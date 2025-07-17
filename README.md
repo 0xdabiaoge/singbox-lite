@@ -1,6 +1,6 @@
 ## **SingBox精简版**
 
-######## **原作者项目地址**
+## **原作者项目地址**
 - **https://github.com/Devmiston/sing-box**
 
 ## **安装**
