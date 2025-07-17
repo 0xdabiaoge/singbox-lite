@@ -8,5 +8,5 @@ apt update && apt -y install curl wget tar socat jq git openssl dnsutils xxd net
 ### **使用以下命令运行脚本**
 
 ```
-wget -N -O /root/sb.sh https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox-lite.sh && chmod +x /root/sb.sh && ln -sf /root/sb.sh /usr/local/bin/sb && sb
+wget -N -O /usr/local/bin/sb.sh https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox-lite.sh && chmod +x /usr/local/bin/sb.sh && ln -sf /usr/local/bin/sb.sh /usr/local/bin/sb && sb
 ```
