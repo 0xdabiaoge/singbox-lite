@@ -1,6 +1,12 @@
 # singbox-lite
-修改后：
-依赖安装：
+## **安装**
+### **Debian&&Ubuntu使用以下命令安装依赖**
+```
 apt update && apt -y install curl wget tar socat jq git openssl dnsutils xxd net-tools cron unzip
-运行脚本：
+```
+
+### **使用以下命令运行脚本**
+
+```
 wget -N -O /root/sb.sh https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox-lite.sh && chmod +x /root/sb.sh && ln -sf /root/sb.sh /usr/local/bin/sb && sb
+```
