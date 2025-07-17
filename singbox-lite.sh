@@ -4279,8 +4279,8 @@ function run_option() {
 # 主菜单
 function main_menu() {
 echo "╔════════════════════════════════════════════════════════════════════════╗"
-echo -e "║ ${CYAN}脚本快捷方式${NC}： sb                                                        ║"
-echo -e "║ ${CYAN}项目地址${NC}: https://github.com/0xdabiaoge/singbox-lite                    ║"
+echo -e "║ ${CYAN}脚本快捷方式${NC}： sb                                                      ║"
+echo -e "║ ${CYAN}项目地址${NC}: https://github.com/0xdabiaoge/singbox-lite                   ║"
 echo "╠════════════════════════════════════════════════════════════════════════╣"
 echo "║ 请选择要执行的操作：                                                   ║"
 echo -e "║${CYAN} [1]${NC}  SOCKS                             ${CYAN} [2]${NC}   Direct                   ║"
@@ -4293,7 +4293,7 @@ echo -e "║${CYAN} [13]${NC} WireGuard                         ${CYAN} [14]${NC
 echo -e "║${CYAN} [15]${NC} 更新内核                          ${CYAN} [16]${NC}  更新脚本                 ║"
 echo -e "║${CYAN} [17]${NC} 更新证书                          ${CYAN} [18]${NC}  重启服务                 ║"
 echo -e "║${CYAN} [19]${NC} 节点管理                          ${CYAN} [20]${NC}  卸载                     ║"
-echo -e "║${CYAN} [0]${NC}  退出                                                               ║"
+echo -e "║${CYAN} [0]${NC}  退出                                                              ║"
 echo "╚════════════════════════════════════════════════════════════════════════╝"
 
     local choice
