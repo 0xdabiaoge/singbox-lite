@@ -12,7 +12,7 @@
 ## **安装**
 ### **Debian&&Ubuntu使用以下命令安装依赖**
 ```
-apt update && apt -y install curl wget tar socat jq git openssl uuid-runtime build-essential zlib1g-dev libssl-dev libevent-dev dnsutils xxd net-tools cron
+apt update && apt -y install curl wget tar socat jq git openssl dnsutils xxd net-tools cron unzip
 ```
 ### **使用以下命令运行脚本**
 
