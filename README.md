@@ -3,6 +3,12 @@
 ## **原作者项目地址**
 - **https://github.com/Devmiston/sing-box**
 
+## **修改的地方**
+- **只保留了sing-box最新稳定版的安装方式**
+- **移除了部分节点协议类型**
+- **只生成Yaml配置文件，适用于Clash**
+- **脚本修改全程由AI完成，难免出现BUG，仅在Debian&&Ubuntu系统下测试使用**
+
 ## **安装**
 ### **Debian&&Ubuntu使用以下命令安装依赖**
 ```
