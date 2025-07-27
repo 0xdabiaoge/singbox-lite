@@ -61,6 +61,9 @@ wget -N -O /usr/local/bin/sb.sh https://raw.githubusercontent.com/0xdabiaoge/sin
 - **Shadowsocks (aes-256-gcm)**
 - **Socks5**
 
+## **yaml配置文件模板，可做参考**
+- **[https://github.com/Devmiston/sing-box](https://github.com/0xdabiaoge/singbox-lite/releases)**
+
 ## **免责声明**
 - **本项目仅供学习与技术交流，请在下载后 24 小时内删除，禁止用于商业或非法目的。**
 - **使用本脚本所搭建的服务，请严格遵守部署服务器所在地、服务提供商和用户所在国家/地区的相关法律法规。**
