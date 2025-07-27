@@ -26,7 +26,7 @@ wget -N -O /usr/local/bin/sb.sh https://raw.githubusercontent.com/0xdabiaoge/sin
 - **节点信息查看: 所有创建的节点信息都会汇总保存在 /usr/local/etc/sing-box/output.txt 中，方便随时查看。**
 - **卸载脚本: 在脚本主菜单选择 20 即可完全卸载，此操作会干净地移除所有相关文件、服务和定时任务，并自动删除脚本本身。**
 
-## **脚本支持的节点类型**
+## **精简版脚本支持的节点类型**
 - **SOCKS**
 - **Direct (端口转发)**
 - **VMess (+TCP/WS/gRPC, 可选 TLS)**
@@ -52,6 +52,14 @@ wget -N -O /usr/local/bin/sb.sh https://raw.githubusercontent.com/0xdabiaoge/sin
 ```
 ## **使用方法**
 - **Clash客户端配置文件位于/usr/local/etc/sing-box/clash.yaml，下载后加载到 clash verge 客户端即可使用。**
+
+## **Alpine版脚本支持的节点类型**
+- **Vless+TCP**
+- **VLESS (REALITY)**
+- **Hysteria2 (自签证书, 无需域名)**
+- **TUICv5 (自签证书, 无需域名)**
+- **Shadowsocks (aes-256-gcm)**
+- **Socks5**
 
 ## **免责声明**
 - **本项目仅供学习与技术交流，请在下载后 24 小时内删除，禁止用于商业或非法目的。**
