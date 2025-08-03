@@ -41,26 +41,6 @@ wget -N -O /usr/local/bin/sb.sh https://raw.githubusercontent.com/0xdabiaoge/sin
 - **Shadowsocks**
 - **WireGuard (WARP 解锁)**
 
-
-## **SingBox Alpine版**
-
-### **使用以下命令运行脚本**
-
-- **自动创建快捷方式：sb**
-```
-wget -N -O /usr/local/bin/sb.sh https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox-lite-alpine.sh && chmod +x /usr/local/bin/sb.sh && ln -sf /usr/local/bin/sb.sh /usr/local/bin/sb && sb
-```
-## **使用方法**
-- **Clash客户端配置文件位于/usr/local/etc/sing-box/clash.yaml，下载后加载到 clash verge 客户端即可使用。**
-
-## **Alpine版脚本支持的节点类型**
-- **Vless+TCP**
-- **VLESS (REALITY)**
-- **Hysteria2 (自签证书, 无需域名)**
-- **TUICv5 (自签证书, 无需域名)**
-- **Shadowsocks (aes-256-gcm)**
-- **Socks5**
-
 ## **yaml配置文件模板，可做参考**
 - **[Release](https://github.com/0xdabiaoge/singbox-lite/releases)**
 
