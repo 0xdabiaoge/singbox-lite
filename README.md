@@ -22,6 +22,7 @@ apt update && apt -y install curl wget tar jq openssl dnsutils net-tools cron co
 wget -N -O /usr/local/bin/sb.sh https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox-lite.sh && chmod +x /usr/local/bin/sb.sh && ln -sf /usr/local/bin/sb.sh /usr/local/bin/sb && sb
 ```
 ## **使用方法**
+- **注意，注意，注意：生成的节点链接，如果是纯IPV6地址，需要用[]将IPV6地址括起来，否则导入V2rayN时会出错。**
 - **如果开启ECH配置则不会生成Clash客户端配置文件。**
 - **Clash客户端配置文件位于/usr/local/etc/sing-box/clash.yaml，下载后加载到 clash verge 客户端即可使用。**
 - **节点链接在创建节点成功后会显示在下方，也可以通过菜单选择 14 查看节点信息中获取，复制粘贴到 v2rayN 即可使用**
