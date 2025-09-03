@@ -1,15 +1,25 @@
-## **SingBox Debian&Ubuntu版**
+## **SingBox 精简版**
 
-## **脚本特色**
-- **极小极小的占用**
+## 两个独立的脚本，分别适配Debian/CentOS/Ubuntu和Alpine，仅在上述系统中测试使用。
+
+## **✨ 功能特性**
+- **脚本风格：Gemini2.5Pro**
+- **轻量高效：资源占用极低，适合小内存机器使用。**
 - **自动识别IPV4，ipv6**
 - **Hysteria2可选择开启QUIC流量混淆（需要客户端支持）**
 
 ### **使用以下命令运行脚本**
 
-- **自动创建快捷方式：sb**
+**快捷命令：sb**
+
+**Debian/CentOS/Ubuntu**
 ```
-wget -N -O /usr/local/bin/sb.sh https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox-lite.sh && chmod +x /usr/local/bin/sb.sh && ln -sf /usr/local/bin/sb.sh /usr/local/bin/sb && sb
+(curl -LfsS https://raw.githubusercontent.com/0xdabiaoge/MTProxy/main/MTP.sh -o /usr/local/bin/mtp || wget -q https://raw.githubusercontent.com/0xdabiaoge/MTProxy/main/MTP.sh -O /usr/local/bin/mtp) && chmod +x /usr/local/bin/mtp && mtp
+```
+
+**Alpine**
+```
+(curl -LfsS https://raw.githubusercontent.com/0xdabiaoge/MTProxy/main/MTP-Alpine.sh -o /usr/local/bin/mtp || wget -q https://raw.githubusercontent.com/0xdabiaoge/MTProxy/main/MTP-Alpine.sh -O /usr/local/bin/mtp) && chmod +x /usr/local/bin/mtp && mtp
 ```
 ## **使用方法**
 - **Clash客户端配置文件位于/usr/local/etc/sing-box/clash.yaml，下载后加载到 clash verge 客户端即可使用**
