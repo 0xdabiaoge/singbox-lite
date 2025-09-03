@@ -25,7 +25,7 @@
 - **Clash客户端配置文件位于/usr/local/etc/sing-box/clash.yaml，下载后加载到 clash verge 客户端即可使用**
 - **菜单选择查看节点分享链接，复制粘贴导入v2rayN即可使用**
 
-## **Alpine版脚本支持的节点类型**
+## **脚本支持的节点类型**
 - **VLESS (REALITY)**
 - **Hysteria2（自签证书）**
 - **TUICv5（自签证书）**
