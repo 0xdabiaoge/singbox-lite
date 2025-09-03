@@ -14,12 +14,12 @@
 
 **Debian/CentOS/Ubuntu**
 ```
-(curl -LfsS https://raw.githubusercontent.com/0xdabiaoge/MTProxy/main/MTP.sh -o /usr/local/bin/mtp || wget -q https://raw.githubusercontent.com/0xdabiaoge/MTProxy/main/MTP.sh -O /usr/local/bin/mtp) && chmod +x /usr/local/bin/mtp && mtp
+(curl -LfsS https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -q https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
 ```
 
 **Alpine**
 ```
-(curl -LfsS https://raw.githubusercontent.com/0xdabiaoge/MTProxy/main/MTP-Alpine.sh -o /usr/local/bin/mtp || wget -q https://raw.githubusercontent.com/0xdabiaoge/MTProxy/main/MTP-Alpine.sh -O /usr/local/bin/mtp) && chmod +x /usr/local/bin/mtp && mtp
+(curl -LfsS https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox-alpine.sh -o /usr/local/bin/sb || wget -q https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox-alpine.sh -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
 ```
 ## **使用方法**
 - **Clash客户端配置文件位于/usr/local/etc/sing-box/clash.yaml，下载后加载到 clash verge 客户端即可使用**
@@ -32,7 +32,7 @@
 - **Shadowsocks (aes-256-gcm加密)**
 - **Socks5**
 
-## **yaml配置文件模板，可做参考**
+## **更多yaml配置文件模板，可做参考**
 - **[Release](https://github.com/0xdabiaoge/singbox-lite/releases)**
 
 ## **免责声明**
