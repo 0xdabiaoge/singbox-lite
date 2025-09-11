@@ -27,7 +27,7 @@
 
 ## **脚本支持的节点类型**
 - **VLESS (REALITY)**
-- - **VLESS (tcp)**
+- **VLESS (tcp)**
 - **Hysteria2（自签证书）**
 - **TUICv5（自签证书）**
 - **Shadowsocks (aes-256-gcm加密)**
