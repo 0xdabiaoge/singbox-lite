@@ -6,6 +6,7 @@
 - **脚本风格：Gemini2.5Pro**
 - **轻量高效：资源占用极低，适合小内存机器使用。**
 - **自动识别IPV4，ipv6**
+- **既有直连节点协议，也有落地节点协议**
 - **Hysteria2可选择开启QUIC流量混淆（需要客户端支持）**
 
 ### **使用以下命令运行脚本**
@@ -26,12 +27,12 @@
 - **菜单选择查看节点分享链接，复制粘贴导入v2rayN即可使用**
 
 ## **脚本支持的节点类型**
-- **VLESS (REALITY)**
-- **VLESS (tcp)**
-- **Hysteria2（自签证书）**
-- **TUICv5（自签证书）**
-- **Shadowsocks (aes-256-gcm加密)**
-- **Socks5**
+- **VLESS (REALITY)，推荐直连使用**
+- **VLESS (tcp)，推荐落地使用**
+- **Hysteria2（自签证书），推荐直连使用**
+- **TUICv5（自签证书），推荐直连使用**
+- **Shadowsocks (aes-256-gcm加密)，推荐落地使用**
+- **Socks5，推荐落地使用**
 
 ## **更多yaml配置文件模板，可做参考**
 - **[Release](https://github.com/0xdabiaoge/singbox-lite/releases)**
