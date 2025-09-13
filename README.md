@@ -31,7 +31,7 @@
 - **VLESS (tcp)，推荐落地使用**
 - **Hysteria2（自签证书），推荐直连使用**
 - **TUICv5（自签证书），推荐直连使用**
-- **Shadowsocks (aes-256-gcm加密)，推荐落地使用**
+- **Shadowsocks (aes-256-gcm，2022-blake3-aes-128-gcm)，推荐落地使用**
 - **Socks5，推荐落地使用**
 
 ## **更多yaml配置文件模板，可做参考**
