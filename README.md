@@ -1,6 +1,6 @@
 ## **SingBox 精简版**
 
-## 适配Docker容器虚拟化的Debian和Alpine，仅在上述系统中测试使用。
+## 适配Docker容器虚拟化的Debian和Alpine，仅在上述系统中测试使用。注：这里有个小bug，通过Docker容器虚拟化出来的系统，重启后需要重新进入脚本，重启一遍singbox，才能正常使用。
 ## 适配标准版以及LXC、KVM等虚拟化的Debian/CentOS/Ubuntu和Alpine，仅在上述系统中测试使用。
 
 ## **✨ 功能特性**
