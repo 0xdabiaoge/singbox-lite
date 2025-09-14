@@ -1,7 +1,7 @@
 ## **SingBox 精简版**
 
 ## 适配Docker容器虚拟化的Debian和Alpine，仅在上述系统中测试使用。
-## 适配标准版及LXC、KVM等Debian/CentOS/Ubuntu和Alpine，仅在上述系统中测试使用。
+## 适配标准版以及LXC、KVM等虚拟化的Debian/CentOS/Ubuntu和Alpine，仅在上述系统中测试使用。
 
 ## **✨ 功能特性**
 - **脚本风格：Gemini2.5Pro**
