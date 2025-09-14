@@ -1,6 +1,7 @@
 ## **SingBox 精简版**
 
-## 分别适配Debian/CentOS/Ubuntu和Alpine，仅在上述系统中测试使用。
+## 适配Docker容器虚拟化的Debian和Alpine，仅在上述系统中测试使用。
+## 适配标准版及LXC、KVM等Debian/CentOS/Ubuntu和Alpine，仅在上述系统中测试使用。
 
 ## **✨ 功能特性**
 - **脚本风格：Gemini2.5Pro**
@@ -17,7 +18,7 @@
 (curl -LfsS https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -q https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
 ```
 ## **使用方法**
-- **Clash客户端配置文件位于/usr/local/etc/sing-box/clash.yaml，下载后加载到 clash verge 客户端即可使用**
+- **Clash客户端配置文件位于/usr/local/etc/sing-box/clash.yaml，初始文件仅保证基础使用。**
 - **菜单选择查看节点分享链接，复制粘贴导入v2rayN即可使用**
 
 ## **脚本支持的节点类型**
