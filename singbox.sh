@@ -389,12 +389,13 @@ EOF
 }
 
 _generate_self_signed_cert() {
+    local my_domain="www.microsoft.com"
     local cert_path="${SINGBOX_DIR}/cert.pem"
     local key_path="${SINGBOX_DIR}/private.key"
     if [ ! -f "$cert_path" ]; then
-        _info "正在为 www.microsoft.com 生成自签名证书..."
+        _info "正在为 ${my_domain} 生成自签名证书..."
         openssl ecparam -genkey -name prime256v1 -out "$key_path"
-        openssl req -new -x509 -days 3650 -key "$key_path" -out "$cert_path" -subj "/CN=www.microsoft.com"
+        openssl req -new -x509 -days 3650 -key "$key_path" -out "$cert_path" -subj "/CN=${my_domain}"
     fi
 }
 
