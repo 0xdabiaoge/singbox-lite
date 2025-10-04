@@ -148,72 +148,66 @@ _install_dependencies() {
 _install_sing_box() {
     _info "正在安装最新稳定版 sing-box..."
 
-    # 1) 识别架构
+    # 1) 检测架构
     local uname_arch="$(uname -m)"
     local arch_tag=""
     case "$uname_arch" in
         x86_64|amd64) arch_tag='amd64' ;;
         aarch64|arm64) arch_tag='arm64' ;;
         armv7l|armv7) arch_tag='armv7' ;;
-        *) _error "不支持的架构：$uname_arch"; exit 1 ;;
+        *)
+            _error "不支持的架构：$uname_arch"
+            exit 1
+            ;;
     esac
 
-    # 2) 判断 libc：Alpine/musl 还是 Debian/Ubuntu/glibc
+    # 2) 判断 libc 类型：musl (Alpine) 或 glibc (Debian/Ubuntu)
     local is_musl="false"
     if [ -f /etc/alpine-release ] || ldd --version 2>&1 | grep -qi musl; then
         is_musl="true"
     fi
 
-    # 3) 解析“最新稳定版”版本号（不依赖 API 与 jq）
-    #    利用 GitHub 的 302 重定向：.../releases/latest -> .../releases/tag/vX.Y.Z
-    local latest_url
-    latest_url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/SagerNet/sing-box/releases/latest)
-    # 提取 vX.Y.Z，并去掉前缀 v 得到 X.Y.Z
-    local tag ver
-    tag=$(echo "$latest_url" | sed -n 's#.*/tag/\(v[0-9][0-9.]*\).*#\1#p')
-    ver=${tag#v}
-    if [ -z "$ver" ]; then
-        _error "无法解析 sing-box 最新版本号（latest 重定向失败）。"
-        exit 1
-    fi
-
-    # 4) 构造官方资产名（官方命名规则：sing-box-<ver>-linux-<arch>(-musl).tar.gz）
-    #    注意：官方没有 amd64v3-musl 包，这里只拼 amd64/arm64/armv7 及 musl 变体
-    local suffix=""
-    if [ "$arch_tag" != "armv7" ] && [ "$is_musl" = "true" ]; then
-        suffix="-musl"
-    fi
-    local asset="sing-box-${ver}-linux-${arch_tag}${suffix}.tar.gz"
-
-    # 5) 直接下载对应资产（避免 API 限流/空 assets）
-    local download_url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${asset}"
-
-    _info "准备下载: ${download_url}"
-
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-
-    # 有些环境 CA 证书不全，优先用 wget；失败再用 curl
-    if ! wget -qO "${tmp_dir}/singbox.tar.gz" "$download_url"; then
-        if ! curl -fL --retry 3 -o "${tmp_dir}/singbox.tar.gz" "$download_url"; then
-            _error "下载失败：${download_url}"
-            rm -rf "$tmp_dir"; exit 1
+    # 3) 构造匹配正则（防止误下 amd64v3）
+    local expected_name_regex=""
+    if [ "$arch_tag" = "armv7" ]; then
+        # 移除了开头的 '^' 以匹配新的 'sing-box-VERSION-linux-...' 格式
+        expected_name_regex="linux-${arch_tag}\\.tar\\.gz$"
+    else
+        if [ "$is_musl" = "true" ]; then
+            # 移除了开头的 '^'
+            expected_name_regex="linux-${arch_tag}-musl\\.tar\\.gz$"
+        else
+            # 移除了开头的 '^'
+            expected_name_regex="linux-${arch_tag}\\.tar\\.gz$"
         fi
     fi
 
-    if ! tar -xzf "${tmp_dir}/singbox.tar.gz" -f "${tmp_dir}/singbox.tar.gz" -C "$tmp_dir"; then
-        _error "解压失败：${asset}"
-        rm -rf "$tmp_dir"; exit 1
+    # 4) 获取下载地址（精确匹配）
+    local api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+    local download_url
+    download_url=$(curl -fsSL "$api_url" | jq -r \
+        ".assets[] | select(.name | test(\"${expected_name_regex}\")) | .browser_download_url")
+
+    if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
+        _error "未能找到匹配 ${expected_name_regex} 的构建包。请检查架构或系统类型。"
+        exit 1
     fi
+
+    # 5) 下载并安装
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    wget -qO "${tmp_dir}/singbox.tar.gz" "$download_url" || { _error "下载失败！"; rm -rf "$tmp_dir"; exit 1; }
+    tar -xzf "${tmp_dir}/singbox.tar.gz" -C "$tmp_dir" || { _error "解压失败！"; rm -rf "$tmp_dir"; exit 1; }
 
     local extracted_dir
     extracted_dir=$(find "$tmp_dir" -maxdepth 1 -type d -name "sing-box-*" | head -n 1)
     if [ -z "$extracted_dir" ]; then
-        _error "未找到解压后的目录（sing-box-*）。"
-        rm -rf "$tmp_dir"; exit 1
+        _error "未找到解压后的目录！"
+        rm -rf "$tmp_dir"
+        exit 1
     fi
 
-    install -m 755 "${extracted_dir}/sing-box" ${SINGBOX_BIN} || { _error "安装二进制失败！"; rm -rf "$tmp_dir"; exit 1; }
+    install -m 755 "${extracted_dir}/sing-box" ${SINGBOX_BIN} || { _error "安装失败！"; rm -rf "$tmp_dir"; exit 1; }
     rm -rf "$tmp_dir"
 
     _success "sing-box 安装成功, 版本: $(${SINGBOX_BIN} version 2>/dev/null || echo unknown)"
