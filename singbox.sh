@@ -167,13 +167,12 @@ _install_sing_box() {
         is_musl="true"
     fi
 
-    # 3. 构造正确的匹配正则 (修正版，去掉了开头的^)
+    # 3. 构造正确的匹配正则 (最终修正：移除了所有 \ 转义符)
     local expected_name_regex=""
     if [ "$is_musl" = "true" ]; then
-        expected_name_regex="linux-${arch_tag}-musl\\.tar\\.gz$"
+        expected_name_regex="linux-${arch_tag}-musl.tar.gz$"
     else
-        # 排除 amd64v3 等变体
-        expected_name_regex="linux-${arch_tag}\\.tar\\.gz$"
+        expected_name_regex="linux-${arch_tag}.tar.gz$"
     fi
 
     # 4. 获取下载地址 (健壮逻辑)
@@ -183,11 +182,10 @@ _install_sing_box() {
     # 直接在返回的 assets 列表中查找并提取最终下载链接
     local download_url=$(curl -fsSL "$api_url" | jq -r ".assets[] | select(.name | test(\"${expected_name_regex}\")) | .browser_download_url")
 
-    # 5. 备用逻辑：如果 "latest" 版本为空 (如此前的 v1.12.8)，则从所有版本列表中查找
+    # 5. 备用逻辑：如果 "latest" 版本为空，则从所有版本列表中查找
     if [ -z "$download_url" ]; then
         _warning "最新版 (latest) 中未找到可用文件，正在扫描所有历史版本..."
         api_url="https://api.github.com/repos/SagerNet/sing-box/releases"
-        # 从所有版本中查找，并取第一个匹配项 (最新的)
         download_url=$(curl -fsSL "$api_url" | jq -r "[.[] | .assets[] | select(.name | test(\"${expected_name_regex}\"))] | first | .browser_download_url")
     fi
 
@@ -214,7 +212,7 @@ _install_sing_box() {
     install -m 755 "${extracted_dir}/sing-box" "/usr/local/bin/sing-box" || { _error "安装失败！"; rm -rf "$tmp_dir"; exit 1; }
     rm -rf "$tmp_dir"
 
-    _success "sing-box 安装成功, 版本: $(/usr/local/bin/sing-box version 2>/dev/null || echo未知)"
+    _success "sing-box 安装成功, 版本: $(/usr/local/bin/sing-box version 2>/dev/null || echo 未知)"
 }
 
 # --- 服务与配置管理 ---
