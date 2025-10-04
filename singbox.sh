@@ -148,39 +148,37 @@ _install_dependencies() {
 _install_sing_box() {
     _info "正在安装最新稳定版 sing-box..."
 
-    # 1) 检测架构
+    # 1) 架构识别
     local uname_arch="$(uname -m)"
     local arch_tag=""
     case "$uname_arch" in
         x86_64|amd64) arch_tag='amd64' ;;
         aarch64|arm64) arch_tag='arm64' ;;
         armv7l|armv7) arch_tag='armv7' ;;
-        *)
-            _error "不支持的架构：$uname_arch"
-            exit 1
-            ;;
+        *) _error "不支持的架构：$uname_arch"; exit 1 ;;
     esac
 
-    # 2) 判断 libc 类型：musl (Alpine) 或 glibc (Debian/Ubuntu)
+    # 2) libc 类型：musl(Alpine) / glibc(Debian/Ubuntu)
     local is_musl="false"
     if [ -f /etc/alpine-release ] || ldd --version 2>&1 | grep -qi musl; then
         is_musl="true"
     fi
 
-    # 3) 构造严格匹配的资产名正则（避免误选 amd64v3 等变种）
+    # 3) 构造“正确文件名”的正则（注意 sing-box-<ver>- 前缀；避免 amd64v3）
+    #   示例：sing-box-1.12.8-linux-amd64.tar.gz
+    #         sing-box-1.12.8-linux-amd64-musl.tar.gz
     local expected_name_regex=""
     if [ "$arch_tag" = "armv7" ]; then
-        # armv7 通常只有 glibc 版
-        expected_name_regex="^linux-${arch_tag}\\.tar\\.gz$"
+        expected_name_regex="^sing-box-.*-linux-${arch_tag}\\.tar\\.gz$"
     else
         if [ "$is_musl" = "true" ]; then
-            expected_name_regex="^linux-${arch_tag}-musl\\.tar\\.gz$"
+            expected_name_regex="^sing-box-.*-linux-${arch_tag}-musl\\.tar\\.gz$"
         else
-            expected_name_regex="^linux-${arch_tag}\\.tar\\.gz$"
+            expected_name_regex="^sing-box-.*-linux-${arch_tag}\\.tar\\.gz$"
         fi
     fi
 
-    # 4) 获取下载地址（用 jq 变量传正则，避免转义错误）
+    # 4) 获取下载地址（用 jq 变量传正则，避免转义问题）
     local api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
     local download_url
     download_url=$(curl -fsSL "$api_url" \
@@ -202,8 +200,7 @@ _install_sing_box() {
     extracted_dir=$(find "$tmp_dir" -maxdepth 1 -type d -name "sing-box-*" | head -n 1)
     if [ -z "$extracted_dir" ]; then
         _error "未找到解压后的目录！"
-        rm -rf "$tmp_dir"
-        exit 1
+        rm -rf "$tmp_dir"; exit 1
     fi
 
     install -m 755 "${extracted_dir}/sing-box" ${SINGBOX_BIN} || { _error "安装失败！"; rm -rf "$tmp_dir"; exit 1; }
