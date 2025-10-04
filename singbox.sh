@@ -501,8 +501,8 @@ _remove_node_from_yaml() {
 _add_vless_reality() {
     read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
     local node_ip=${custom_ip:-$server_ip}
-    read -p "请输入伪装域名 (默认: microsoft.com): " camouflage_domain
-    local server_name=${camouflage_domain:-"microsoft.com"}
+    read -p "请输入伪装域名 (默认: www.bing.com): " camouflage_domain
+    local server_name=${camouflage_domain:-"www.bing.com"}
     
     read -p "请输入监听端口: " port; [[ -z "$port" ]] && _error "端口不能为空" && return 1
     local uuid=$(${SINGBOX_BIN} generate uuid)
@@ -552,8 +552,8 @@ _add_hysteria2() {
     
     read -p "请输入监听端口: " port; [[ -z "$port" ]] && _error "端口不能为空" && return 1
     
-    read -p "请输入伪装域名 (默认: microsoft.com): " camouflage_domain
-    local server_name=${camouflage_domain:-"microsoft.com"}
+    read -p "请输入伪装域名 (默认: www.bing.com): " camouflage_domain
+    local server_name=${camouflage_domain:-"www.bing.com"}
 
     local tag="hy2-in-${port}"
     local cert_path="${SINGBOX_DIR}/${tag}.pem"
@@ -597,8 +597,8 @@ _add_tuic() {
     
     read -p "请输入监听端口: " port; [[ -z "$port" ]] && _error "端口不能为空" && return 1
 
-    read -p "请输入伪装域名 (默认: microsoft.com): " camouflage_domain
-    local server_name=${camouflage_domain:-"microsoft.com"}
+    read -p "请输入伪装域名 (默认: www.bing.com): " camouflage_domain
+    local server_name=${camouflage_domain:-"www.bing.com"}
 
     local tag="tuic-in-${port}"
     local cert_path="${SINGBOX_DIR}/${tag}.pem"
