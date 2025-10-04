@@ -164,10 +164,9 @@ _install_sing_box() {
         is_musl="true"
     fi
 
-    # 3) 构造“正确文件名”的正则（注意 sing-box-<ver>- 前缀；避免 amd64v3）
-    #   示例：sing-box-1.12.8-linux-amd64.tar.gz
-    #         sing-box-1.12.8-linux-amd64-musl.tar.gz
-    local expected_name_regex=""
+    # 3) 精确文件名正则（官方资产名：sing-box-<ver>-linux-<arch>(-musl).tar.gz）
+    #    避免误选 amd64v3 等变种
+    local expected_name_regex
     if [ "$arch_tag" = "armv7" ]; then
         expected_name_regex="^sing-box-.*-linux-${arch_tag}\\.tar\\.gz$"
     else
@@ -178,19 +177,38 @@ _install_sing_box() {
         fi
     fi
 
-    # 4) 获取下载地址（用 jq 变量传正则，避免转义问题）
-    local api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
-    local download_url
-    download_url=$(curl -fsSL "$api_url" \
-        | jq -r --arg re "$expected_name_regex" \
-            '.assets[] | select(.name | test($re)) | .browser_download_url')
+    local api_hdrs=(-H "Accept: application/vnd.github+json" -H "User-Agent: singbox-installer")
+    local latest_api="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+    local list_api="https://api.github.com/repos/SagerNet/sing-box/releases?per_page=20"
 
+    # 4) 先尝试 /releases/latest
+    local download_url
+    download_url=$(
+        curl -fsSL "${api_hdrs[@]}" "$latest_api" \
+        | jq -r --arg re "$expected_name_regex" \
+              '.assets[]? | select(.name | test($re)) | .browser_download_url' \
+        | head -n 1
+    )
+
+    # 5) 如果 latest 没命中，回退扫描最近 20 个 release（含稳定版/预发布）
     if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
-        _error "未能在最新发布中找到匹配 ${expected_name_regex} 的构建包。请检查系统架构/环境。"
+        download_url=$(
+            curl -fsSL "${api_hdrs[@]}" "$list_api" \
+            | jq -r --arg re "$expected_name_regex" '
+                [ .[] | .assets[]? | select(.name | test($re)) | .browser_download_url ][0]
+            '
+        )
+    fi
+
+    # 6) 仍失败则给出调试信息
+    if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
+        _error "未能找到匹配 ${expected_name_regex} 的构建包。下面打印最近一个 release 的资产名用于排查："
+        curl -fsSL "${api_hdrs[@]}" "$latest_api" \
+          | jq -r '.assets[]?.name' 2>/dev/null || true
         exit 1
     fi
 
-    # 5) 下载并安装
+    # 7) 下载并安装
     local tmp_dir
     tmp_dir=$(mktemp -d)
     wget -qO "${tmp_dir}/singbox.tar.gz" "$download_url" || { _error "下载失败！"; rm -rf "$tmp_dir"; exit 1; }
