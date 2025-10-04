@@ -360,21 +360,72 @@ _initialize_config_files() {
     if [ ! -s "$CLASH_YAML_FILE" ]; then
         _info "正在创建全新的 clash.yaml 配置文件..."
         cat > "$CLASH_YAML_FILE" << 'EOF'
-mixed-port: 7890
-allow-lan: true
-bind-address: "*"
+port: 7890
+socks-port: 7891
+mixed-port: 7892
+allow-lan: false
+bind-address: '*'
 mode: rule
 log-level: info
-ipv6: true
-external-controller: 127.0.0.1:9090
-external-ui: ui
-external-ui-url: "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip"
+ipv6: false
+find-process-mode: strict
+external-controller: '127.0.0.1:9090'
+profile:
+  store-selected: true
+  store-fake-ip: true
+unified-delay: true
+tcp-concurrent: true
+ntp:
+  enable: true
+  write-to-system: false
+  server: ntp.aliyun.com
+  port: 123
+  interval: 30
 dns:
   enable: true
+  respect-rules: true
+  use-system-hosts: true
+  prefer-h3: false
+  listen: '0.0.0.0:1053'
+  ipv6: false
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
-  default-nameserver: [223.5.5.5, 114.114.114.114]
-  nameserver: ['https://223.5.5.5/dns-query', 'https://1.1.1.1/dns-query']
+  use-hosts: true
+  fake-ip-filter:
+    - +.lan
+    - +.local
+    - localhost.ptlogin2.qq.com
+    - +.msftconnecttest.com
+    - +.msftncsi.com
+  nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+    - 'https://1.1.1.1/dns-query'
+    - 'https://dns.quad9.net/dns-query'
+  default-nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+  proxy-server-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  fallback:
+    - 'https://1.0.0.1/dns-query'
+    - 'https://9.9.9.10/dns-query'
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    ipcidr:
+      - 240.0.0.0/4
+tun:
+  enable: true
+  stack: system
+  auto-route: true
+  auto-detect-interface: true
+  strict-route: false
+  dns-hijack:
+    - 'any:53'
+  device: SakuraiTunnel
+  endpoint-independent-nat: true
 proxies: []
 proxy-groups:
   - name: 节点选择
@@ -450,8 +501,8 @@ _remove_node_from_yaml() {
 _add_vless_reality() {
     read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
     local node_ip=${custom_ip:-$server_ip}
-    read -p "请输入伪装域名 (默认: www.microsoft.com): " camouflage_domain
-    local server_name=${camouflage_domain:-"www.microsoft.com"}
+    read -p "请输入伪装域名 (默认: microsoft.com): " camouflage_domain
+    local server_name=${camouflage_domain:-"microsoft.com"}
     
     read -p "请输入监听端口: " port; [[ -z "$port" ]] && _error "端口不能为空" && return 1
     local uuid=$(${SINGBOX_BIN} generate uuid)
@@ -501,8 +552,8 @@ _add_hysteria2() {
     
     read -p "请输入监听端口: " port; [[ -z "$port" ]] && _error "端口不能为空" && return 1
     
-    read -p "请输入伪装域名 (默认: www.microsoft.com): " camouflage_domain
-    local server_name=${camouflage_domain:-"www.microsoft.com"}
+    read -p "请输入伪装域名 (默认: microsoft.com): " camouflage_domain
+    local server_name=${camouflage_domain:-"microsoft.com"}
 
     local tag="hy2-in-${port}"
     local cert_path="${SINGBOX_DIR}/${tag}.pem"
@@ -546,8 +597,8 @@ _add_tuic() {
     
     read -p "请输入监听端口: " port; [[ -z "$port" ]] && _error "端口不能为空" && return 1
 
-    read -p "请输入伪装域名 (默认: www.microsoft.com): " camouflage_domain
-    local server_name=${camouflage_domain:-"www.microsoft.com"}
+    read -p "请输入伪装域名 (默认: microsoft.com): " camouflage_domain
+    local server_name=${camouflage_domain:-"microsoft.com"}
 
     local tag="tuic-in-${port}"
     local cert_path="${SINGBOX_DIR}/${tag}.pem"
