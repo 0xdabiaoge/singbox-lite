@@ -148,7 +148,7 @@ _install_dependencies() {
 _install_sing_box() {
     _info "正在安装最新稳定版 sing-box..."
 
-    # 1) 架构识别
+    # 1) 识别架构
     local uname_arch="$(uname -m)"
     local arch_tag=""
     case "$uname_arch" in
@@ -158,70 +158,62 @@ _install_sing_box() {
         *) _error "不支持的架构：$uname_arch"; exit 1 ;;
     esac
 
-    # 2) libc 类型：musl(Alpine) / glibc(Debian/Ubuntu)
+    # 2) 判断 libc：Alpine/musl 还是 Debian/Ubuntu/glibc
     local is_musl="false"
     if [ -f /etc/alpine-release ] || ldd --version 2>&1 | grep -qi musl; then
         is_musl="true"
     fi
 
-    # 3) 精确文件名正则（官方资产名：sing-box-<ver>-linux-<arch>(-musl).tar.gz）
-    #    避免误选 amd64v3 等变种
-    local expected_name_regex
-    if [ "$arch_tag" = "armv7" ]; then
-        expected_name_regex="^sing-box-.*-linux-${arch_tag}\\.tar\\.gz$"
-    else
-        if [ "$is_musl" = "true" ]; then
-            expected_name_regex="^sing-box-.*-linux-${arch_tag}-musl\\.tar\\.gz$"
-        else
-            expected_name_regex="^sing-box-.*-linux-${arch_tag}\\.tar\\.gz$"
-        fi
-    fi
-
-    local api_hdrs=(-H "Accept: application/vnd.github+json" -H "User-Agent: singbox-installer")
-    local latest_api="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
-    local list_api="https://api.github.com/repos/SagerNet/sing-box/releases?per_page=20"
-
-    # 4) 先尝试 /releases/latest
-    local download_url
-    download_url=$(
-        curl -fsSL "${api_hdrs[@]}" "$latest_api" \
-        | jq -r --arg re "$expected_name_regex" \
-              '.assets[]? | select(.name | test($re)) | .browser_download_url' \
-        | head -n 1
-    )
-
-    # 5) 如果 latest 没命中，回退扫描最近 20 个 release（含稳定版/预发布）
-    if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
-        download_url=$(
-            curl -fsSL "${api_hdrs[@]}" "$list_api" \
-            | jq -r --arg re "$expected_name_regex" '
-                [ .[] | .assets[]? | select(.name | test($re)) | .browser_download_url ][0]
-            '
-        )
-    fi
-
-    # 6) 仍失败则给出调试信息
-    if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
-        _error "未能找到匹配 ${expected_name_regex} 的构建包。下面打印最近一个 release 的资产名用于排查："
-        curl -fsSL "${api_hdrs[@]}" "$latest_api" \
-          | jq -r '.assets[]?.name' 2>/dev/null || true
+    # 3) 解析“最新稳定版”版本号（不依赖 API 与 jq）
+    #    利用 GitHub 的 302 重定向：.../releases/latest -> .../releases/tag/vX.Y.Z
+    local latest_url
+    latest_url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/SagerNet/sing-box/releases/latest)
+    # 提取 vX.Y.Z，并去掉前缀 v 得到 X.Y.Z
+    local tag ver
+    tag=$(echo "$latest_url" | sed -n 's#.*/tag/\(v[0-9][0-9.]*\).*#\1#p')
+    ver=${tag#v}
+    if [ -z "$ver" ]; then
+        _error "无法解析 sing-box 最新版本号（latest 重定向失败）。"
         exit 1
     fi
 
-    # 7) 下载并安装
+    # 4) 构造官方资产名（官方命名规则：sing-box-<ver>-linux-<arch>(-musl).tar.gz）
+    #    注意：官方没有 amd64v3-musl 包，这里只拼 amd64/arm64/armv7 及 musl 变体
+    local suffix=""
+    if [ "$arch_tag" != "armv7" ] && [ "$is_musl" = "true" ]; then
+        suffix="-musl"
+    fi
+    local asset="sing-box-${ver}-linux-${arch_tag}${suffix}.tar.gz"
+
+    # 5) 直接下载对应资产（避免 API 限流/空 assets）
+    local download_url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${asset}"
+
+    _info "准备下载: ${download_url}"
+
     local tmp_dir
     tmp_dir=$(mktemp -d)
-    wget -qO "${tmp_dir}/singbox.tar.gz" "$download_url" || { _error "下载失败！"; rm -rf "$tmp_dir"; exit 1; }
-    tar -xzf "${tmp_dir}/singbox.tar.gz" -C "$tmp_dir" || { _error "解压失败！"; rm -rf "$tmp_dir"; exit 1; }
+
+    # 有些环境 CA 证书不全，优先用 wget；失败再用 curl
+    if ! wget -qO "${tmp_dir}/singbox.tar.gz" "$download_url"; then
+        if ! curl -fL --retry 3 -o "${tmp_dir}/singbox.tar.gz" "$download_url"; then
+            _error "下载失败：${download_url}"
+            rm -rf "$tmp_dir"; exit 1
+        fi
+    fi
+
+    if ! tar -xzf "${tmp_dir}/singbox.tar.gz" -f "${tmp_dir}/singbox.tar.gz" -C "$tmp_dir"; then
+        _error "解压失败：${asset}"
+        rm -rf "$tmp_dir"; exit 1
+    fi
 
     local extracted_dir
     extracted_dir=$(find "$tmp_dir" -maxdepth 1 -type d -name "sing-box-*" | head -n 1)
     if [ -z "$extracted_dir" ]; then
-        _error "未找到解压后的目录！"
+        _error "未找到解压后的目录（sing-box-*）。"
         rm -rf "$tmp_dir"; exit 1
     fi
 
-    install -m 755 "${extracted_dir}/sing-box" ${SINGBOX_BIN} || { _error "安装失败！"; rm -rf "$tmp_dir"; exit 1; }
+    install -m 755 "${extracted_dir}/sing-box" ${SINGBOX_BIN} || { _error "安装二进制失败！"; rm -rf "$tmp_dir"; exit 1; }
     rm -rf "$tmp_dir"
 
     _success "sing-box 安装成功, 版本: $(${SINGBOX_BIN} version 2>/dev/null || echo unknown)"
