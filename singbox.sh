@@ -147,29 +147,67 @@ _install_dependencies() {
 
 _install_sing_box() {
     _info "正在安装最新稳定版 sing-box..."
-    local arch=$(uname -m)
-    local arch_tag
-    case $arch in
+
+    # 1) 检测架构
+    local uname_arch="$(uname -m)"
+    local arch_tag=""
+    case "$uname_arch" in
         x86_64|amd64) arch_tag='amd64' ;;
         aarch64|arm64) arch_tag='arm64' ;;
-        armv7l) arch_tag='armv7' ;;
-        *) _error "不支持的架构：$arch"; exit 1 ;;
+        armv7l|armv7) arch_tag='armv7' ;;
+        *)
+            _error "不支持的架构：$uname_arch"
+            exit 1
+            ;;
     esac
-    
+
+    # 2) 判断 libc 类型：musl (Alpine) 或 glibc (Debian/Ubuntu)
+    local is_musl="false"
+    if [ -f /etc/alpine-release ] || ldd --version 2>&1 | grep -qi musl; then
+        is_musl="true"
+    fi
+
+    # 3) 构造匹配正则（防止误下 amd64v3）
+    local expected_name_regex=""
+    if [ "$arch_tag" = "armv7" ]; then
+        expected_name_regex="^linux-${arch_tag}\\.tar\\.gz$"
+    else
+        if [ "$is_musl" = "true" ]; then
+            expected_name_regex="^linux-${arch_tag}-musl\\.tar\\.gz$"
+        else
+            expected_name_regex="^linux-${arch_tag}\\.tar\\.gz$"
+        fi
+    fi
+
+    # 4) 获取下载地址（精确匹配）
     local api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
-    local download_url=$(curl -s "$api_url" | jq -r ".assets[] | select(.name | contains(\"linux-${arch_tag}.tar.gz\")) | .browser_download_url")
-    
-    if [ -z "$download_url" ]; then _error "无法获取 sing-box 下载链接。"; exit 1; fi
-    
-    wget -qO sing-box.tar.gz "$download_url" || { _error "下载失败!"; exit 1; }
-    
-    local temp_dir=$(mktemp -d)
-    tar -xzf sing-box.tar.gz -C "$temp_dir"
-    mv "$temp_dir/sing-box-"*"/sing-box" ${SINGBOX_BIN}
-    rm -rf sing-box.tar.gz "$temp_dir"
-    chmod +x ${SINGBOX_BIN}
-    
-    _success "sing-box 安装成功, 版本: $(${SINGBOX_BIN} version)"
+    local download_url
+    download_url=$(curl -fsSL "$api_url" | jq -r \
+        ".assets[] | select(.name | test(\"${expected_name_regex}\")) | .browser_download_url")
+
+    if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
+        _error "未能找到匹配 ${expected_name_regex} 的构建包。请检查架构或系统类型。"
+        exit 1
+    fi
+
+    # 5) 下载并安装
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    wget -qO "${tmp_dir}/singbox.tar.gz" "$download_url" || { _error "下载失败！"; rm -rf "$tmp_dir"; exit 1; }
+    tar -xzf "${tmp_dir}/singbox.tar.gz" -C "$tmp_dir" || { _error "解压失败！"; rm -rf "$tmp_dir"; exit 1; }
+
+    local extracted_dir
+    extracted_dir=$(find "$tmp_dir" -maxdepth 1 -type d -name "sing-box-*" | head -n 1)
+    if [ -z "$extracted_dir" ]; then
+        _error "未找到解压后的目录！"
+        rm -rf "$tmp_dir"
+        exit 1
+    fi
+
+    install -m 755 "${extracted_dir}/sing-box" ${SINGBOX_BIN} || { _error "安装失败！"; rm -rf "$tmp_dir"; exit 1; }
+    rm -rf "$tmp_dir"
+
+    _success "sing-box 安装成功, 版本: $(${SINGBOX_BIN} version 2>/dev/null || echo unknown)"
 }
 
 # --- 服务与配置管理 ---
