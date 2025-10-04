@@ -167,9 +167,10 @@ _install_sing_box() {
         is_musl="true"
     fi
 
-    # 3) 构造匹配正则（防止误下 amd64v3）
+    # 3) 构造严格匹配的资产名正则（避免误选 amd64v3 等变种）
     local expected_name_regex=""
     if [ "$arch_tag" = "armv7" ]; then
+        # armv7 通常只有 glibc 版
         expected_name_regex="^linux-${arch_tag}\\.tar\\.gz$"
     else
         if [ "$is_musl" = "true" ]; then
@@ -179,14 +180,15 @@ _install_sing_box() {
         fi
     fi
 
-    # 4) 获取下载地址（精确匹配）
+    # 4) 获取下载地址（用 jq 变量传正则，避免转义错误）
     local api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
     local download_url
-    download_url=$(curl -fsSL "$api_url" | jq -r \
-        ".assets[] | select(.name | test(\"${expected_name_regex}\")) | .browser_download_url")
+    download_url=$(curl -fsSL "$api_url" \
+        | jq -r --arg re "$expected_name_regex" \
+            '.assets[] | select(.name | test($re)) | .browser_download_url')
 
     if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
-        _error "未能找到匹配 ${expected_name_regex} 的构建包。请检查架构或系统类型。"
+        _error "未能在最新发布中找到匹配 ${expected_name_regex} 的构建包。请检查系统架构/环境。"
         exit 1
     fi
 
