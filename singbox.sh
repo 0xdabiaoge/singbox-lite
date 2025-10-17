@@ -360,72 +360,77 @@ _initialize_config_files() {
     if [ ! -s "$CLASH_YAML_FILE" ]; then
         _info "正在创建全新的 clash.yaml 配置文件..."
         cat > "$CLASH_YAML_FILE" << 'EOF'
-port: 7890
-socks-port: 7891
-mixed-port: 7892
-allow-lan: false
-bind-address: '*'
-mode: rule
-log-level: info
-ipv6: false
+mixed-port: 7890
+allow-lan: true
+bind-address: "*"
 find-process-mode: strict
-external-controller: '127.0.0.1:9090'
-profile:
-  store-selected: true
-  store-fake-ip: true
+mode: rule
 unified-delay: true
 tcp-concurrent: true
-ntp:
-  enable: true
-  write-to-system: false
-  server: ntp.aliyun.com
-  port: 123
-  interval: 30
-dns:
-  enable: true
-  respect-rules: true
-  use-system-hosts: true
-  prefer-h3: false
-  listen: '0.0.0.0:1053'
-  ipv6: false
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-  use-hosts: true
-  fake-ip-filter:
-    - +.lan
-    - +.local
-    - localhost.ptlogin2.qq.com
-    - +.msftconnecttest.com
-    - +.msftncsi.com
-  nameserver:
-    - 1.1.1.1
-    - 8.8.8.8
-    - 'https://1.1.1.1/dns-query'
-    - 'https://dns.quad9.net/dns-query'
-  default-nameserver:
-    - 1.1.1.1
-    - 8.8.8.8
-  proxy-server-nameserver:
-    - 223.5.5.5
-    - 119.29.29.29
-  fallback:
-    - 'https://1.0.0.1/dns-query'
-    - 'https://9.9.9.10/dns-query'
-  fallback-filter:
-    geoip: true
-    geoip-code: CN
-    ipcidr:
-      - 240.0.0.0/4
+log-level: info
+ipv6: true
+global-client-fingerprint: chrome
+external-controller: 127.0.0.1:9090
+external-ui: ui
+external-ui-url: "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip"
 tun:
   enable: true
   stack: system
-  auto-route: true
-  auto-detect-interface: true
-  strict-route: false
   dns-hijack:
-    - 'any:53'
-  device: SakuraiTunnel
-  endpoint-independent-nat: true
+    - 0.0.0.0:53
+  auto-detect-interface: true
+  auto-route: true
+  auto-redirect: false
+  strict-route: true
+  mtu: 1400
+profile:
+  store-selected: true
+  store-fake-ip: true
+sniffer:
+  enable: true
+  sniff:
+    TLS:
+      ports: [443, 8443]
+    HTTP:
+      ports: [80, 8080-8880]
+      override-destination: true
+    QUIC:
+      ports: [443, 8443]
+  skip-domain:
+    - "+.push.apple.com"
+dns:
+  enable: true
+  cache-algorithm: arc
+  prefer-h3: false
+  respect-rules: true
+  ipv6: true
+  default-nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+    - 223.5.5.5
+    - 119.29.29.29
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "*.lan"
+    - "*.local"
+    - "*.localdomain"
+    - "*.example"
+    - "*.invalid"
+    - "*.localhost"
+    - "*.test"
+    - "*.home.arpa"
+    - "*.direct"
+  nameserver-policy:
+    'rule-set:cn_domain,private_domain':
+      - https://dns.alidns.com/dns-query
+      - https://doh.pub/dns-query
+  nameserver:
+    - https://cloudflare-dns.com/dns-query
+    - https://dns.google/dns-query
+  proxy-server-nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
 proxies: []
 proxy-groups:
   - name: 节点选择
