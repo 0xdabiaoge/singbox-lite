@@ -32,7 +32,7 @@
 - **菜单选择查看节点分享链接，复制粘贴导入v2rayN即可使用**
 
 ## **线路机转发脚本命令使用方法**
-**上传relay-install.sh到线路机的/root目录下，执行chmod +x /root/relay-install.sh && /root/relay-install.sh**
+**上传relay-install.sh到线路机的/root目录下，执行```chmod +x /root/relay-install.sh && /root/relay-install.sh```**
 - **1. 查看链接: bash /root/relay-install.sh view**
 - **2. 重启服务: rc-service sing-box-relay restart**
 - **3. 查看日志: tail -f /var/log/sing-box-relay.log**
