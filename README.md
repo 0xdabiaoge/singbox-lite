@@ -67,7 +67,7 @@
 
 **2025.11.16更新要点（重大更新）：**
 
-**1、内置的Relay转发灵感来自[singbox-deploy](https://github.com/caigouzi121380/singbox-deploy)，感谢大佬提供的思路！**
+**1、内置的Relay转发灵感来自[singbox-deploy](https://github.com/caigouzi121380/singbox-deploy)，支持多个落地SS节点转发，感谢大佬提供的思路！**
 
 **2、用法：先在落地机使用脚本搭建SS协议，加密方式尽量选择shadowsocks-2022 (2022-blake3-aes-128-gcm)，因为后续比较方便。
 然后主菜单选择9、生成中转落地脚本，选择刚才创建的SS节点协议，会自动生成一份名为：relay-install.sh的脚本文件在/root目录下。
