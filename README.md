@@ -35,6 +35,7 @@
 - **1. 查看链接: bash /root/relay-install.sh view**
 - **2. 重启服务: rc-service sing-box-relay restart**
 - **3. 查看日志: tail -f /var/log/sing-box-relay.log**
+
    **如何卸载**
 - **1. 卸载配置: bash /root/relay-install.sh uninstall**
 - **2. 清除singbox主程序及脚本: rm /usr/local/bin/sing-box /root/relay-install.sh**
