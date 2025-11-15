@@ -10,6 +10,16 @@
 - **Hysteria2可选择开启QUIC流量混淆（需要客户端支持）**
 - **内置Relay转发功能，详细看版本更新说明**
 
+## **脚本支持的节点类型**
+- **VLESS (Vision+REALITY)，推荐直连使用**
+- **VLESS (WebSocket+TLS)，推荐直连使用，优选域名专用，目前仅支持手动上传域名证书文件**
+- **Trojan (WebSocket+TLS)，推荐直连使用，优选域名专用，目前仅支持手动上传域名证书文件**
+- **VLESS (tcp)，推荐落地使用**
+- **Hysteria2（自签证书），推荐直连使用**
+- **TUICv5（自签证书），推荐直连使用**
+- **Shadowsocks (aes-256-gcm，2022-blake3-aes-128-gcm)，推荐落地使用**
+- **Socks5，推荐落地使用**
+
 ### **使用以下命令运行脚本**
 
 **快捷命令：sb**
@@ -21,17 +31,13 @@
 - **Clash客户端配置文件位于/usr/local/etc/sing-box/clash.yaml，脚本默认的配置文件仅保证基础使用，效果不理想的请自行搜索解决**
 - **菜单选择查看节点分享链接，复制粘贴导入v2rayN即可使用**
 
-## **脚本支持的节点类型**
-- **VLESS (Vision+REALITY)，推荐直连使用**
-- **VLESS (WebSocket+TLS)，推荐直连使用，优选域名专用，目前仅支持手动上传域名证书文件**
-- **Trojan (WebSocket+TLS)，推荐直连使用，优选域名专用，目前仅支持手动上传域名证书文件**
-- **VLESS (tcp)，推荐落地使用**
-- **Hysteria2（自签证书），推荐直连使用**
-- **TUICv5（自签证书），推荐直连使用**
-- **Shadowsocks (aes-256-gcm，2022-blake3-aes-128-gcm)，推荐落地使用**
-- **Socks5，推荐落地使用**
-
-
+## **线路机转发脚本命令使用方法**
+- **1. 查看链接: bash /root/relay-install.sh view**
+- **2. 重启服务: rc-service sing-box-relay restart**
+- **3. 查看日志: tail -f /var/log/sing-box-relay.log**
+   **如何卸载**
+- **1. 卸载配置: bash /root/relay-install.sh uninstall**
+- **2. 清除singbox主程序及脚本: rm /usr/local/bin/sing-box /root/relay-install.sh**
 
 ## **版本更新说明**
 **2025.09.27更新要点：**
