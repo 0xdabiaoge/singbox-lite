@@ -34,8 +34,8 @@
 ## **线路机转发脚本命令使用方法**
 **上传relay-install.sh到线路机的/root目录下，执行```chmod +x /root/relay-install.sh && /root/relay-install.sh```**
 - **1. 查看链接: ```bash /root/relay-install.sh view```**
-- **2. 重启服务: Debian：```systemctl restart sing-box-relay```    Alpine：```rc-service sing-box-relay restart```**
-- **3. 查看日志: ```tail -f /var/log/sing-box-relay.log```**
+- **2. 重启服务: Debian：```systemctl restart sing-box-relay```   Alpine：```rc-service sing-box-relay restart```**
+- **3. 查看日志: Debian：```journalctl -u sing-box-relay -f```   Alpine：```tail -f /var/log/sing-box-relay.log```**
 
    **如何卸载**
 - **1. 卸载配置: ```bash /root/relay-install.sh uninstall```**
