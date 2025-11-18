@@ -8,7 +8,7 @@
 - **自动识别IPV4，ipv6**
 - **既有直连节点协议，也有落地节点协议**
 - **Hysteria2可选择开启QUIC流量混淆（需要客户端支持）**
-- **内置Relay转发功能，详细看版本更新说明**
+- **内置SingBox路由规则 (Route Rules)转发，详细看版本更新说明**
 
 ## **脚本支持的节点类型**
 - **VLESS (Vision+REALITY)，推荐直连使用**
@@ -32,14 +32,15 @@
 - **菜单选择查看节点分享链接，复制粘贴导入v2rayN即可使用**
 
 ## **线路机转发脚本命令使用方法**
-**上传relay-install.sh到线路机的/root目录下，执行```chmod +x /root/relay-install.sh && /root/relay-install.sh```**
+- **1. 将落地机生成的relay-install.sh脚本文件上传到线路机的/root目录下，执行```chmod +x /root/relay-install.sh && /root/relay-install.sh```**
 - **1. 查看链接: ```bash /root/relay-install.sh view```**
+- **2. 添加中转路由: ```bash /root/relay-install.sh add```**
+- **3. 删除指定中转路由: ```bash /root/relay-install.sh delete```**
 - **2. 重启服务: Debian：```systemctl restart sing-box-relay```   Alpine：```rc-service sing-box-relay restart```**
 - **3. 查看日志: Debian：```journalctl -u sing-box-relay -f```   Alpine：```tail -f /var/log/sing-box-relay.log```**
 
    **如何卸载**
 - **1. 卸载配置: ```bash /root/relay-install.sh uninstall```**
-- **2. 清除singbox主程序及脚本: ```rm /usr/local/bin/sing-box /root/relay-install.sh```**
 
 ## **版本更新说明**
 **2025.09.27更新要点：**
@@ -65,9 +66,9 @@
 
 **1、修改了Vless+WS+TLS的搭建方式，可选择跳过证书验证**
 
-**2025.11.16更新要点（重大更新）：**
+**2025.11.18更新要点（## **重大更新**）：**
 
-**1、内置的Relay转发灵感来自[singbox-deploy](https://github.com/caigouzi121380/singbox-deploy)，支持多个落地SS节点转发，感谢大佬提供的思路！**
+**1、内置SingBox路由规则 (Route Rules)转发灵感来自[singbox-deploy](https://github.com/caigouzi121380/singbox-deploy)，支持多个落地SS节点转发，感谢大佬提供的思路！**
 
 **2、用法：先在落地机使用脚本搭建SS协议，加密方式尽量选择shadowsocks-2022 (2022-blake3-aes-128-gcm)，因为后续比较方便。
 然后主菜单选择9、生成中转落地脚本，选择刚才创建的SS节点协议，会自动生成一份名为：relay-install.sh的脚本文件在/root目录下。
