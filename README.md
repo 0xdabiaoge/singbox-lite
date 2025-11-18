@@ -66,7 +66,7 @@
 
 **1、修改了Vless+WS+TLS的搭建方式，可选择跳过证书验证**
 
-**2025.11.18更新要点（## **重大更新**）：**
+##**2025.11.18更新要点（重大更新）：**
 
 **1、内置SingBox路由规则 (Route Rules)转发灵感来自[singbox-deploy](https://github.com/caigouzi121380/singbox-deploy)，支持多个落地SS节点转发，感谢大佬提供的思路！**
 
