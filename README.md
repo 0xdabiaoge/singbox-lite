@@ -30,6 +30,7 @@
 ## **使用方法**
 - **Clash客户端配置文件位于/usr/local/etc/sing-box/clash.yaml，脚本默认的配置文件仅保证基础使用，效果不理想的请自行搜索解决**
 - **菜单选择查看节点分享链接，复制粘贴导入v2rayN即可使用**
+- **如果想查看SS的密码，请到/usr/local/etc/sing-box目录下，打开config.json文件查看**
 
 ## **线路机转发脚本命令使用方法**
 - **1. 将落地机生成的relay-install.sh脚本文件上传到线路机的/root目录下，执行```chmod +x /root/relay-install.sh && /root/relay-install.sh```**
