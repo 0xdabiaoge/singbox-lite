@@ -1,37 +1,32 @@
 #!/bin/bash
-# 通用 Sing-box 中转脚本 (Universal Relay Script)
-# 用法: bash <(curl -sL https://.../relay.sh) --token <BASE64_TOKEN>
-
-# --- 颜色定义 ---
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+# Universal Sing-box Relay Manager
+# 保存为: relay.sh
 
 # --- 全局变量 ---
 SINGBOX_BIN="/usr/local/bin/sing-box"
 CONFIG_DIR="/etc/sing-box"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
 SERVICE_NAME="sing-box-relay"
+SELF_PATH="/root/relay.sh" # 脚本自我复制的目标路径
 
-# --- 依赖检查 ---
+# --- 颜色 ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# --- 核心工具函数 ---
+_info() { echo -e "${CYAN}[INFO] $1${NC}"; }
+_error() { echo -e "${RED}[ERROR] $1${NC}"; exit 1; }
 _check_deps() {
     if ! command -v jq &>/dev/null; then
-        echo -e "${YELLOW}正在安装 jq...${NC}"
         if [ -f /etc/alpine-release ]; then apk add --no-cache jq curl bash openssl
         elif command -v apt-get &>/dev/null; then apt-get update && apt-get install -y jq curl openssl
         elif command -v yum &>/dev/null; then yum install -y jq curl openssl
         fi
     fi
 }
-
-# --- 辅助函数 ---
-_url_encode() { echo -n "$1" | jq -s -R -r @uri; }
-_info() { echo -e "${CYAN}[INFO] $1${NC}"; }
-_error() { echo -e "${RED}[ERROR] $1${NC}"; exit 1; }
-
-# --- 安装 Sing-box ---
 _install_core() {
     if [ -f "$SINGBOX_BIN" ]; then return; fi
     _info "正在安装 Sing-box 核心..."
@@ -48,154 +43,164 @@ _install_core() {
     chmod +x "$SINGBOX_BIN"
     rm -rf sing-box.tar.gz sing-box-*
 }
-
-# --- 生成自签名证书 ---
-_gen_cert() {
-    local domain=$1
-    local name=$2
-    openssl ecparam -genkey -name prime256v1 -out "${CONFIG_DIR}/${name}.key" >/dev/null 2>&1
-    openssl req -new -x509 -days 3650 -key "${CONFIG_DIR}/${name}.key" -out "${CONFIG_DIR}/${name}.pem" -subj "/CN=${domain}" >/dev/null 2>&1
+_ensure_self_persist() {
+    # 确保脚本保存在 /root/relay.sh 以便 Option 10 调用
+    if [[ "$0" != "$SELF_PATH" ]]; then
+        cp "$0" "$SELF_PATH"
+        chmod +x "$SELF_PATH"
+    fi
+}
+_reload_service() {
+    if command -v systemctl &>/dev/null; then
+        systemctl restart "$SERVICE_NAME"
+    elif command -v rc-service &>/dev/null; then
+        rc-service "$SERVICE_NAME" restart
+    else
+        $SINGBOX_BIN run -c $CONFIG_FILE > /var/log/sing-box-relay.log 2>&1 &
+    fi
+    _info "服务已重启"
 }
 
-# --- 主逻辑：解析 Token 并生成配置 ---
-_main() {
-    local TOKEN=""
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --token) TOKEN="$2"; shift ;;
-            *) shift ;;
-        esac
-        shift
-    done
+# --- 功能函数 ---
 
-    if [ -z "$TOKEN" ]; then
-        echo "===================================================="
-        echo -e "${RED}错误：未提供配置令牌 (--token)${NC}"
-        echo "请从落地机脚本获取完整的安装命令。"
-        echo "===================================================="
-        exit 1
+# 1. 解析 Token 并生成配置片段
+_parse_token_to_json() {
+    local token="$1"
+    local inbound_port="$2"
+    local inbound_proto="$3" # vless/hy2/tuic
+    local sni="$4"
+    local tag_suffix="$inbound_port"
+    
+    local decoded=$(echo "$token" | base64 -d 2>/dev/null)
+    if ! echo "$decoded" | jq . >/dev/null 2>&1; then _error "Token 无效"; fi
+    
+    local l_type=$(echo "$decoded" | jq -r .type)
+    local out_tag="out-${tag_suffix}"
+    local in_tag="in-${tag_suffix}"
+    
+    # 构建 Outbound (落地)
+    local outbound=$(echo "$decoded" | jq --arg tag "$out_tag" '. + {"tag": $tag}')
+    if [[ "$l_type" =~ ^(vless|trojan|hysteria2|tuic)$ ]]; then
+         outbound=$(echo "$outbound" | jq '.tls += {"insecure": true}')
     fi
-
-    _check_deps
-    _install_core
-    mkdir -p "$CONFIG_DIR"
-
-    # 1. 解码 Token
-    local DECODED_JSON=$(echo "$TOKEN" | base64 -d 2>/dev/null)
-    if ! echo "$DECODED_JSON" | jq . >/dev/null 2>&1; then
-        _error "Token 解析失败，格式无效。"
-    fi
-
-    # 2. 提取落地机信息 (Outbound)
-    local L_TYPE=$(echo "$DECODED_JSON" | jq -r .type)
-    local L_SERVER=$(echo "$DECODED_JSON" | jq -r .server)
-    local L_PORT=$(echo "$DECODED_JSON" | jq -r .server_port)
-    local L_TAG="relay-out"
     
-    _info "检测到落地节点协议: ${YELLOW}${L_TYPE}${NC} -> ${L_SERVER}:${L_PORT}"
-
-    # 3. 构建 Outbound JSON (根据不同协议)
-    # 注意：这里我们直接复用 decoded_json 中的大部分字段，但需要调整结构以适应 outbound
-    local OUTBOUND_JSON=""
+    # 构建 Inbound (入口)
+    local inbound=""
+    local uuid=$($SINGBOX_BIN generate uuid)
+    local password=$($SINGBOX_BIN generate rand 16 --hex)
     
-    # 基础结构
-    local BASE_OUTBOUND=$(echo "$DECODED_JSON" | jq --arg tag "$L_TAG" '. + {"tag": $tag}')
-    
-    # 针对特定协议的修正 (Sing-box Outbound 结构微调)
-    case "$L_TYPE" in
-        shadowsocks)
-            OUTBOUND_JSON="$BASE_OUTBOUND"
+    case "$inbound_proto" in
+        vless) # Vision + Reality
+            local kp=$($SINGBOX_BIN generate reality-keypair)
+            local pk=$(echo "$kp" | awk '/PrivateKey/ {print $2}')
+            local pub=$(echo "$kp" | awk '/PublicKey/ {print $2}')
+            local sid=$($SINGBOX_BIN generate rand 8 --hex)
+            inbound=$(jq -n --arg p "$inbound_port" --arg t "$in_tag" --arg u "$uuid" --arg s "$sni" --arg pk "$pk" --arg sid "$sid" \
+                '{type:"vless",tag:$t,listen:"::",listen_port:($p|tonumber),users:[{uuid:$u,flow:"xtls-rprx-vision"}],tls:{enabled:true,server_name:$s,reality:{enabled:true,handshake:{server:$s,server_port:443},private_key:$pk,short_id:[$sid]}}}')
+            echo "vless://${uuid}@$(curl -s4 icanhazip.com):${inbound_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp#Relay-${inbound_port}" > "/tmp/relay_link_${inbound_port}.txt"
             ;;
-        vless|trojan)
-            # 确保 TLS 和 Transport 正确
-            # 落地机通常是 Server 配置，我们需要转为 Client 配置
-            # 这里的 Token 生成器(主脚本) 必须确保传过来的是 Client 兼容的结构
-            # 比如: skip-cert-verify 需要在 token 生成时或者这里强制加上
-            OUTBOUND_JSON=$(echo "$BASE_OUTBOUND" | jq '.tls += {"insecure": true}')
+        hy2)
+            _gen_cert "$sni" "$in_tag"
+            inbound=$(jq -n --arg p "$inbound_port" --arg t "$in_tag" --arg pw "$password" --arg c "${CONFIG_DIR}/${in_tag}.pem" --arg k "${CONFIG_DIR}/${in_tag}.key" \
+                '{type:"hysteria2",tag:$t,listen:"::",listen_port:($p|tonumber),users:[{password:$pw}],tls:{enabled:true,certificate_path:$c,key_path:$k,alpn:["h3"]}}')
+            echo "hysteria2://${password}@$(curl -s4 icanhazip.com):${inbound_port}?sni=${sni}&insecure=1#Relay-${inbound_port}" > "/tmp/relay_link_${inbound_port}.txt"
             ;;
-        hysteria2|tuic)
-            OUTBOUND_JSON=$(echo "$BASE_OUTBOUND" | jq '.tls += {"insecure": true}')
-            ;;
-        *)
-            _error "暂不支持的中转落地协议: $L_TYPE"
+        tuic)
+            _gen_cert "$sni" "$in_tag"
+            inbound=$(jq -n --arg p "$inbound_port" --arg t "$in_tag" --arg u "$uuid" --arg pw "$password" --arg c "${CONFIG_DIR}/${in_tag}.pem" --arg k "${CONFIG_DIR}/${in_tag}.key" \
+                '{type:"tuic",tag:$t,listen:"::",listen_port:($p|tonumber),users:[{uuid:$u,password:$pw}],congestion_control:"bbr",tls:{enabled:true,certificate_path:$c,key_path:$k,alpn:["h3"]}}')
+            echo "tuic://${uuid}:${password}@$(curl -s4 icanhazip.com):${inbound_port}?sni=${sni}&alpn=h3&congestion_control=bbr&allow_insecure=1#Relay-${inbound_port}" > "/tmp/relay_link_${inbound_port}.txt"
             ;;
     esac
+    
+    # 写入 Config
+    local rule="{\"inbound\":\"$in_tag\",\"outbound\":\"$out_tag\"}"
+    
+    # 初始化 Config 如果不存在
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo '{"log":{"level":"info"},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[]}}' > "$CONFIG_FILE"
+    fi
+    
+    # 原子写入
+    cp "$CONFIG_FILE" "${CONFIG_FILE}.tmp"
+    jq ".inbounds += [$inbound]" "${CONFIG_FILE}.tmp" > "${CONFIG_FILE}.tmp2" && mv "${CONFIG_FILE}.tmp2" "${CONFIG_FILE}.tmp"
+    jq ".outbounds += [$outbound]" "${CONFIG_FILE}.tmp" > "${CONFIG_FILE}.tmp2" && mv "${CONFIG_FILE}.tmp2" "${CONFIG_FILE}.tmp"
+    jq ".route.rules += [$rule]" "${CONFIG_FILE}.tmp" > "${CONFIG_FILE}.tmp2" && mv "${CONFIG_FILE}.tmp2" "${CONFIG_FILE}.tmp"
+    mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+}
 
-    # 4. 配置中转机入口 (Inbound)
+_gen_cert() {
+    openssl ecparam -genkey -name prime256v1 -out "${CONFIG_DIR}/$2.key" >/dev/null 2>&1
+    openssl req -new -x509 -days 3650 -key "${CONFIG_DIR}/$2.key" -out "${CONFIG_DIR}/$2.pem" -subj "/CN=$1" >/dev/null 2>&1
+}
+
+# --- 菜单动作 ---
+
+_add_relay() {
+    local token=""
     echo "===================================================="
-    echo "请选择 [中转机] 的入口协议 (客户端连接到本机的协议):"
-    echo "  1) VLESS Vision + Reality (推荐)"
+    echo "步骤 1: 请输入落地机生成的 Token"
+    read -p "Token: " token
+    [ -z "$token" ] && return
+    
+    echo "----------------------------------------------------"
+    echo "步骤 2: 选择中转入口协议"
+    echo "  1) VLESS Vision+Reality (推荐)"
     echo "  2) Hysteria2"
     echo "  3) TUIC v5"
-    echo "===================================================="
-    read -p "请选择 [1-3]: " IN_CHOICE
-
-    local INBOUND_JSON=""
-    local LISTEN_PORT
-    read -p "请输入中转监听端口 (留空随机): " LISTEN_PORT
-    [ -z "$LISTEN_PORT" ] && LISTEN_PORT=$((RANDOM % 45000 + 10000))
+    read -p "选择 [1-3]: " choice
+    local proto="vless"
+    case "$choice" in 2) proto="hy2";; 3) proto="tuic";; esac
     
-    local UUID=$($SINGBOX_BIN generate uuid)
-    local PASSWORD=$($SINGBOX_BIN generate rand 16 --hex)
-    local SNI="www.microsoft.com"
-    local LINK=""
-
-    case "$IN_CHOICE" in
-        1) # VLESS Reality
-            local KP=$($SINGBOX_BIN generate reality-keypair)
-            local PK=$(echo "$KP" | awk '/PrivateKey/ {print $2}')
-            local PUB=$(echo "$KP" | awk '/PublicKey/ {print $2}')
-            local SID=$($SINGBOX_BIN generate rand 8 --hex)
-            
-            INBOUND_JSON=$(jq -n \
-                --argport "$LISTEN_PORT" --arg uuid "$UUID" --arg pk "$PK" --arg pub "$PUB" --arg sid "$SID" --arg sni "$SNI" \
-                '{
-                    "type": "vless", "tag": "in-relay", "listen": "::", "listen_port": ($argport|tonumber),
-                    "users": [{"uuid": $uuid, "flow": "xtls-rprx-vision"}],
-                    "tls": {
-                        "enabled": true, "server_name": $sni,
-                        "reality": {"enabled": true, "handshake": {"server": $sni, "server_port": 443}, "private_key": $pk, "short_id": [$sid]}
-                    }
-                }')
-             LINK="vless://${UUID}@$(curl -s4 icanhazip.com):${LISTEN_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#Relay-VLESS"
-             ;;
-        2) # Hysteria2
-            _gen_cert "$SNI" "hy2"
-            INBOUND_JSON=$(jq -n \
-                --argport "$LISTEN_PORT" --arg pw "$PASSWORD" --arg cert "${CONFIG_DIR}/hy2.pem" --arg key "${CONFIG_DIR}/hy2.key" \
-                '{
-                    "type": "hysteria2", "tag": "in-relay", "listen": "::", "listen_port": ($argport|tonumber),
-                    "users": [{"password": $pw}],
-                    "tls": {"enabled": true, "certificate_path": $cert, "key_path": $key, "alpn": ["h3"]}
-                }')
-            LINK="hysteria2://${PASSWORD}@$(curl -s4 icanhazip.com):${LISTEN_PORT}?sni=${SNI}&insecure=1#Relay-Hy2"
-            ;;
-        3) # TUIC
-            _gen_cert "$SNI" "tuic"
-            INBOUND_JSON=$(jq -n \
-                --argport "$LISTEN_PORT" --arg uuid "$UUID" --arg pw "$PASSWORD" --arg cert "${CONFIG_DIR}/tuic.pem" --arg key "${CONFIG_DIR}/tuic.key" \
-                '{
-                    "type": "tuic", "tag": "in-relay", "listen": "::", "listen_port": ($argport|tonumber),
-                    "users": [{"uuid": $uuid, "password": $pw}],
-                    "congestion_control": "bbr",
-                    "tls": {"enabled": true, "certificate_path": $cert, "key_path": $key, "alpn": ["h3"]}
-                }')
-            LINK="tuic://${UUID}:${PASSWORD}@$(curl -s4 icanhazip.com):${LISTEN_PORT}?sni=${SNI}&alpn=h3&congestion_control=bbr&allow_insecure=1#Relay-TUIC"
-            ;;
-        *) _error "无效选择" ;;
-    esac
-
-    # 5. 生成最终 Config
-    cat > "$CONFIG_FILE" <<EOF
-{
-  "log": { "level": "info", "timestamp": true },
-  "inbounds": [ $INBOUND_JSON ],
-  "outbounds": [ $OUTBOUND_JSON, { "type": "direct", "tag": "direct" } ],
-  "route": { "rules": [ { "inbound": "in-relay", "outbound": "relay-out" } ] }
+    echo "----------------------------------------------------"
+    read -p "步骤 3: 监听端口 (留空随机): " port
+    [ -z "$port" ] && port=$((RANDOM % 45000 + 10000))
+    read -p "步骤 4: 伪装域名 (默认 www.microsoft.com): " sni
+    [ -z "$sni" ] && sni="www.microsoft.com"
+    
+    _info "正在配置..."
+    _parse_token_to_json "$token" "$port" "$proto" "$sni"
+    _reload_service
+    
+    echo ""
+    _info "添加成功！链接如下："
+    cat "/tmp/relay_link_${port}.txt"
+    rm -f "/tmp/relay_link_${port}.txt"
+    echo ""
+    read -p "按回车继续..."
 }
-EOF
 
-    # 6. 启动服务
+_list_relays() {
+    clear
+    echo "--- 当前中转节点 ---"
+    # 简易解析，仅供参考
+    jq -r '.inbounds[] | "\(.tag) -> 端口: \(.listen_port) (类型: \(.type))"' "$CONFIG_FILE" 2>/dev/null
+    echo ""
+    read -p "按回车继续..."
+}
+
+_delete_relay() {
+    _list_relays
+    read -p "请输入要删除的节点 Tag (例如 in-12345): " tag
+    if [ -z "$tag" ]; then return; fi
+    
+    # 查找对应的 outbound tag (通过 port 关联通常是 in-PORT 和 out-PORT)
+    local port=$(echo "$tag" | cut -d'-' -f2)
+    local out_tag="out-${port}"
+    
+    cp "$CONFIG_FILE" "${CONFIG_FILE}.tmp"
+    jq "del(.inbounds[] | select(.tag == \"$tag\"))" "${CONFIG_FILE}.tmp" > "${CONFIG_FILE}.tmp2" && mv "${CONFIG_FILE}.tmp2" "${CONFIG_FILE}.tmp"
+    jq "del(.outbounds[] | select(.tag == \"$out_tag\"))" "${CONFIG_FILE}.tmp" > "${CONFIG_FILE}.tmp2" && mv "${CONFIG_FILE}.tmp2" "${CONFIG_FILE}.tmp"
+    jq "del(.route.rules[] | select(.inbound == \"$tag\"))" "${CONFIG_FILE}.tmp" > "${CONFIG_FILE}.tmp2" && mv "${CONFIG_FILE}.tmp2" "${CONFIG_FILE}.tmp"
+    mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+    
+    rm -f "${CONFIG_DIR}/${tag}.pem" "${CONFIG_DIR}/${tag}.key"
+    _reload_service
+    _info "删除完成。"
+}
+
+# --- 入口 ---
+_init_system() {
     if command -v systemctl &>/dev/null; then
         cat > /etc/systemd/system/${SERVICE_NAME}.service <<EOF
 [Unit]
@@ -207,16 +212,60 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload && systemctl enable ${SERVICE_NAME} && systemctl restart ${SERVICE_NAME}
-    else
-        # 简单 OpenRC 支持
-        $SINGBOX_BIN run -c $CONFIG_FILE > /var/log/sing-box-relay.log 2>&1 &
+        systemctl daemon-reload && systemctl enable ${SERVICE_NAME}
     fi
-
-    echo ""
-    _info "✅ 中转服务已部署！"
-    echo -e "🔗 中转链接: ${YELLOW}${LINK}${NC}"
-    echo "===================================================="
 }
 
-_main "$@"
+main() {
+    _check_deps
+    _install_core
+    mkdir -p "$CONFIG_DIR"
+    _ensure_self_persist
+    
+    # 如果带 token 参数，执行自动安装模式 (Option 9 生成的命令会走到这里)
+    if [[ "$1" == "--token" ]]; then
+        _init_system
+        # 交互式询问入口参数，或者你可以修改这里变为全自动
+        # 为了兼容 Option 9 生成的命令：
+        echo "===================================================="
+        echo "检测到快速部署模式"
+        echo "请选择中转入口协议:"
+        echo "  1) VLESS Reality"
+        echo "  2) Hysteria2"
+        echo "  3) TUIC v5"
+        read -p "选择 [1-3]: " c
+        local p="vless"
+        case "$c" in 2) p="hy2";; 3) p="tuic";; esac
+        read -p "端口 (留空随机): " pt
+        [ -z "$pt" ] && pt=$((RANDOM % 45000 + 10000))
+        _parse_token_to_json "$2" "$pt" "$p" "www.microsoft.com"
+        _reload_service
+        cat "/tmp/relay_link_${pt}.txt"
+        rm -f "/tmp/relay_link_${pt}.txt"
+        exit 0
+    fi
+
+    # 否则进入管理菜单 (Option 10 调用会走到这里)
+    while true; do
+        clear
+        echo "=============================="
+        echo "   Sing-box 中转管理脚本"
+        echo "=============================="
+        echo "  1. 添加中转 (需 Token)"
+        echo "  2. 查看列表"
+        echo "  3. 删除中转"
+        echo "  4. 重启服务"
+        echo "  0. 退出"
+        echo "=============================="
+        read -p "选项: " opt
+        case "$opt" in
+            1) _add_relay ;;
+            2) _list_relays ;;
+            3) _delete_relay ;;
+            4) _reload_service ;;
+            0) exit 0 ;;
+        esac
+    done
+}
+
+main "$@"
