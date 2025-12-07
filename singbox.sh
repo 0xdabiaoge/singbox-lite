@@ -24,7 +24,7 @@ INIT_SYSTEM="" # 将存储 'systemd', 'openrc' 或 'direct'
 SERVICE_FILE="" # 将根据 INIT_SYSTEM 设置
 
 # 脚本元数据
-SCRIPT_VERSION="5.0" 
+SCRIPT_VERSION="6.0" 
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh" 
 
 # 全局状态变量
