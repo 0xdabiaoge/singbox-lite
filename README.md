@@ -32,17 +32,6 @@
 - **菜单选择查看节点分享链接，复制粘贴导入v2rayN即可使用**
 - **如果想查看SS的密码，请到/usr/local/etc/sing-box目录下，打开config.json文件查看**
 
-## **线路机转发脚本命令使用方法**
-- **1. 将落地机生成的relay-install.sh脚本文件上传到线路机的/root目录下，执行```chmod +x /root/relay-install.sh && /root/relay-install.sh```**
-- **1. 查看链接: ```bash /root/relay-install.sh view```**
-- **2. 添加中转路由: ```bash /root/relay-install.sh add```**
-- **3. 删除指定中转路由: ```bash /root/relay-install.sh delete```**
-- **2. 重启服务: Debian：```systemctl restart sing-box-relay```   Alpine：```rc-service sing-box-relay restart```**
-- **3. 查看日志: Debian：```journalctl -u sing-box-relay -f```   Alpine：```tail -f /var/log/sing-box-relay.log```**
-
-   **如何卸载**
-- **1. 卸载线路机转发脚本及配置服务: ```bash /root/relay-install.sh uninstall```**
-
 ## **版本更新说明**
 **2025.09.27更新要点：**
 
