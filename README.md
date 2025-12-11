@@ -90,11 +90,11 @@
 6. 自动创建本地适配层
 ```
 
-**支持的第三方链接格式：**
-- `vless://...` (VLESS-Reality)
-- `hysteria2://...`
-- `tuic://...`
-- `ss://...` (Shadowsocks, 支持多种编码格式)
+**支持导入的第三方节点链接：**
+- VLESS (Vision+REALITY)
+- Hysteria2
+- TUICv5
+- Shadowsocks
 
 ---
 
@@ -172,5 +172,6 @@
 - ✅ Clash
 - ✅ Shadowrocket
 - ✅ 所有标准客户端
+
 
 ---
