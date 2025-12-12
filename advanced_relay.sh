@@ -101,6 +101,39 @@ _remove_node_from_relay_yaml() {
     _info "已从 YAML 配置中删除节点: ${proxy_name}"
 }
 
+
+# 初始化辅助目录
+_init_relay_dirs() {
+    # 确保辅助目录存在
+    if [ ! -d "$RELAY_AUX_DIR" ]; then
+        mkdir -p "$RELAY_AUX_DIR"
+        _info "已创建辅助目录: $RELAY_AUX_DIR"
+    fi
+    
+    # 确保 relay_links.json 存在
+    local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
+    if [ ! -f "$LINKS_FILE" ]; then
+        echo '{}' > "$LINKS_FILE"
+        _info "已初始化链接存储文件: $LINKS_FILE"
+    fi
+    
+    # 确保 clash.yaml 存在
+    if [ ! -f "$RELAY_CLASH_YAML" ]; then
+        cat > "$RELAY_CLASH_YAML" << 'EOF'
+proxies: []
+proxy-groups:
+  - name: 节点选择
+    type: select
+    proxies: []
+rules:
+  - GEOIP,PRIVATE,DIRECT,no-resolve
+  - GEOIP,CN,DIRECT
+  - MATCH,节点选择
+EOF
+        _info "已初始化 YAML 配置文件: $RELAY_CLASH_YAML"
+    fi
+}
+
 # 检查依赖
 _check_deps() {
     if ! command -v jq &>/dev/null; then
@@ -621,9 +654,16 @@ _view_relays() {
     
     if [ ! -f "$CONFIG_FILE" ]; then _error "配置文件不存在。"; return; fi
     
+    # 检查 route.rules 是否存在
+    if ! jq -e '.route.rules' "$CONFIG_FILE" >/dev/null 2>&1; then
+        _warn "当前没有任何中转路由规则。"
+        read -p "按回车键继续..."
+        return
+    fi
+    
     # 查找中转路由规则：outbound tag 以 "relay-out-" 开头的
     # 这样可以排除第三方适配层的内部路由（outbound 是 third-party-xxx）
-    local rules=$(jq -c '.route.rules[] | select(.inbound != null and .outbound != null and (.outbound | startswith("relay-out-")))' "$CONFIG_FILE")
+    local rules=$(jq -c '.route.rules[] | select(.inbound != null and .outbound != null and (.outbound | startswith("relay-out-")))' "$CONFIG_FILE" 2>/dev/null)
     
     if [ -z "$rules" ]; then
         _warn "当前没有任何中转路由规则。"
@@ -697,6 +737,13 @@ _delete_relay() {
     local CONFIG_FILE="$MAIN_CONFIG_FILE"
     
     if [ ! -f "$CONFIG_FILE" ]; then _error "配置文件不存在。"; return; fi
+    
+    # 检查 route.rules 是否存在
+    if ! jq -e '.route.rules' "$CONFIG_FILE" >/dev/null 2>&1; then
+        _warn "没有可删除的中转路由。"
+        read -p "按回车键继续..."
+        return
+    fi
     
     # 仅查找真正的中转路由（outbound 以 relay-out- 开头）
     local rules=$(jq -c '.route.rules[] | select(.inbound != null and .outbound != null and (.outbound | startswith("relay-out-")))' "$CONFIG_FILE")
@@ -877,7 +924,14 @@ _modify_relay_port() {
         return
     fi
     
-    local rules=$(jq -c '.route.rules[] | select(.inbound != null and .outbound != null)' "$CONFIG_FILE")
+    # 检查 route.rules 是否存在
+    if ! jq -e '.route.rules' "$CONFIG_FILE" >/dev/null 2>&1; then
+        _warn "没有可修改的中转路由。"
+        read -p "按回车键继续..."
+        return
+    fi
+    
+    local rules=$(jq -c '.route.rules[] | select(.inbound != null and .outbound != null)' "$CONFIG_FILE" 2>/dev/null)
     
     if [ -z "$rules" ]; then
         _warn "没有可修改的中转路由。"
@@ -1051,6 +1105,7 @@ _modify_relay_port() {
 # --- 菜单 ---
 _advanced_menu() {
     _check_deps
+    _init_relay_dirs
     while true; do
         clear
         echo "========================================"
