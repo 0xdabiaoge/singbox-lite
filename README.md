@@ -30,11 +30,12 @@
 |------|---------|-----------|---------|
 | VLESS-Reality | ✅ | ✅ | ✅ |
 | VLESS-WS-TLS | ✅ | ❌ | ❌ |
-| VLESS-TCP | ✅ | ❌ | ✅ |
+| AnyTLS | ✅ | ❌ | ✅ |
 | Trojan-WS-TLS | ✅ | ❌ | ❌ |
 | Hysteria2 | ✅ | ✅ | ✅ |
 | TUICv5 | ✅ | ✅ | ✅ |
 | Shadowsocks | ✅ | ✅ | ✅ |
+| VLESS-TCP | ✅ | ❌ | ✅ |
 | SOCKS5 | ✅ | ❌ | ❌ |
 
 ---
@@ -182,3 +183,4 @@
 
 ### 2025.12.14
 - **更新加入AnyTLS协议，同时支持AnyTLS作为中转入口协议的支持**
+
