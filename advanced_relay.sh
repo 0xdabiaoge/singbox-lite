@@ -247,6 +247,9 @@ _landing_config() {
         _warn "请先在主菜单中添加节点。"
         return
     fi
+    
+    # 获取本机IP，用于生成Token中的地址
+    local server_ip=$(_get_public_ip)
 
     # 筛选支持的协议: VLESS-TCP (不含 Reality), Shadowsocks (aes-256-gcm, 2022-blake3-aes-128-gcm)
     local nodes=$(jq -c '.inbounds[] | select(
@@ -320,28 +323,11 @@ _landing_config() {
     
     # 检测节点监听地址，如果是本地地址则使用 127.0.0.1
     local listen_addr=$(echo "$selected_node" | jq -r '.listen // "::"')
-    local token_addr=""
+    local token_addr="$server_ip"
     
     if [[ "$listen_addr" == "127.0.0.1" || "$listen_addr" == "localhost" ]]; then
         token_addr="127.0.0.1"
         _warn "检测到本地节点（第三方适配层），Token 将使用 127.0.0.1"
-    else
-        # [关键修改] 从 Clash YAML 中获取已存储的服务器地址（可能是 DDNS 域名）
-        local YQ_BINARY="/usr/local/bin/yq"
-        local CLASH_YAML_FILE="/usr/local/etc/sing-box/clash.yaml"
-        
-        if [ -f "$YQ_BINARY" ] && [ -f "$CLASH_YAML_FILE" ]; then
-            # 优先使用端口匹配查找对应的 proxy
-            token_addr=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}') | .server' "$CLASH_YAML_FILE" 2>/dev/null | head -n 1)
-        fi
-        
-        # 如果无法从 YAML 获取，则回退到获取公网 IP
-        if [ -z "$token_addr" ] || [ "$token_addr" == "null" ]; then
-            _warn "无法从已有配置中获取服务器地址，将自动获取公网 IP"
-            token_addr=$(_get_public_ip)
-        else
-            _info "使用已配置的服务器地址: ${token_addr}"
-        fi
     fi
     
     case "$type" in
