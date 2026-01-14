@@ -1993,8 +1993,8 @@ _add_hysteria2() {
                 local hop_count=$((port_range_end - port_range_start + 1))
                 local use_multiport="false"
 
-                if [ "$hop_count" -le 50 ]; then
-                    _info "端口范围较小 (${hop_count} 个)，将使用 多端口监听模式 (兼容 LXC 和 NAT VPS)..."
+                if [ "$hop_count" -le 1000 ]; then
+                    _info "端口范围适中 (${hop_count} 个)，将使用 多端口监听模式 (兼容 LXC 和 NAT VPS)..."
                     use_multiport="true"
                 else
                     _info "端口范围较大，将尝试使用 iptables 转发模式..."
@@ -3673,8 +3673,8 @@ _batch_create_nodes() {
         local hop_count=$((hy2_hop_end - hy2_hop_start + 1))
         local use_multiport="false"
 
-        if [ "$hop_count" -le 50 ]; then
-             _info "端口范围较小 (${hop_count} 个)，将使用 多端口监听模式 (兼容 LXC 和 NAT VPS)..."
+        if [ "$hop_count" -le 1000 ]; then
+             _info "端口范围适中 (${hop_count} 个)，将使用 多端口监听模式 (兼容 LXC 和 NAT VPS)..."
              use_multiport="true"
              
              _info "正在生成多端口监听配置 (${hy2_hop_start}-${hy2_hop_end})..."
