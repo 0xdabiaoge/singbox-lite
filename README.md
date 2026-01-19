@@ -61,9 +61,9 @@
 
 **快捷命令：sb**
 
-### 快速部署（新机器初始化）
+### 快速部署
 
-一条命令自动部署 VLESS-Reality、Hysteria2、TUICv5 三节点，适用于云服务商实例初始化：
+一条命令自动部署 VLESS-Reality、Hysteria2、TUICv5 三节点，适用于实例初始化：
 
 ```
 (curl -sSL https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -qO /usr/local/bin/sb https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh) && chmod +x /usr/local/bin/sb && sb -q
@@ -214,6 +214,10 @@
 ### 2026.01.13
 - **增加 Hysteria2 端口跳跃功能**：引入应用层多端口监听模式，彻底解决 LXC/NAT 机器无法使用端口跳跃的问题，同时保留对大端口段的 iptables 支持。
 - **优化主脚本&子脚本**：优化交互流程和界面。
+
+### 2026.01.19
+- **加入定时重启功能**：自动获取服务器当前时间和时区，并显示与北京时间的时差，方便设置定时重启，适合一些需要定时重启singbox的用户
+- **加入快速部署三节点模式**：快速部署三节点适合给一些实例的初始化、新开实例、重装实例使用，会自动部署本脚本，并在SSH登录的时候自动显示三节点的节点链接，端口为随机端口（NAT机器需要自行映射端口）
 
 
 
