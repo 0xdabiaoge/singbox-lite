@@ -36,6 +36,9 @@ SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/mai
 # 全局状态变量
 server_ip=""
 
+# 快速部署模式标志
+QUICK_DEPLOY_MODE=false
+
 # --- 工具函数 ---
 
 # 打印消息
@@ -3485,24 +3488,25 @@ _main_menu() {
         echo -e "  ${CYAN}【服务控制】${NC}"
         echo -e "    ${GREEN}[7]${NC} 重启服务          ${GREEN}[8]${NC} 停止服务"
         echo -e "    ${GREEN}[9]${NC} 查看运行状态     ${GREEN}[10]${NC} 查看实时日志"
+        echo -e "   ${GREEN}[11]${NC} 定时重启设置"
         echo ""
         
         # 配置与更新
         echo -e "  ${CYAN}【配置与更新】${NC}"
-        echo -e "   ${GREEN}[11]${NC} 检查配置文件     ${GREEN}[12]${NC} 更新脚本"
-        echo -e "   ${GREEN}[13]${NC} 更新核心         ${RED}[14]${NC} 卸载脚本"
+        echo -e "   ${GREEN}[12]${NC} 检查配置文件     ${GREEN}[13]${NC} 更新脚本"
+        echo -e "   ${GREEN}[14]${NC} 更新核心         ${RED}[15]${NC} 卸载脚本"
         echo ""
         
         # 进阶功能
         echo -e "  ${CYAN}【进阶功能】${NC}"
-        echo -e "   ${GREEN}[15]${NC} 落地/中转配置"
+        echo -e "   ${GREEN}[16]${NC} 落地/中转配置"
         echo ""
         
         echo -e "  ─────────────────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 退出脚本"
         echo ""
         
-        read -p "  请输入选项 [0-15]: " choice
+        read -p "  请输入选项 [0-16]: " choice
 
         case $choice in
             1) _show_add_node_menu ;;
@@ -3515,17 +3519,397 @@ _main_menu() {
             8) _manage_service "stop" ;;
             9) _manage_service "status" ;;
             10) _view_log ;;
-            11) _check_config ;;
-            12) _update_script ;;
-            13) _update_singbox_core ;;
-            14) _uninstall ;; 
-            15) _advanced_features ;;
+            11) _scheduled_restart_menu ;;
+            12) _check_config ;;
+            13) _update_script ;;
+            14) _update_singbox_core ;;
+            15) _uninstall ;; 
+            16) _advanced_features ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
         echo
         read -n 1 -s -r -p "按任意键返回主菜单..."
     done
+}
+
+# 定时重启功能
+_scheduled_restart_menu() {
+    clear
+    echo -e "${CYAN}"
+    echo '  ╔═══════════════════════════════════════╗'
+    echo '  ║         定时重启 sing-box             ║'
+    echo '  ╚═══════════════════════════════════════╝'
+    echo -e "${NC}"
+    echo ""
+    
+    # 获取服务器时间信息
+    local server_time=$(date '+%Y-%m-%d %H:%M:%S')
+    local server_tz_offset=$(date +%z)  # 如: +0800, +0000, -0500
+    local server_tz_name=$(date +%Z 2>/dev/null || echo "Unknown")  # 如: CST, UTC
+    
+    # 解析时区偏移 (格式: +0800 或 -0500)
+    local offset_sign="${server_tz_offset:0:1}"
+    local offset_hours="${server_tz_offset:1:2}"
+    local offset_mins="${server_tz_offset:3:2}"
+    
+    # 去除前导零
+    offset_hours=$((10#$offset_hours))
+    offset_mins=$((10#$offset_mins))
+    
+    # 计算总偏移分钟数
+    local server_offset_mins=$((offset_hours * 60 + offset_mins))
+    if [ "$offset_sign" == "-" ]; then
+        server_offset_mins=$((-server_offset_mins))
+    fi
+    
+    # 北京时间 = UTC+8 = +480 分钟
+    local beijing_offset_mins=480
+    local diff_mins=$((beijing_offset_mins - server_offset_mins))
+    local diff_hours=$((diff_mins / 60))
+    local diff_remaining_mins=$((diff_mins % 60))
+    
+    # 格式化显示
+    local diff_display=""
+    if [ $diff_mins -gt 0 ]; then
+        diff_display="北京时间比服务器快 ${diff_hours} 小时"
+        if [ $diff_remaining_mins -ne 0 ]; then
+            diff_display="${diff_display} ${diff_remaining_mins} 分钟"
+        fi
+    elif [ $diff_mins -lt 0 ]; then
+        diff_display="北京时间比服务器慢 $((-diff_hours)) 小时"
+        if [ $diff_remaining_mins -ne 0 ]; then
+            diff_display="${diff_display} $((-diff_remaining_mins)) 分钟"
+        fi
+    else
+        diff_display="服务器与北京时间同步"
+    fi
+    
+    # 检查当前定时任务状态
+    local current_cron=$(crontab -l 2>/dev/null | grep "sing-box" | grep -v "^#")
+    local cron_status="未设置"
+    local cron_time=""
+    if [ -n "$current_cron" ]; then
+        # 解析 cron 时间 (格式: 分 时 * * * 命令)
+        local cron_min=$(echo "$current_cron" | awk '{print $1}')
+        local cron_hour=$(echo "$current_cron" | awk '{print $2}')
+        cron_time=$(printf "%02d:%02d" "$cron_hour" "$cron_min")
+        cron_status="已启用 (每天 ${cron_time} 重启)"
+    fi
+    
+    echo -e "  ${CYAN}【服务器时间信息】${NC}"
+    echo -e "    当前时间: ${GREEN}${server_time}${NC}"
+    echo -e "    时区: ${GREEN}${server_tz_name} (UTC${server_tz_offset})${NC}"
+    echo -e "    与北京时间: ${YELLOW}${diff_display}${NC}"
+    echo ""
+    echo -e "  ${CYAN}【定时重启状态】${NC}"
+    if [ -n "$current_cron" ]; then
+        echo -e "    状态: ${GREEN}${cron_status}${NC}"
+    else
+        echo -e "    状态: ${YELLOW}${cron_status}${NC}"
+    fi
+    echo ""
+    echo -e "  ─────────────────────────────────────────"
+    echo -e "    ${GREEN}[1]${NC} 设置定时重启"
+    echo -e "    ${GREEN}[2]${NC} 查看当前设置"
+    echo -e "    ${RED}[3]${NC} 取消定时重启"
+    echo ""
+    echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
+    echo ""
+    
+    read -p "  请输入选项 [0-3]: " choice
+    
+    case $choice in
+        1)
+            echo ""
+            echo -e "  ${CYAN}设置定时重启时间${NC}"
+            echo -e "  提示: 输入服务器时区的时间 (24小时制)"
+            echo ""
+            read -p "  请输入重启时间 (格式 HH:MM, 如 04:30): " restart_time
+            
+            # 验证时间格式
+            if [[ ! "$restart_time" =~ ^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$ ]]; then
+                _error "时间格式错误！请使用 HH:MM 格式 (如 04:30)"
+                return
+            fi
+            
+            local hour=$(echo "$restart_time" | cut -d: -f1)
+            local min=$(echo "$restart_time" | cut -d: -f2)
+            
+            # 去除前导零
+            hour=$((10#$hour))
+            min=$((10#$min))
+            
+            # 构建重启命令
+            local restart_cmd=""
+            if [ "$INIT_SYSTEM" == "systemd" ]; then
+                restart_cmd="systemctl restart sing-box"
+            elif [ "$INIT_SYSTEM" == "openrc" ]; then
+                restart_cmd="rc-service sing-box restart"
+            else
+                restart_cmd="/usr/local/bin/sing-box run -c ${CONFIG_FILE}"
+            fi
+            
+            # 添加 cron 任务 (先删除旧的，再添加新的)
+            (crontab -l 2>/dev/null | grep -v "sing-box") | crontab -
+            (crontab -l 2>/dev/null; echo "$min $hour * * * $restart_cmd > /dev/null 2>&1") | crontab -
+            
+            if [ $? -eq 0 ]; then
+                _success "定时重启已设置！"
+                echo ""
+                echo -e "  重启时间: ${GREEN}每天 $(printf "%02d:%02d" "$hour" "$min")${NC} (服务器时区)"
+                
+                # 计算对应的北京时间
+                local beijing_hour=$((hour + diff_hours))
+                local beijing_min=$((min + diff_remaining_mins))
+                
+                # 处理分钟溢出
+                if [ $beijing_min -ge 60 ]; then
+                    beijing_min=$((beijing_min - 60))
+                    beijing_hour=$((beijing_hour + 1))
+                elif [ $beijing_min -lt 0 ]; then
+                    beijing_min=$((beijing_min + 60))
+                    beijing_hour=$((beijing_hour - 1))
+                fi
+                
+                # 处理小时溢出
+                if [ $beijing_hour -ge 24 ]; then
+                    beijing_hour=$((beijing_hour - 24))
+                elif [ $beijing_hour -lt 0 ]; then
+                    beijing_hour=$((beijing_hour + 24))
+                fi
+                
+                echo -e "  对应北京时间: ${YELLOW}$(printf "%02d:%02d" "$beijing_hour" "$beijing_min")${NC}"
+            else
+                _error "设置定时任务失败！请检查 cron 服务是否正常运行"
+            fi
+            ;;
+        2)
+            echo ""
+            echo -e "  ${CYAN}当前 cron 任务:${NC}"
+            local all_cron=$(crontab -l 2>/dev/null | grep "sing-box")
+            if [ -n "$all_cron" ]; then
+                echo -e "  ${GREEN}$all_cron${NC}"
+            else
+                echo -e "  ${YELLOW}无 sing-box 相关定时任务${NC}"
+            fi
+            ;;
+        3)
+            echo ""
+            if [ -z "$current_cron" ]; then
+                _warning "当前没有设置定时重启"
+            else
+                read -p "$(echo -e ${YELLOW}"  确定取消定时重启? (y/N): "${NC})" confirm
+                if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+                    (crontab -l 2>/dev/null | grep -v "sing-box") | crontab -
+                    _success "定时重启已取消"
+                else
+                    _info "已取消操作"
+                fi
+            fi
+            ;;
+        0)
+            return
+            ;;
+        *)
+            _error "无效输入"
+            ;;
+    esac
+    
+    echo ""
+    read -n 1 -s -r -p "按任意键继续..."
+}
+
+# 快速部署模式 - 静默创建3个节点
+_quick_deploy() {
+    echo ""
+    echo -e "${CYAN}========================================${NC}"
+    echo -e "${CYAN}     sing-box 快速部署模式${NC}"
+    echo -e "${CYAN}========================================${NC}"
+    echo ""
+    
+    # 获取公网 IP
+    _info "正在获取服务器公网 IP..."
+    server_ip=$(curl -s4 --max-time 5 icanhazip.com || curl -s4 --max-time 5 ipinfo.io/ip)
+    if [ -z "$server_ip" ]; then
+        server_ip=$(curl -s6 --max-time 5 icanhazip.com || curl -s6 --max-time 5 ipinfo.io/ip)
+    fi
+    if [ -z "$server_ip" ]; then
+        _error "无法获取公网 IP，快速部署终止"
+        exit 1
+    fi
+    _success "服务器 IP: ${server_ip}"
+    
+    # 生成3个不重复的随机端口
+    local ports=()
+    while [ ${#ports[@]} -lt 3 ]; do
+        local p=$(shuf -i 10000-60000 -n 1)
+        # 确保端口不重复
+        local duplicate=false
+        for existing in "${ports[@]}"; do
+            if [ "$existing" -eq "$p" ]; then
+                duplicate=true
+                break
+            fi
+        done
+        if [ "$duplicate" = false ]; then
+            # 确保端口未被配置占用
+            if ! jq -e ".inbounds[] | select(.listen_port == $p)" "$CONFIG_FILE" >/dev/null 2>&1; then
+                ports+=("$p")
+            fi
+        fi
+    done
+    
+    local port_reality=${ports[0]}
+    local port_hy2=${ports[1]}
+    local port_tuic=${ports[2]}
+    
+    local sni="www.microsoft.com"
+    local name_prefix="Quick"
+    
+    # 用于收集分享链接
+    local links=()
+    
+    # IPv6 处理
+    local yaml_ip="$server_ip"
+    local link_ip="$server_ip"
+    [[ "$server_ip" == *":"* ]] && link_ip="[$server_ip]"
+    
+    _info "正在创建节点..."
+    echo ""
+    
+    # ===== 1. VLESS-Reality =====
+    _info "[1/3] 创建 VLESS-Reality 节点..."
+    local tag_reality="vless-in-${port_reality}"
+    local uuid_reality=$(${SINGBOX_BIN} generate uuid)
+    local keypair=$(${SINGBOX_BIN} generate reality-keypair)
+    local pk=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
+    local pbk=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
+    local sid=$(${SINGBOX_BIN} generate rand --hex 8)
+    local flow="xtls-rprx-vision"
+    
+    local inbound_reality=$(jq -n --arg t "$tag_reality" --arg p "$port_reality" --arg u "$uuid_reality" --arg f "$flow" --arg sn "$sni" --arg pk "$pk" --arg sid "$sid" \
+        '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":$f}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
+    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_reality]"
+    
+    local meta_reality=$(jq -n --arg pk "$pbk" --arg sid "$sid" '{"publicKey": $pk, "shortId": $sid}')
+    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag_reality\": $meta_reality}"
+    
+    local proxy_reality=$(jq -n --arg n "${name_prefix}-Reality-${port_reality}" --arg s "$yaml_ip" --arg p "$port_reality" --arg u "$uuid_reality" --arg sn "$sni" --arg pk "$pbk" --arg sid "$sid" --arg f "$flow" \
+        '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"flow":$f,"tls":true,"servername":$sn,"reality-opts":{"public-key":$pk,"short-id":$sid},"client-fingerprint":"chrome","network":"tcp"}')
+    _add_node_to_yaml "$proxy_reality"
+    
+    local link_reality="vless://${uuid_reality}@${link_ip}:${port_reality}?security=reality&encryption=none&pbk=${pbk}&fp=chrome&type=tcp&flow=${flow}&sni=${sni}&sid=${sid}#$(_url_encode "${name_prefix}-Reality-${port_reality}")"
+    links+=("$link_reality")
+    _success "  端口: ${port_reality}"
+    
+    # ===== 2. Hysteria2 =====
+    _info "[2/3] 创建 Hysteria2 节点..."
+    local tag_hy2="hy2-in-${port_hy2}"
+    local password_hy2=$(${SINGBOX_BIN} generate rand --hex 16)
+    local cert_hy2="${SINGBOX_DIR}/${tag_hy2}.pem"
+    local key_hy2="${SINGBOX_DIR}/${tag_hy2}.key"
+    
+    _generate_self_signed_cert "$sni" "$cert_hy2" "$key_hy2"
+    
+    local inbound_hy2=$(jq -n --arg t "$tag_hy2" --arg p "$port_hy2" --arg pw "$password_hy2" --arg cert "$cert_hy2" --arg key "$key_hy2" \
+        '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
+    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_hy2]"
+    
+    local meta_hy2=$(jq -n '{"up": "500 Mbps", "down": "500 Mbps"}')
+    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag_hy2\": $meta_hy2}"
+    
+    local proxy_hy2=$(jq -n --arg n "${name_prefix}-Hy2-${port_hy2}" --arg s "$yaml_ip" --arg p "$port_hy2" --arg pw "$password_hy2" --arg sn "$sni" \
+        '{"name":$n,"type":"hysteria2","server":$s,"port":($p|tonumber),"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"up":"500 Mbps","down":"500 Mbps"}')
+    _add_node_to_yaml "$proxy_hy2"
+    
+    local link_hy2="hysteria2://${password_hy2}@${link_ip}:${port_hy2}?sni=${sni}&insecure=1#$(_url_encode "${name_prefix}-Hy2-${port_hy2}")"
+    links+=("$link_hy2")
+    _success "  端口: ${port_hy2}"
+    
+    # ===== 3. TUIC =====
+    _info "[3/3] 创建 TUIC 节点..."
+    local tag_tuic="tuic-in-${port_tuic}"
+    local uuid_tuic=$(${SINGBOX_BIN} generate uuid)
+    local password_tuic=$(${SINGBOX_BIN} generate rand --hex 16)
+    local cert_tuic="${SINGBOX_DIR}/${tag_tuic}.pem"
+    local key_tuic="${SINGBOX_DIR}/${tag_tuic}.key"
+    
+    _generate_self_signed_cert "$sni" "$cert_tuic" "$key_tuic"
+    
+    local inbound_tuic=$(jq -n --arg t "$tag_tuic" --arg p "$port_tuic" --arg u "$uuid_tuic" --arg pw "$password_tuic" --arg cert "$cert_tuic" --arg key "$key_tuic" \
+        '{"type":"tuic","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"password":$pw}],"congestion_control":"bbr","tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
+    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_tuic]"
+    
+    local proxy_tuic=$(jq -n --arg n "${name_prefix}-TUIC-${port_tuic}" --arg s "$yaml_ip" --arg p "$port_tuic" --arg u "$uuid_tuic" --arg pw "$password_tuic" --arg sn "$sni" \
+        '{"name":$n,"type":"tuic","server":$s,"port":($p|tonumber),"uuid":$u,"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"congestion-controller":"bbr","udp-relay-mode":"native"}')
+    _add_node_to_yaml "$proxy_tuic"
+    
+    local link_tuic="tuic://${uuid_tuic}:${password_tuic}@${link_ip}:${port_tuic}?sni=${sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "${name_prefix}-TUIC-${port_tuic}")"
+    links+=("$link_tuic")
+    _success "  端口: ${port_tuic}"
+    
+    # 重启服务
+    _info "正在启动服务..."
+    _manage_service "restart"
+    
+    # 生成 Base64 订阅
+    local all_links=""
+    for link in "${links[@]}"; do
+        all_links+="${link}\n"
+    done
+    local base64_sub=$(echo -e "$all_links" | base64 -w 0)
+    
+    # 输出节点信息
+    echo ""
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}     sing-box 快速部署完成！${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo ""
+    echo -e "服务器 IP: ${CYAN}${server_ip}${NC}"
+    echo ""
+    echo -e "${YELLOW}[VLESS-Reality]${NC} 端口: ${port_reality}"
+    echo -e "${link_reality}"
+    echo ""
+    echo -e "${YELLOW}[Hysteria2]${NC} 端口: ${port_hy2}"
+    echo -e "${link_hy2}"
+    echo ""
+    echo -e "${YELLOW}[TUIC]${NC} 端口: ${port_tuic}"
+    echo -e "${link_tuic}"
+    echo ""
+    echo -e "${GREEN}----------------------------------------${NC}"
+    echo -e "${YELLOW}Base64 订阅（可直接导入客户端）:${NC}"
+    echo -e "${CYAN}${base64_sub}${NC}"
+    echo -e "${GREEN}----------------------------------------${NC}"
+    echo ""
+    echo -e "运行 ${YELLOW}sb${NC} 进入管理菜单"
+    echo -e "${GREEN}========================================${NC}"
+    
+    # 写入 MOTD (SSH 登录显示)
+    local motd_file="/etc/motd"
+    cat > "$motd_file" << EOF
+=====================================
+    sing-box 节点信息
+=====================================
+服务器 IP: ${server_ip}
+
+[VLESS-Reality] 端口: ${port_reality}
+${link_reality}
+
+[Hysteria2] 端口: ${port_hy2}
+${link_hy2}
+
+[TUIC] 端口: ${port_tuic}
+${link_tuic}
+
+-------------------------------------
+Base64 订阅:
+${base64_sub}
+-------------------------------------
+运行 sb 进入管理菜单
+=====================================
+EOF
+    _success "节点信息已写入 /etc/motd (SSH登录时自动显示)"
 }
 
 # 批量创建节点
@@ -3928,8 +4312,27 @@ main() {
         _manage_service "start"
     fi
     
+    # 6. 快速部署模式检测
+    if [ "$QUICK_DEPLOY_MODE" = true ]; then
+        _quick_deploy
+        exit 0
+    fi
+    
     _get_public_ip
     _main_menu
 }
+
+# 解析命令行参数
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -q|--quick-deploy)
+            QUICK_DEPLOY_MODE=true
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
 
 main
