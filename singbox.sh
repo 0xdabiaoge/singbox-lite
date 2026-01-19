@@ -3543,6 +3543,43 @@ _scheduled_restart_menu() {
     echo -e "${NC}"
     echo ""
     
+    # 检测并安装 cron
+    if ! command -v crontab &> /dev/null; then
+        _warning "检测到系统未安装 cron，正在安装..."
+        if command -v apt-get &> /dev/null; then
+            apt-get update -qq && apt-get install -y cron > /dev/null 2>&1
+            # 启动 cron 服务
+            if command -v systemctl &> /dev/null; then
+                systemctl start cron 2>/dev/null
+                systemctl enable cron 2>/dev/null
+            fi
+        elif command -v apk &> /dev/null; then
+            apk add --no-cache dcron > /dev/null 2>&1
+            # Alpine 使用 dcron，需要启动服务
+            rc-service dcron start 2>/dev/null
+            rc-update add dcron default 2>/dev/null
+        elif command -v yum &> /dev/null; then
+            yum install -y cronie > /dev/null 2>&1
+            systemctl start crond 2>/dev/null
+            systemctl enable crond 2>/dev/null
+        fi
+        
+        # 再次检测
+        if ! command -v crontab &> /dev/null; then
+            _error "cron 安装失败！请手动安装 cron 后重试"
+            echo ""
+            echo "  Debian/Ubuntu: apt install cron"
+            echo "  Alpine: apk add dcron"
+            echo "  CentOS/RHEL: yum install cronie"
+            echo ""
+            read -n 1 -s -r -p "按任意键返回..."
+            return
+        fi
+        _success "cron 安装成功！"
+        echo ""
+    fi
+
+    
     # 获取服务器时间信息
     local server_time=$(date '+%Y-%m-%d %H:%M:%S')
     local server_tz_offset=$(date +%z)  # 如: +0800, +0000, -0500
