@@ -51,11 +51,30 @@
 
 ## 📥 安装
 
+### 交互式安装（推荐）
+
+进入交互菜单手动配置节点：
+
 ```
 (curl -LfsS https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -q https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
 ```
 
 **快捷命令：sb**
+
+### 快速部署（新机器初始化）
+
+一条命令自动部署 VLESS-Reality、Hysteria2、TUICv5 三节点，适用于云服务商实例初始化：
+
+```
+(curl -sSL https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -qO /usr/local/bin/sb https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh) && chmod +x /usr/local/bin/sb && sb -q
+```
+
+**特点**：
+- ✅ 端口随机分配
+- ✅ SNI 默认使用 www.microsoft.com
+- ✅ 自动输出节点链接和 Base64 订阅
+- ✅ SSH 登录时自动显示节点信息
+- ✅ 部署后可运行 `sb` 进入管理菜单
 
 ---
 
@@ -76,11 +95,12 @@
 8. **停止 sing-box** - 停止服务
 9. **查看运行状态** - 查看服务状态
 10. **查看实时日志** - 查看 sing-box 日志
-11. **检查配置文件** - 验证配置文件语法
-12. **更新脚本** - 更新管理脚本
-13. **更新 Sing-box 核心** - 更新 sing-box 程序
-14. **卸载** - 完全卸载 sing-box
-15. **进阶功能** - 进入中转配置
+11. **定时重启设置** - 设置每天自动重启 sing-box（显示服务器时区与北京时间时差）
+12. **检查配置文件** - 验证配置文件语法
+13. **更新脚本** - 更新管理脚本
+14. **更新 Sing-box 核心** - 更新 sing-box 程序
+15. **卸载** - 完全卸载 sing-box
+16. **进阶功能** - 进入中转配置
 
 #### 导入第三方节点
 
