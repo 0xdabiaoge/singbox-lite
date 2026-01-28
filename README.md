@@ -16,7 +16,7 @@
       </a>
     </td>
     <td align="center" width="220">
-      <a href="https://lazycats.online/" target="_blank">
+      <a href="https://lazycats.vip/" target="_blank">
         <img src="https://lazycats.online/upload/logo2.png" width="100" alt="懒猫云" />
         <br><sub><b>懒猫云</b></sub>
       </a>
@@ -250,6 +250,7 @@
 - **优化内存回收机制**：优化了跑测速时会出现singbox进程被杀死，目前测试下来内存回收机制还算不错，起码能够顺利跑完测速。
 - **hy2节点协议优化**：hy2节点协议不再需要手动输入上下行的限制，目前写死了10Gbps（也就是10000M），会自动根据机器的带宽进行调整。
 - **AnyTLS协议优化**：优化了AnyTLS协议的填充机制，保证AnyTLS协议的强伪装前提下，降低了不少延迟，提高了不少速度。
+
 
 
 
