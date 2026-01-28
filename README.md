@@ -2,6 +2,30 @@
 
 一套功能完整的 sing-box 节点管理和中转配置脚本，支持多种协议和高级中转功能。
 
+## 💯 本项目顺利落地，特别鸣谢两家提供机器
+
+<div align="center">
+
+<table>
+  <tr>
+    </td>
+    <td align="center" width="220">
+      <a href="https://incudal.com/" target="_blank">
+        <img src="https://incudal.com/incudal_logo.webp" width="100" alt="Incudal" />
+        <br><sub><b>Incudal</b></sub>
+      </a>
+    </td>
+    <td align="center" width="220">
+      <a href="https://lazycats.online/" target="_blank">
+        <img src="https://lazycats.online/upload/logo2.png" width="100" alt="懒猫云" />
+        <br><sub><b>懒猫云</b></sub>
+      </a>
+    </td>
+  </tr>
+</table>
+
+</div>
+
 ## ✨ 特性
 
 ### 主脚本 (singbox.sh)
@@ -226,6 +250,7 @@
 - **优化内存回收机制**：优化了跑测速时会出现singbox进程被杀死，目前测试下来内存回收机制还算不错，起码能够顺利跑完测速。
 - **hy2节点协议优化**：hy2节点协议不再需要手动输入上下行的限制，目前写死了10Gbps（也就是10000M），会自动根据机器的带宽进行调整。
 - **AnyTLS协议优化**：优化了AnyTLS协议的填充机制，保证AnyTLS协议的强伪装前提下，降低了不少延迟，提高了不少速度。
+
 
 
 
