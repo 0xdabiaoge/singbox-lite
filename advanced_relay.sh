@@ -170,6 +170,82 @@ EOF
     fi
 }
 
+# 检查并下载解析脚本
+_check_parser() {
+    local PARSER_BIN="${RELAY_AUX_DIR}/parser.sh"
+    
+    # 优先检测当前目录 (调试模式)
+    if [ -f "./parser.sh" ]; then
+        _info "检测到本地 parser.sh，使用本地版本进行调试。"
+        chmod +x "./parser.sh"
+        return 0
+    fi
+
+    if [ ! -f "$PARSER_BIN" ]; then
+        _info "正在下载解析脚本 (parser.sh)..."
+        local PARSER_URL="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/parser.sh"
+        if ! wget -qO "$PARSER_BIN" "$PARSER_URL"; then
+             _error "解析脚本下载失败，请检查网络！"
+             return 1
+        fi
+        _success "解析脚本下载成功。"
+    fi
+    
+    # 确保有执行权限
+    chmod +x "$PARSER_BIN"
+}
+
+# --- 2.1 导入第三方节点链接 ---
+_import_link_config() {
+    _check_parser || return
+    local PARSER_BIN="${RELAY_AUX_DIR}/parser.sh"
+    if [ -f "./parser.sh" ]; then PARSER_BIN="./parser.sh"; fi
+
+    echo "================================================"
+    echo "         配置为 [中转机] (导入第三方链接) "
+    echo "================================================"
+    echo "支持协议: VLESS-Reality, VLESS-WS， Hy2 (Hysteria2), TUICv5, Shadowsocks, Trojan-WS, AnyTLS"
+    echo "请输入节点分享链接:"
+    read -r share_link
+    
+    if [ -z "$share_link" ]; then _error "输入为空。"; return; fi
+    
+    _info "正在解析链接..."
+    local outbound_json=$(bash "$PARSER_BIN" "$share_link")
+    
+    if [ -z "$outbound_json" ] || echo "$outbound_json" | jq -e '.error' >/dev/null 2>&1; then
+        _error "链接解析失败！"
+        local err_msg=$(echo "$outbound_json" | jq -r '.error // "未知错误"')
+        _error "错误信息: $err_msg"
+        return
+    fi
+    
+    local dest_type=$(echo "$outbound_json" | jq -r '.type')
+    local dest_addr=$(echo "$outbound_json" | jq -r '.server')
+    local dest_port=$(echo "$outbound_json" | jq -r '.server_port')
+    
+    # [屏蔽逻辑] 检查是否为 SS-2022
+    if [ "$dest_type" == "shadowsocks" ]; then
+        local dest_method=$(echo "$outbound_json" | jq -r '.method // empty')
+        if [[ "$dest_method" == *"2022"* ]]; then
+             echo -e "${YELLOW}================================================================${NC}"
+             _warn "检测到导入的节点协议为 Shadowsocks-2022 !"
+             _warn "由于本机 (中转机) 未进行精确时间同步，连接极大概率会失败 (Time skew)。"
+             _warn "建议更换其他协议，或务必确保已执行 chronyd 时间同步。"
+             echo -e "${YELLOW}================================================================${NC}"
+             read -p "是否仍要继续? (y/N): " continue_choice
+             if [[ "$continue_choice" != "y" && "$continue_choice" != "Y" ]]; then
+                 return
+             fi
+        fi
+    fi
+    
+    # 修正 outbound_tag 占位符
+    outbound_json=$(echo "$outbound_json" | jq '.tag = "TEMP_TAG"')
+
+    _finalize_relay_setup "$dest_type" "$dest_addr" "$dest_port" "$outbound_json"
+}
+
 # 检查依赖
 _check_deps() {
     if ! command -v jq &>/dev/null; then
@@ -268,7 +344,7 @@ EOF
 
 # --- 1. 落地机配置 (生成 Token) ---
 _landing_config() {
-    _info "正在读取本机节点配置..."
+    _info "正在读取本机所有节点配置..."
     
     if [ ! -f "$MAIN_CONFIG_FILE" ]; then
         _error "配置文件不存在: $MAIN_CONFIG_FILE"
@@ -281,17 +357,14 @@ _landing_config() {
     # 定义 YQ 和 CLASH 配置文件路径
     local YQ_BINARY="/usr/local/bin/yq"
     local MAIN_CLASH_YAML="/usr/local/etc/sing-box/clash.yaml"
+    local METADATA_FILE="/usr/local/etc/sing-box/metadata.json"
 
-    # 筛选支持的协议: VLESS-TCP (不含 Reality), Shadowsocks (aes-256-gcm, 2022-blake3-aes-128-gcm)
-    local nodes=$(jq -c '.inbounds[] | select(
-        (.type=="vless" and (.tls.enabled == false or .tls == null)) or 
-        (.type=="shadowsocks" and (.method == "aes-256-gcm" or .method == "2022-blake3-aes-128-gcm"))
-    )' "$MAIN_CONFIG_FILE")
+    # 获取所有有效的落地节点 (排除 tag 为 direct 的 outbound，获取所有 inbounds)
+    local nodes=$(jq -c '.inbounds[] | select(.tag != "direct")' "$MAIN_CONFIG_FILE")
 
     if [ -z "$nodes" ]; then
-        _error "未找到符合要求的落地节点协议。"
-        _warn "仅支持: VLESS-TCP, Shadowsocks(aes-256-gcm / 2022-blake3-aes-128-gcm)"
-        _warn "请先去主菜单 [1) 添加节点] 创建上述类型的节点。"
+        _error "未找到任何落地节点。"
+        _warn "请先去主菜单 [1) 添加节点] 创建节点。"
         return
     fi
 
@@ -302,40 +375,47 @@ _landing_config() {
     local i=1
     local node_list=()
     
+    local has_ss2022=false
     while IFS= read -r node; do
+        [ -z "$node" ] && continue
         local tag=$(echo "$node" | jq -r '.tag')
         local type=$(echo "$node" | jq -r '.type')
         local port=$(echo "$node" | jq -r '.listen_port')
         
+        # [屏蔽逻辑] 屏蔽 SS-2022 节点
+        if [ "$type" == "shadowsocks" ]; then
+            local method=$(echo "$node" | jq -r '.method // empty')
+            if [[ "$method" == *"2022"* ]]; then
+                has_ss2022=true
+                continue
+            fi
+        fi
+        
         # 尝试从 metadata 中获取自定义名称
         local display_name="$tag"
-        if [ -f "/usr/local/etc/sing-box/metadata.json" ]; then
-            local node_meta=$(jq -r --arg t "$tag" '.[$t] // empty' "/usr/local/etc/sing-box/metadata.json" 2>/dev/null)
+        if [ -f "$METADATA_FILE" ]; then
+            local node_meta=$(jq -r --arg t "$tag" '.[$t] // empty' "$METADATA_FILE" 2>/dev/null)
             if [ -n "$node_meta" ]; then
                 local node_type=$(echo "$node_meta" | jq -r '.type // empty')
                 if [ "$node_type" == "third-party-adapter" ]; then
-                    # 第三方适配层：显示自定义适配层名称
                     local adapter_name=$(echo "$node_meta" | jq -r '.adapter_name // empty')
+            
+            
                     local adapter_type=$(echo "$node_meta" | jq -r '.adapter_type // empty')
-                    if [ -n "$adapter_name" ]; then
-                        display_name="${adapter_name} [${adapter_type}适配层]"
-                    else
-                        # 兼容旧版本（没有adapter_name字段）
-                        local source_name=$(echo "$node_meta" | jq -r '.source_name // empty')
-                        if [ -n "$source_name" ] && [ -n "$adapter_type" ]; then
-                            display_name="${source_name} [${adapter_type}适配层]"
-                        fi
-                    fi
+                    [ -n "$adapter_name" ] && display_name="${adapter_name} [${adapter_type}适配层]"
                 fi
             fi
         fi
         
         local desc="${display_name} (${type}:${port})"
-        
         echo -e " ${GREEN}$i)${NC} $desc"
         node_list+=("$node")
         ((i++))
     done <<< "$nodes"
+    
+    if [ "$has_ss2022" == "true" ]; then
+        echo -e "${YELLOW}[注意] 已自动隐藏 Shadowsocks-2022 节点 (因需要同步时间，故屏蔽SS2022的节点加密方式)${NC}"
+    fi
     
     echo " 0) 返回"
     read -p "请输入选项: " choice
@@ -349,65 +429,182 @@ _landing_config() {
     local type=$(echo "$selected_node" | jq -r '.type')
     local port=$(echo "$selected_node" | jq -r '.listen_port')
     
-    # --- 全新逻辑：自动从 clash.yaml 提取地址 (支持 DDNS) ---
+    # 自动检测地址
     local token_addr="$server_ip"
     local use_auto_detect=false
-    
     if [ -f "$MAIN_CLASH_YAML" ] && [ -f "$YQ_BINARY" ]; then
-        # 尝试根据端口查找对应的 server 地址
-        # 逻辑：查找 proxies 数组中 port 等于目标端口的第一个节点
         local detected_addr=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}') | .server' "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
-        
         if [ -n "$detected_addr" ] && [ "$detected_addr" != "null" ]; then
             token_addr="$detected_addr"
             use_auto_detect=true
-            _info "自动检测到连接地址: ${CYAN}${token_addr}${NC} (来源于 clash.yaml)"
-        else
-            _warn "无法从配置中自动读取地址，降级使用公网 IP。"
+            _info "自动检测到连接地址: ${CYAN}${token_addr}${NC}"
         fi
     fi
     
-    # 检测节点监听地址，如果是本地地址则使用 127.0.0.1 (适配层)
+    # 检测落地机监听地址 (适配层强制 127.0.0.1)
     local listen_addr=$(echo "$selected_node" | jq -r '.listen // "::"')
     if [[ "$listen_addr" == "127.0.0.1" || "$listen_addr" == "localhost" ]]; then
         token_addr="127.0.0.1"
-        _warn "检测到本地节点（第三方适配层），Token 将强制使用 127.0.0.1"
-    elif [ "$use_auto_detect" = false ]; then
-        _info "使用服务器公网 IP: ${token_addr}"
     fi
+
+    # --- 核心改造：全协议出站(Outbound)构造器 ---
+    _info "正在构造全协议中转 Token..."
     
-    # --- 提取字段并构建 Token JSON ---
-    local token_json=""
-    
+    local outbound_json=""
     case "$type" in
         "vless")
             local uuid=$(echo "$selected_node" | jq -r '.users[0].uuid')
-            # VLESS-TCP (无 TLS，无 Reality)
-            token_json=$(jq -n \
-                --arg ip "$token_addr" --arg p "$port" --arg u "$uuid" \
-                '{type: "vless", addr: $ip, port: $p, uuid: $u}')
+            local flow=$(echo "$selected_node" | jq -r '.users[0].flow // ""')
+            outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg u "$uuid" --arg f "$flow" \
+                '{"type":"vless","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"uuid":$u,"flow":$f}')
+            
+            # 处理 TLS / Reality
+            if [ "$(echo "$selected_node" | jq -r '.tls.enabled // false')" == "true" ]; then
+                local sni=$(echo "$selected_node" | jq -r '.tls.server_name // empty')
+                # 尝试从 clash.yaml 获取 SNI (如果 inbound 里没存)
+                if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
+                    sni=$(${YQ_BINARY} r "$MAIN_CLASH_YAML" "proxies.(port==$port).servername" 2>/dev/null || \
+                          ${YQ_BINARY} r "$MAIN_CLASH_YAML" "proxies.(port==$port).sni" 2>/dev/null || \
+                          ${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .servername // .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
+                fi
+                [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.apple.com" # 极简保底
+
+                local utls_json='{"enabled":true,"fingerprint":"chrome"}'
+                
+                if [ "$(echo "$selected_node" | jq -r '.tls.reality.enabled // false')" == "true" ]; then
+                    # Reality 需要从 metadata 读取 publicKey
+                    local pbk="" sid=""
+                    if [ -f "$MAIN_METADATA_FILE" ]; then
+                        pbk=$(jq -r --arg t "$tag" '.[$t].publicKey // empty' "$MAIN_METADATA_FILE")
+                        sid=$(jq -r --arg t "$tag" '.[$t].shortId // empty' "$MAIN_METADATA_FILE")
+                    fi
+                    [ -z "$pbk" ] && _warn "Reality 节点未在 metadata 中找到公钥，可能无法连接。"
+                    outbound_json=$(echo "$outbound_json" | jq --arg sni "$sni" --arg pbk "$pbk" --arg sid "$sid" --argjson utls "$utls_json" \
+                        '.tls = {enabled:true, server_name:$sni, utls:$utls, reality:{enabled:true, public_key:$pbk, short_id:$sid}}')
+                else
+                    outbound_json=$(echo "$outbound_json" | jq --arg sni "$sni" --argjson utls "$utls_json" \
+                        '.tls = {enabled:true, server_name:$sni, utls:$utls, insecure:true}')
+                fi
+            fi
+            
+            # 处理 Transport (WS)
+            if [ "$(echo "$selected_node" | jq -r '.transport.type // ""')" == "ws" ]; then
+                local path=$(echo "$selected_node" | jq -r '.transport.path // "/"')
+                local host=$(echo "$selected_node" | jq -r '.transport.headers.Host // empty')
+                # 尝试从 clash.yaml 获取 Host
+                if [ -z "$host" ] && [ -f "$MAIN_CLASH_YAML" ]; then
+                    host=$(${YQ_BINARY} r "$MAIN_CLASH_YAML" 'proxies.(port=='$port').ws-opts.headers.Host' 2>/dev/null || \
+                           ${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .\"ws-opts\".headers.Host" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
+                fi
+                [ -z "$host" ] || [ "$host" == "null" ] && host="$sni" # 兜底使用 SNI
+                
+                outbound_json=$(echo "$outbound_json" | jq --arg path "$path" --arg host "$host" \
+                    '.transport = {type:"ws", path:$path, headers:{Host:$host}}')
+            fi
             ;;
+            
         "shadowsocks")
             local method=$(echo "$selected_node" | jq -r '.method')
-            local pw=$(echo "$selected_node" | jq -r '.password')
-            token_json=$(jq -n \
-                --arg ip "$token_addr" --arg p "$port" --arg m "$method" --arg pw "$pw" \
-                '{type: "shadowsocks", addr: $ip, port: $p, method: $m, password: $pw}')
+            local password=$(echo "$selected_node" | jq -r '.password')
+            outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg m "$method" --arg pw "$password" \
+                '{"type":"shadowsocks","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"method":$m,"password":$pw}')
+            ;;
+            
+        "trojan")
+            local password=$(echo "$selected_node" | jq -r '.users[0].password')
+            outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg pw "$password" \
+                '{"type":"trojan","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"password":$pw}')
+            
+            if [ "$(echo "$selected_node" | jq -r '.tls.enabled // false')" == "true" ]; then
+                local sni=$(echo "$selected_node" | jq -r '.tls.server_name // empty')
+                if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
+                    sni=$(${YQ_BINARY} r "$MAIN_CLASH_YAML" "proxies.(port==$port).sni" 2>/dev/null || \
+                          ${YQ_BINARY} r "$MAIN_CLASH_YAML" "proxies.(port==$port).servername" 2>/dev/null || \
+                          ${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni // .servername" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
+                fi
+                [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.apple.com"
+                outbound_json=$(echo "$outbound_json" | jq --arg sni "$sni" '.tls = {enabled:true, server_name:$sni, insecure:true}')
+            fi
+            
+            if [ "$(echo "$selected_node" | jq -r '.transport.type // ""')" == "ws" ]; then
+                local path=$(echo "$selected_node" | jq -r '.transport.path // "/"')
+                local host=$(echo "$selected_node" | jq -r '.transport.headers.Host // empty')
+                if [ -z "$host" ] && [ -f "$MAIN_CLASH_YAML" ]; then
+                    host=$(${YQ_BINARY} r "$MAIN_CLASH_YAML" 'proxies.(port=='$port').ws-opts.headers.Host' 2>/dev/null || \
+                           ${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .\"ws-opts\".headers.Host" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
+                fi
+                [ -z "$host" ] || [ "$host" == "null" ] && host="$sni"
+                outbound_json=$(echo "$outbound_json" | jq --arg path "$path" --arg host "$host" \
+                    '.transport = {type:"ws", path:$path, headers:{Host:$host}}')
+            fi
+            ;;
+
+        "hysteria2")
+            local password=$(echo "$selected_node" | jq -r '.users[0].password')
+            local sni=$(echo "$selected_node" | jq -r '.tls.server_name // empty')
+            if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
+                sni=$(${YQ_BINARY} r "$MAIN_CLASH_YAML" "proxies.(port==$port).sni" 2>/dev/null || \
+                      ${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
+            fi
+            [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.apple.com"
+
+            local obfs_type=$(echo "$selected_node" | jq -r '.obfs.type // empty')
+            local obfs_pw=$(echo "$selected_node" | jq -r '.obfs.password // empty')
+
+            outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg pw "$password" --arg sni "$sni" \
+                '{"type":"hysteria2","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"password":$pw,"tls":{"enabled":true,"server_name":$sni,"insecure":true,"alpn":["h3"]}}')
+            
+            if [ -n "$obfs_type" ] && [ -n "$obfs_pw" ]; then
+                outbound_json=$(echo "$outbound_json" | jq --arg ot "$obfs_type" --arg op "$obfs_pw" '.obfs = {type:$ot, password:$op}')
+            fi
+            ;;
+
+        "tuic")
+            local uuid=$(echo "$selected_node" | jq -r '.users[0].uuid')
+            local password=$(echo "$selected_node" | jq -r '.users[0].password')
+            local sni=$(echo "$selected_node" | jq -r '.tls.server_name // empty')
+            if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
+                sni=$(${YQ_BINARY} r "$MAIN_CLASH_YAML" "proxies.(port==$port).sni" 2>/dev/null || \
+                      ${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
+            fi
+            [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.apple.com"
+
+            local cc=$(echo "$selected_node" | jq -r '.congestion_control // "bbr"')
+            outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sni "$sni" --arg cc "$cc" \
+                '{"type":"tuic","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"uuid":$u,"password":$pw,"congestion_control":$cc,"tls":{"enabled":true,"server_name":$sni,"insecure":true,"alpn":["h3"]}}')
+            ;;
+
+        "anytls")
+            local password=$(echo "$selected_node" | jq -r '.users[0].password')
+            local sni=$(echo "$selected_node" | jq -r '.tls.server_name // empty')
+            if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
+                sni=$(${YQ_BINARY} r "$MAIN_CLASH_YAML" "proxies.(port==$port).sni" 2>/dev/null || \
+                      ${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
+            fi
+            [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.apple.com"
+            outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg pw "$password" --arg sni "$sni" \
+                '{"type":"anytls","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"password":$pw,"tls":{"enabled":true,"server_name":$sni,"insecure":true}}')
+            ;;
+            
+        *)
+            _error "暂不支持对协议 [$type] 自动生成 Token。"
+            return
             ;;
     esac
     
-    if [ -n "$token_json" ]; then
-        local token_base64=$(echo "$token_json" | base64 | tr -d '\n')
+    if [ -n "$outbound_json" ]; then
+        local token_base64=$(echo "$outbound_json" | base64 | tr -d '\n')
         echo ""
-        _success "Token 生成成功！"
+        _success "全协议 Token 生成成功！"
         echo -e "${YELLOW}请复制以下 Token 到 [中转机] 使用：${NC}"
         echo "---------------------------------------------------"
         echo "$token_base64"
         echo "---------------------------------------------------"
-        echo -e " Token 解析地址: ${CYAN}${token_addr}${NC}"
+        echo -e " 目标节点类型: ${CYAN}${type}${NC}"
+        echo -e " 连接地址: ${CYAN}${token_addr}:${port}${NC}"
         echo "---------------------------------------------------"
     else
-        _error "Token 生成失败 (未知错误)。"
+        _error "Token 生成失败。"
     fi
     
     read -p "按回车键继续..."
@@ -444,10 +641,11 @@ _finalize_relay_setup() {
     read -p "请输入本机监听端口 (回车随机): " listen_port
     [[ -z "$listen_port" ]] && listen_port=$(shuf -i 10000-50000 -n 1)
     
-    read -p "请输入伪装域名 SNI (回车默认 www.apple.com): " sni
-    [[ -z "$sni" ]] && sni="www.apple.com"
+    # 此处的 SNI 是中转机的入口 SNI
+    read -p "请输入中转机入口 SNI (回车默认 www.apple.com): " entrance_sni
+    [[ -z "$entrance_sni" ]] && entrance_sni="www.apple.com"
     
-    local default_name="${relay_type}-Relay-${listen_port}"
+    local default_name="${dest_type}-Relay-${listen_port}"
     read -p "请输入节点名称 (回车: ${default_name}): " node_name
     [[ -z "$node_name" ]] && node_name="$default_name"
     
@@ -457,7 +655,6 @@ _finalize_relay_setup() {
     local outbound_tag="relay-out-${tag_suffix}" # 对应的出口
     
     # 更新 outbound_json 中的 tag
-    # 注意：传入的 outbound_json 必须是 jq 构造好的对象，我们需要修改它的 tag 字段
     outbound_json=$(echo "$outbound_json" | jq --arg t "$outbound_tag" '.tag = $t')
 
     # 1. 生成 Inbound (本机入口)
@@ -466,13 +663,13 @@ _finalize_relay_setup() {
     local keypair=""
     local pbk=""
     
-    # 证书处理 (Hy2/Tuic 需要) - 存储在辅助目录
+    # 证书处理 (仅中转入口使用)
+    local cert_path="${RELAY_AUX_DIR}/${inbound_tag}.pem"
+    local key_path="${RELAY_AUX_DIR}/${inbound_tag}.key"
     if [[ "$relay_type" == "hysteria2" || "$relay_type" == "tuic" || "$relay_type" == "anytls" ]]; then
-        local cert_path="${RELAY_AUX_DIR}/${inbound_tag}.pem"
-        local key_path="${RELAY_AUX_DIR}/${inbound_tag}.key"
-        _info "正在生成自签名证书..."
+        _info "正在生成中转入口自签名证书..."
         openssl ecparam -genkey -name prime256v1 -out "$key_path" >/dev/null 2>&1
-        openssl req -new -x509 -days 3650 -key "$key_path" -out "$cert_path" -subj "/CN=${sni}" >/dev/null 2>&1
+        openssl req -new -x509 -days 3650 -key "$key_path" -out "$cert_path" -subj "/CN=${entrance_sni}" >/dev/null 2>&1
     fi
     
     if [ "$relay_type" == "vless-reality" ]; then
@@ -485,196 +682,112 @@ _finalize_relay_setup() {
         # 默认开启 XTLS-Vision 流控
         local flow="xtls-rprx-vision"
 
-        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg u "$uuid" --arg f "$flow" --arg sn "$sni" --arg pk "$pk" --arg sid "$sid" \
+        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg u "$uuid" --arg f "$flow" --arg sn "$entrance_sni" --arg pk "$pk" --arg sid "$sid" \
             '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":$f}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
              
         local server_ip=$(_get_public_ip)
-        link="vless://${uuid}@${server_ip}:${listen_port}?encryption=none&flow=${flow}&security=reality&sni=${sni}&fp=chrome&pbk=${pbk}&sid=${sid}&type=tcp#${node_name}"
+        link="vless://${uuid}@${server_ip}:${listen_port}?encryption=none&flow=${flow}&security=reality&sni=${entrance_sni}&fp=chrome&pbk=${pbk}&sid=${sid}&type=tcp#${node_name}"
         
     elif [ "$relay_type" == "hysteria2" ]; then
         local password=$($SINGBOX_BIN generate rand --hex 16)
         
-        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg pw "$password" --arg sn "$sni" --arg cert "$cert_path" --arg key "$key_path" \
+        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg pw "$password" --arg sn "$entrance_sni" --arg cert "$cert_path" --arg key "$key_path" \
             '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"server_name":$sn,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
 
         local server_ip=$(_get_public_ip)
-        link="hysteria2://${password}@${server_ip}:${listen_port}?sni=${sni}&insecure=1&up=10000&down=10000#${node_name}"
+        link="hysteria2://${password}@${server_ip}:${listen_port}?sni=${entrance_sni}&insecure=1&up=10000&down=10000#${node_name}"
         
     elif [ "$relay_type" == "tuic" ]; then
         local uuid=$($SINGBOX_BIN generate uuid)
         local password=$($SINGBOX_BIN generate rand --hex 16)
-        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg u "$uuid" --arg pw "$password" --arg sn "$sni" --arg cert "$cert_path" --arg key "$key_path" \
+        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg u "$uuid" --arg pw "$password" --arg sn "$entrance_sni" --arg cert "$cert_path" --arg key "$key_path" \
             '{"type":"tuic","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"password":$pw}],"congestion_control":"bbr","tls":{"enabled":true,"server_name":$sn,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
             
         local server_ip=$(_get_public_ip)
-        link="tuic://${uuid}:${password}@${server_ip}:${listen_port}?sni=${sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#${node_name}"
+        link="tuic://${uuid}:${password}@${server_ip}:${listen_port}?sni=${entrance_sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#${node_name}"
         
     elif [ "$relay_type" == "anytls" ]; then
         local password=$($SINGBOX_BIN generate uuid)
-        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg pw "$password" --arg sn "$sni" --arg cert "$cert_path" --arg key "$key_path" \
+        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg pw "$password" --arg sn "$entrance_sni" --arg cert "$cert_path" --arg key "$key_path" \
             '{"type":"anytls","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"name":"default","password":$pw}],"padding_scheme":["stop=2","0=100-200","1=100-200"],"tls":{"enabled":true,"server_name":$sn,"certificate_path":$cert,"key_path":$key}}')
             
         local server_ip=$(_get_public_ip)
-        link="anytls://${password}@${server_ip}:${listen_port}?security=tls&sni=${sni}&insecure=1&allowInsecure=1&type=tcp#${node_name}"
+        link="anytls://${password}@${server_ip}:${listen_port}?security=tls&sni=${entrance_sni}&insecure=1&allowInsecure=1&type=tcp#${node_name}"
     fi
     
     # 2. 写入配置到主配置文件
     _info "正在写入配置..."
     
-    # [配置隔离] 使用 RELAY_CONFIG_FILE
     local CONFIG_FILE="$RELAY_CONFIG_FILE"
-    
-    # 如果配置文件不存在 (理论上 _init_relay_dirs 已创建，但做个保险)
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$CONFIG_FILE"
-    fi
-    
+    if [ ! -f "$CONFIG_FILE" ]; then echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$CONFIG_FILE"; fi
     cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
     
-    # === 新增：检查是否存在重复的 tag ===
     if jq -e ".inbounds[] | select(.tag == \"$inbound_tag\")" "$CONFIG_FILE" >/dev/null 2>&1; then
         _error "中转入口 tag \"$inbound_tag\" 已存在！"
-        _warn "请先删除现有的中转路由，或使用不同的端口。"
-        echo ""
-        echo "解决方法："
-        echo "  1) 进阶功能 → 4) 删除中转路由"
-        echo "  2) 或者重新选择一个不同的监听端口"
         return 1
     fi
-    
     if jq -e ".outbounds[] | select(.tag == \"$outbound_tag\")" "$CONFIG_FILE" >/dev/null 2>&1; then
         _error "中转出口 tag \"$outbound_tag\" 已存在！"
-        _warn "请先删除现有的中转路由，或使用不同的端口。"
         return 1
     fi
-    # === 检查结束 ===
     
     jq ".inbounds += [$inbound_json]" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
     jq ".outbounds = [$outbound_json] + .outbounds" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
     
     local rule_json=$(jq -n --arg it "$inbound_tag" --arg ot "$outbound_tag" '{"inbound": $it, "outbound": $ot}')
-    
-    if ! jq -e '.route' "$CONFIG_FILE" >/dev/null; then
-         jq '. += {"route":{"rules":[]}}' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-    fi
-    if ! jq -e '.route.rules' "$CONFIG_FILE" >/dev/null; then
-         jq '.route.rules = []' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-    fi
-    
+    if ! jq -e '.route' "$CONFIG_FILE" >/dev/null; then jq '. += {"route":{"rules":[]}}' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"; fi
     jq ".route.rules += [$rule_json]" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
     
-    # 验证配置文件有效性
     if ! jq empty "$CONFIG_FILE" 2>/dev/null; then
-        _error "配置文件格式错误！正在回滚..."
         mv "${CONFIG_FILE}.bak" "$CONFIG_FILE"
-        _log_operation "CONFIG_ERROR" "配置验证失败，已回滚"
-        return 1
+        _error "配置验证失败，已回滚"; return 1
     fi
     
     _success "配置已更新！正在重启服务..."
+    [ -f "/etc/init.d/sing-box" ] && rc-service sing-box restart || systemctl restart sing-box
     
-    if [ -f "/etc/init.d/sing-box" ]; then
-        rc-service sing-box restart
-    else
-        systemctl restart sing-box
-    fi
-    
-    # 3. 存储链接信息到辅助目录（增强元数据）
+    # 3. 存储链接信息
     local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
-    if [ ! -f "$LINKS_FILE" ]; then
-        echo '{}' > "$LINKS_FILE"
-    fi
-    
-    # 使用 jq 添加或更新链接（包含元数据）
-    local metadata=$(jq -n \
-        --arg link "$link" \
-        --arg created "$(date '+%Y-%m-%d %H:%M:%S')" \
-        --arg relay_type "$relay_type" \
-        --arg landing_type "$dest_type" \
-        --arg landing_addr "${dest_addr}:${dest_port}" \
-        --arg node_name "$node_name" \
+    local metadata=$(jq -n --arg link "$link" --arg created "$(date '+%Y-%m-%d %H:%M:%S')" --arg relay_type "$relay_type" \
+        --arg landing_type "$dest_type" --arg landing_addr "${dest_addr}:${dest_port}" --arg node_name "$node_name" \
         '{link: $link, created_at: $created, relay_type: $relay_type, landing_type: $landing_type, landing_addr: $landing_addr, node_name: $node_name}')
-    
     jq --arg tag "$inbound_tag" --argjson meta "$metadata" '.[$tag] = $meta' "$LINKS_FILE" > "${LINKS_FILE}.tmp" && mv "${LINKS_FILE}.tmp" "$LINKS_FILE"
-    
-    # 记录操作日志
     _log_operation "CREATE_RELAY" "Type: $relay_type, Port: $listen_port, Landing: ${dest_type}@${dest_addr}:${dest_port}"
     
     # 4. 添加到中转机专用 YAML 配置
     local server_ip=$(_get_public_ip)
     local proxy_json=""
-    
     if [ "$relay_type" == "vless-reality" ]; then
         local uuid=$(echo "$inbound_json" | jq -r '.users[0].uuid')
         local sn=$(echo "$inbound_json" | jq -r '.tls.server_name')
         local flow=$(echo "$inbound_json" | jq -r '.users[0].flow')
         local pk=$(echo "$inbound_json" | jq -r '.tls.reality.private_key')
         local sid=$(echo "$inbound_json" | jq -r '.tls.reality.short_id[0]')
-        
-        # 获取公钥（从 keypair 中提取）
         local pbk=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
-        
-        proxy_json=$(jq -n \
-            --arg n "$node_name" \
-            --arg s "$server_ip" \
-            --arg p "$listen_port" \
-            --arg u "$uuid" \
-            --arg sn "$sn" \
-            --arg pbk "$pbk" \
-            --arg sid "$sid" \
-            --arg flow "$flow" \
-            '{name:$n,type:"vless",server:$s,port:($p|tonumber),uuid:$u,tls:true,network:"tcp",flow:$flow,servername:$sn,"client-fingerprint":"chrome","reality-opts":{"public-key":$pbk,"short-id":$sid}}')
-            
+        proxy_json=$(jq -n --arg n "$node_name" --arg s "$server_ip" --arg p "$listen_port" --arg u "$uuid" --arg sn "$sn" --arg pbk "$pbk" --arg sid "$sid" --arg flow "$flow" \
+            '{name:$n,type:"vless",server:$s,port:($p|tonumber),uuid:$u,tls:true,udp:true,network:"tcp",flow:$flow,servername:$sn,"client-fingerprint":"chrome","reality-opts":{"public-key":$pbk,"short-id":$sid}}')
     elif [ "$relay_type" == "hysteria2" ]; then
         local password=$(echo "$inbound_json" | jq -r '.users[0].password')
-        local sni=$(echo "$inbound_json" | jq -r '.tls.server_name // "www.apple.com"')
-        
-        proxy_json=$(jq -n \
-            --arg n "$node_name" \
-            --arg s "$server_ip" \
-            --arg p "$listen_port" \
-            --arg pw "$password" \
-            --arg sn "$sni" \
+        proxy_json=$(jq -n --arg n "$node_name" --arg s "$server_ip" --arg p "$listen_port" --arg pw "$password" --arg sn "$sni" \
             '{name:$n,type:"hysteria2",server:$s,port:($p|tonumber),password:$pw,sni:$sn,"skip-cert-verify":true,alpn:["h3"]}')
-            
     elif [ "$relay_type" == "tuic" ]; then
         local uuid=$(echo "$inbound_json" | jq -r '.users[0].uuid')
         local password=$(echo "$inbound_json" | jq -r '.users[0].password')
-        local sni=$(echo "$inbound_json" | jq -r '.tls.server_name // "www.apple.com"')
-        
-        proxy_json=$(jq -n \
-            --arg n "$node_name" \
-            --arg s "$server_ip" \
-            --arg p "$listen_port" \
-            --arg u "$uuid" \
-            --arg pw "$password" \
-            --arg sn "$sni" \
+        proxy_json=$(jq -n --arg n "$node_name" --arg s "$server_ip" --arg p "$listen_port" --arg u "$uuid" --arg pw "$password" --arg sn "$sni" \
             '{name:$n,type:"tuic",server:$s,port:($p|tonumber),uuid:$u,password:$pw,sni:$sn,"skip-cert-verify":true,alpn:["h3"],"udp-relay-mode":"native","congestion-controller":"bbr"}')
-            
     elif [ "$relay_type" == "anytls" ]; then
         local password=$(echo "$inbound_json" | jq -r '.users[0].password')
-        local sni=$(echo "$inbound_json" | jq -r '.tls.server_name // "www.apple.com"')
-        
-        proxy_json=$(jq -n \
-            --arg n "$node_name" \
-            --arg s "$server_ip" \
-            --arg p "$listen_port" \
-            --arg pw "$password" \
-            --arg sn "$sni" \
-            '{name:$n,type:"anytls",server:$s,port:($p|tonumber),password:$pw,"client-fingerprint":"chrome",udp:true,"idle-session-check-interval":30,"idle-session-timeout":30,"min-idle-session":0,sni:$sn,alpn:["h2","http/1.1"],"skip-cert-verify":true}')
+        proxy_json=$(jq -n --arg n "$node_name" --arg s "$server_ip" --arg p "$listen_port" --arg pw "$password" --arg sn "$sni" \
+            '{name:$n,type:"anytls",server:$s,port:($p|tonumber),password:$pw,"client-fingerprint":"chrome",udp:true,sni:$sn,alpn:["h2","http/1.1"],"skip-cert-verify":true}')
     fi
-    
-    if [ -n "$proxy_json" ]; then
-        _add_node_to_relay_yaml "$proxy_json"
-    fi
+    [ -n "$proxy_json" ] && _add_node_to_relay_yaml "$proxy_json"
     
     echo "==================================================="
     _success "中转配置成功！"
     echo -e "中转节点: ${YELLOW}$node_name${NC}"
     echo -e "分享链接: ${CYAN}$link${NC}"
     echo "==================================================="
-    
-    read -p "按回车键继续..."
+    read -p "按回车键返回..."
 }
 
 # --- 2. 中转机配置 (导入 Token) ---
@@ -693,31 +806,32 @@ _relay_config() {
         return
     fi
     
-    local dest_addr=$(echo "$decoded_json" | jq -r '.addr')
-    local dest_port=$(echo "$decoded_json" | jq -r '.port')
     local dest_type=$(echo "$decoded_json" | jq -r '.type')
+    local dest_addr=$(echo "$decoded_json" | jq -r '.server // .addr')
+    local dest_port=$(echo "$decoded_json" | jq -r '.server_port // .port')
     
     # 构造 outbound
     local outbound_json=""
-    local outbound_tag="TEMP_TAG" # 将在 finalize 中被修正
-
-    if [ "$dest_type" == "vless" ]; then
-        local uuid=$(echo "$decoded_json" | jq -r '.uuid')
-        outbound_json=$(jq -n --arg t "$outbound_tag" --arg ip "$dest_addr" --arg p "$dest_port" --arg u "$uuid" \
-            '{"type":"vless","tag":$t,"server":$ip,"server_port":($p|tonumber),"uuid":$u,"packet_encoding":"xudp","tls":{"enabled":false}}')
-    elif [ "$dest_type" == "shadowsocks" ]; then
-        local method=$(echo "$decoded_json" | jq -r '.method')
-        local password=$(echo "$decoded_json" | jq -r '.password')
-        outbound_json=$(jq -n --arg t "$outbound_tag" --arg ip "$dest_addr" --arg p "$dest_port" --arg m "$method" --arg pw "$password" \
-            '{"type":"shadowsocks","tag":$t,"server":$ip,"server_port":($p|tonumber),"method":$m,"password":$pw}')
+    
+    # 智能检查 Token 类型：如果是原生的 outbound 结构（包含 'server_port' 或 'type' 不仅是基础几样）
+    if echo "$decoded_json" | jq -e '.server_port' >/dev/null 2>&1; then
+        _info "检测到全协议增强型 Token..."
+        outbound_json="$decoded_json"
     else
-        _error "不支持的协议类型: $dest_type"
-        _warn "仅支持: VLESS-TCP, Shadowsocks"
-        return
+        _info "检测到旧版基础型 Token，正在转换..."
+        if [ "$dest_type" == "vless" ]; then
+            local uuid=$(echo "$decoded_json" | jq -r '.uuid')
+            outbound_json=$(jq -n --arg ip "$dest_addr" --arg p "$dest_port" --arg u "$uuid" \
+                '{"type":"vless","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"uuid":$u,"tls":{"enabled":false}}')
+        elif [ "$dest_type" == "shadowsocks" ]; then
+            local method=$(echo "$decoded_json" | jq -r '.method')
+            local password=$(echo "$decoded_json" | jq -r '.password')
+            outbound_json=$(jq -n --arg ip "$dest_addr" --arg p "$dest_port" --arg m "$method" --arg pw "$password" \
+                '{"type":"shadowsocks","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"method":$m,"password":$pw}')
+        fi
     fi
     
-    if [ -z "$outbound_json" ]; then _error "Outbound 生成失败"; return; fi
-
+    if [ -z "$outbound_json" ]; then _error "Token 解析失败"; return; fi
     _finalize_relay_setup "$dest_type" "$dest_addr" "$dest_port" "$outbound_json"
 }
 
@@ -1205,15 +1319,16 @@ _advanced_menu() {
         
         # 落地机配置
         echo -e "  ${CYAN}【落地机配置】${NC}"
-        echo -e "    ${GREEN}[1]${NC} 落地机配置 (VLESS-TCP / Shadowsocks)"
+        echo -e "    ${GREEN}[1]${NC} 落地机配置 (支持主脚本创建的全部节点协议)"
         echo ""
         
         # 中转机配置
         echo -e "  ${CYAN}【中转机配置】${NC}"
         echo -e "    ${GREEN}[2]${NC} 中转机配置 (导入 Token)"
-        echo -e "    ${GREEN}[3]${NC} 查看中转节点链接"
-        echo -e "    ${GREEN}[4]${NC} 删除中转路由"
-        echo -e "    ${GREEN}[5]${NC} 修改中转端口"
+        echo -e "    ${GREEN}[3]${NC} 中转机配置 (导入第三方链接)"
+        echo -e "    ${GREEN}[4]${NC} 查看中转节点链接"
+        echo -e "    ${GREEN}[5]${NC} 删除中转路由"
+        echo -e "    ${GREEN}[6]${NC} 修改中转端口"
         echo ""
         
         echo -e "  ─────────────────────────────────────────"
@@ -1225,9 +1340,10 @@ _advanced_menu() {
         case $choice in
             1) _landing_config ;;
             2) _relay_config ;;
-            3) _view_relays ;;
-            4) _delete_relay ;;
-            5) _modify_relay_port ;;
+            3) _import_link_config ;;
+            4) _view_relays ;;
+            5) _delete_relay ;;
+            6) _modify_relay_port ;;
             0) exit 0 ;;
             *) echo "无效选择" ;;
         esac
