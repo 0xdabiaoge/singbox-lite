@@ -430,12 +430,29 @@ _add_argo_vless_ws() {
     # 安装 cloudflared
     _install_cloudflared || return 1
     
-    # 自动分配内部端口 (无需用户输入，仅用于本地通信)
-    local port=$(shuf -i 10000-60000 -n 1)
-    while jq -e ".inbounds[] | select(.listen_port == $port)" "$CONFIG_FILE" >/dev/null 2>&1; do
-         port=$(shuf -i 10000-60000 -n 1)
-    done
-    _info "已自动分配内部监听端口: ${port}"
+    # 内部端口分配 (支持自定义或随机)
+    read -p "请输入 Argo 内部监听端口 (回车随机生成): " input_port
+    local port="$input_port"
+    
+    if [[ -n "$port" && "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]; then
+        if jq -e ".inbounds[] | select(.listen_port == $port)" "$CONFIG_FILE" >/dev/null 2>&1; then
+             _warning "端口 $port 已被占用，将切换为随机端口。"
+             port=""
+        fi
+    else
+        [ -n "$port" ] && _warning "端口格式无效，将切换为随机端口。"
+        port=""
+    fi
+
+    if [ -z "$port" ]; then
+        port=$(shuf -i 10000-60000 -n 1)
+        while jq -e ".inbounds[] | select(.listen_port == $port)" "$CONFIG_FILE" >/dev/null 2>&1; do
+             port=$(shuf -i 10000-60000 -n 1)
+        done
+        _info "已随机分配内部监听端口: ${port}"
+    else
+        _info "已使用自定义内部监听端口: ${port}"
+    fi
     
     # 输入 WebSocket 路径
     read -p "请输入 WebSocket 路径 (回车随机生成): " ws_path
@@ -628,12 +645,29 @@ _add_argo_trojan_ws() {
     # 安装 cloudflared
     _install_cloudflared || return 1
     
-    # 自动分配内部端口 (无需用户输入，仅用于本地通信)
-    local port=$(shuf -i 10000-60000 -n 1)
-    while jq -e ".inbounds[] | select(.listen_port == $port)" "$CONFIG_FILE" >/dev/null 2>&1; do
-         port=$(shuf -i 10000-60000 -n 1)
-    done
-    _info "已自动分配内部监听端口: ${port}"
+    # 内部端口分配 (支持自定义或随机)
+    read -p "请输入 Argo 内部监听端口 (回车随机生成): " input_port
+    local port="$input_port"
+    
+    if [[ -n "$port" && "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]; then
+        if jq -e ".inbounds[] | select(.listen_port == $port)" "$CONFIG_FILE" >/dev/null 2>&1; then
+             _warning "端口 $port 已被占用，将切换为随机端口。"
+             port=""
+        fi
+    else
+        [ -n "$port" ] && _warning "端口格式无效，将切换为随机端口。"
+        port=""
+    fi
+
+    if [ -z "$port" ]; then
+        port=$(shuf -i 10000-60000 -n 1)
+        while jq -e ".inbounds[] | select(.listen_port == $port)" "$CONFIG_FILE" >/dev/null 2>&1; do
+             port=$(shuf -i 10000-60000 -n 1)
+        done
+        _info "已随机分配内部监听端口: ${port}"
+    else
+        _info "已使用自定义内部监听端口: ${port}"
+    fi
     
     # 输入 WebSocket 路径
     read -p "请输入 WebSocket 路径 (回车随机生成): " ws_path
