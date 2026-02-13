@@ -22,6 +22,7 @@ _parse_vless() {
     local link="$1"
     # vless://uuid@server:port?param1=value1&param2=value2#name
     local uuid=$(echo "$link" | sed 's|vless://\([^@]*\)@.*|\1|')
+    uuid=$(_url_decode "$uuid")
     local server_part=$(echo "$link" | sed 's|vless://[^@]*@\([^?#]*\).*|\1|')
     local server=$(echo "$server_part" | cut -d: -f1)
     local port=$(echo "$server_part" | cut -d: -f2)
@@ -85,6 +86,7 @@ _parse_hy2() {
     [[ "$link" =~ ^hy2:// ]] && proto="hy2"
     
     local password=$(echo "$link" | sed "s|${proto}://\([^@]*\)@.*|\1|")
+    password=$(_url_decode "$password")
     local server_part=$(echo "$link" | sed "s|${proto}://[^@]*@\([^?#]*\).*|\1|")
     local server=$(echo "$server_part" | cut -d: -f1)
     local port=$(echo "$server_part" | cut -d: -f2)
@@ -139,6 +141,8 @@ _parse_tuic() {
     local auth=$(echo "$link" | sed 's|tuic://\([^@]*\)@.*|\1|')
     local uuid="${auth%%:*}"
     local password="${auth#*:}"
+    uuid=$(_url_decode "$uuid")
+    password=$(_url_decode "$password")
     local server_part=$(echo "$link" | sed 's|tuic://[^@]*@\([^?#]*\).*|\1|')
     local server=$(echo "$server_part" | cut -d: -f1)
     local port=$(echo "$server_part" | cut -d: -f2)
@@ -197,7 +201,12 @@ _parse_ss() {
         local server_port="${ss_body##*@}"
         server="${server_port%:*}"
         port="${server_port##*:}"
-        if [[ "$prefix" != *":"* ]]; then
+        # [修复] 先尝试 URL 解码
+        local decoded_prefix=$(_url_decode "$prefix")
+        if [[ "$decoded_prefix" == *":"* ]]; then
+            prefix="$decoded_prefix"
+        elif [[ "$prefix" != *":"* ]]; then
+            # 只有当原始字符串不含冒号，且解码后也不含冒号时，才尝试 Base64 解码
             prefix=$(echo -n "$prefix" | base64 -d 2>/dev/null)
         fi
         method="${prefix%%:*}"
@@ -234,6 +243,7 @@ _parse_ss() {
 _parse_trojan() {
     local link="$1"
     local password=$(echo "$link" | sed 's|trojan://\([^@]*\)@.*|\1|')
+    password=$(_url_decode "$password")
     local server_part=$(echo "$link" | sed 's|trojan://[^@]*@\([^?#]*\).*|\1|')
     local server=$(echo "$server_part" | cut -d: -f1)
     local port=$(echo "$server_part" | cut -d: -f2)
@@ -279,6 +289,7 @@ _parse_trojan() {
 _parse_anytls() {
     local link="$1"
     local password=$(echo "$link" | sed 's|anytls://\([^@]*\)@.*|\1|')
+    password=$(_url_decode "$password")
     local server_part=$(echo "$link" | sed 's|anytls://[^@]*@\([^?#]*\).*|\1|')
     local server=$(echo "$server_part" | cut -d: -f1)
     local port=$(echo "$server_part" | cut -d: -f2)
