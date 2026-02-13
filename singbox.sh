@@ -3349,7 +3349,7 @@ _modify_port() {
 
 # --- 更新管理脚本 ---
 _update_script() {
-    _info "--- 更新管理脚本 ---"
+    _info "--- 更新脚本 ---"
     
     if [ "$SCRIPT_UPDATE_URL" == "YOUR_GITHUB_RAW_URL_HERE/singbox.sh" ]; then
         _error "错误：您尚未在脚本中配置 SCRIPT_UPDATE_URL 变量。"
@@ -3358,7 +3358,7 @@ _update_script() {
     fi
 
     # 更新主脚本
-    _info "正在从 GitHub 下载主脚本..."
+    _info "正在从 GitHub 下载主脚本 (singbox.sh)..."
     local temp_script_path="${SELF_SCRIPT_PATH}.tmp"
     
     if wget -qO "$temp_script_path" "$SCRIPT_UPDATE_URL"; then
@@ -3377,29 +3377,42 @@ _update_script() {
         return 1
     fi
     
-    # 更新子脚本 (advanced_relay.sh)
-    local sub_script_name="advanced_relay.sh"
-    local sub_script_path="/root/${sub_script_name}"
-    local sub_script_url="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/${sub_script_name}"
+    # 需要更新的子脚本列表
+    local sub_scripts=("advanced_relay.sh" "parser.sh")
     
-    _info "正在从 GitHub 下载子脚本..."
-    local temp_sub_path="${sub_script_path}.tmp"
-    
-    if wget -qO "$temp_sub_path" "$sub_script_url"; then
-        if [ -s "$temp_sub_path" ]; then
-            chmod +x "$temp_sub_path"
-            mv "$temp_sub_path" "$sub_script_path"
-            _success "子脚本 (advanced_relay.sh) 更新成功！"
-        else
-            _warning "子脚本下载失败或文件为空，跳过更新。"
-            rm -f "$temp_sub_path"
+    for script_name in "${sub_scripts[@]}"; do
+        # 定义可能的路径
+        local paths=("/root/${script_name}" "./${script_name}")
+        local updated=false
+        
+        _info "正在尝试更新子脚本: ${script_name}..."
+        
+        for script_path in "${paths[@]}"; do
+            if [ -f "$script_path" ]; then
+                local script_url="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/${script_name}"
+                local temp_sub_path="${script_path}.tmp"
+                
+                if wget -qO "$temp_sub_path" "$script_url"; then
+                    if [ -s "$temp_sub_path" ]; then
+                        chmod +x "$temp_sub_path"
+                        mv "$temp_sub_path" "$script_path"
+                        _success "子脚本 (${script_name}) 于 ${script_path} 更新成功！"
+                        updated=true
+                    else
+                        rm -f "$temp_sub_path"
+                    fi
+                else
+                    rm -f "$temp_sub_path"
+                fi
+            fi
+        done
+        
+        if [ "$updated" = false ]; then
+            _warning "子脚本 ${script_name} 未在常用路径中找到或下载失败，跳过更新。"
         fi
-    else
-        _warning "子脚本下载失败，跳过更新。进阶功能可能使用旧版本。"
-        rm -f "$temp_sub_path"
-    fi
+    done
     
-    _success "脚本更新完成！"
+    _success "所有脚本更新操作已完成！"
     _info "请重新运行脚本以加载新版本："
     echo -e "${YELLOW}bash ${SELF_SCRIPT_PATH}${NC}"
     exit 0
