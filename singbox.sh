@@ -4,12 +4,33 @@
 # singbox.sh - singbox-lite 核心管理脚本 (优化版)
 # ==========================================================
 
-# 引入工具库
+# 引入工具库 (Self-Initialization Logic)
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
+
+_download_missing_component() {
+    local name="$1"
+    local target="$SCRIPT_DIR/$name"
+    echo "检测到缺失核心组件: $name，正在尝试自动补全..."
+    if command -v curl &>/dev/null; then
+        curl -LfSs "$GITHUB_RAW_BASE/$name" -o "$target"
+    elif command -v wget &>/dev/null; then
+        wget -qO "$target" "$GITHUB_RAW_BASE/$name"
+    else
+        echo "错误: 未找到 curl 或 wget，无法自动补全缺失组件。"
+        exit 1
+    fi
+    [ -f "$target" ] && chmod +x "$target"
+}
+
+if [ ! -f "$SCRIPT_DIR/utils.sh" ]; then
+    _download_missing_component "utils.sh"
+fi
+
 if [ -f "$SCRIPT_DIR/utils.sh" ]; then
     source "$SCRIPT_DIR/utils.sh"
 else
-    echo "错误: 未找到 utils.sh，请确保脚本完整。"
+    echo "错误: 未找到 utils.sh，且自动补全失败。请确保网络连通或手动上传。"
     exit 1
 fi
 
@@ -3170,7 +3191,7 @@ _update_script() {
         
         for script_path in "${paths[@]}"; do
             if [ -f "$script_path" ]; then
-                local script_url="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/${script_name}"
+                local script_url="${GITHUB_RAW_BASE}/${script_name}"
                 local temp_sub_path="${script_path}.tmp"
                 
                 if wget -qO "$temp_sub_path" "$script_url"; then
@@ -3234,7 +3255,7 @@ _advanced_features() {
     # 如果都不存在，则下载
     if [ ! -f "$script_path" ]; then
         _info "本地未检测到进阶脚本，正在尝试下载..."
-        local download_url="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/${script_name}"
+        local download_url="${GITHUB_RAW_BASE}/${script_name}"
         
         if wget -qO "$script_path" "$download_url"; then
             chmod +x "$script_path"

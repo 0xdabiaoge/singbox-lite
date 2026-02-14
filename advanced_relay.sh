@@ -4,8 +4,23 @@
 # advanced_relay.sh - singbox-lite 进阶转发系统 (v11.3 稳定版)
 # ==========================================================
 
+# 引入工具库 (Self-Initialization Logic)
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-[ -f "$SCRIPT_DIR/utils.sh" ] && source "$SCRIPT_DIR/utils.sh"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
+
+if [ ! -f "$SCRIPT_DIR/utils.sh" ]; then
+    echo "检测到缺失核心组件: utils.sh，正在尝试自动补全..."
+    if command -v curl &>/dev/null; then
+        curl -LfSs "$GITHUB_RAW_BASE/utils.sh" -o "$SCRIPT_DIR/utils.sh"
+    elif command -v wget &>/dev/null; then
+        wget -qO "$SCRIPT_DIR/utils.sh" "$GITHUB_RAW_BASE/utils.sh"
+    fi
+    [ -f "$SCRIPT_DIR/utils.sh" ] && chmod +x "$SCRIPT_DIR/utils.sh"
+fi
+
+if [ -f "$SCRIPT_DIR/utils.sh" ]; then
+    source "$SCRIPT_DIR/utils.sh"
+fi
 
 # --- 全局变量 ---
 # 主脚本配置路径（落地机和中转机共用）
