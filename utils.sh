@@ -30,6 +30,7 @@ _url_decode() {
     printf '%b' "${data//%/\\x}"
 }
 _url_encode() {
+    local LC_ALL=C
     local string="${1}"
     local length="${#string}"
     local res=""
@@ -37,7 +38,12 @@ _url_encode() {
         local c="${string:i:1}"
         case "$c" in
             [a-zA-Z0-9.~_-]) res="${res}${c}" ;;
-            *) res="${res}$(printf '%%%02X' "'$c")" ;;
+            *)
+                # 关键修复：某些环境下 printf "'$c" 会输出 4 位 16 进制（如 DFE5），
+                # 我们强制只取最后两位，确保符合 %XX 格式。
+                local hex=$(printf '%02X' "'$c")
+                res="${res}%${hex: -2}"
+                ;;
         esac
     done
     echo "${res}"
