@@ -1,14 +1,15 @@
 #!/bin/bash
 
-# ==========================================================
-# advanced_relay.sh - singbox-lite 进阶转发系统 (v11.3 稳定版)
-# ==========================================================
-
 # 引入工具库 (Self-Initialization Logic)
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+SINGBOX_DIR="/usr/local/etc/sing-box"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
 
-if [ ! -f "$SCRIPT_DIR/utils.sh" ]; then
+if [ -f "$SCRIPT_DIR/utils.sh" ]; then
+    source "$SCRIPT_DIR/utils.sh"
+elif [ -f "${SINGBOX_DIR}/utils.sh" ]; then
+    source "${SINGBOX_DIR}/utils.sh"
+else
     echo "检测到缺失核心组件: utils.sh，正在尝试自动补全..."
     if command -v curl &>/dev/null; then
         curl -LfSs "$GITHUB_RAW_BASE/utils.sh" -o "$SCRIPT_DIR/utils.sh"
@@ -16,19 +17,16 @@ if [ ! -f "$SCRIPT_DIR/utils.sh" ]; then
         wget -qO "$SCRIPT_DIR/utils.sh" "$GITHUB_RAW_BASE/utils.sh"
     fi
     [ -f "$SCRIPT_DIR/utils.sh" ] && chmod +x "$SCRIPT_DIR/utils.sh"
-fi
-
-if [ -f "$SCRIPT_DIR/utils.sh" ]; then
-    source "$SCRIPT_DIR/utils.sh"
+    [ -f "$SCRIPT_DIR/utils.sh" ] && source "$SCRIPT_DIR/utils.sh"
 fi
 
 # --- 全局变量 ---
-# 主脚本配置路径（落地机和中转机共用）
-MAIN_CONFIG_FILE="/usr/local/etc/sing-box/config.json"
-MAIN_METADATA_FILE="/usr/local/etc/sing-box/metadata.json"
+# 主脚本配置路径
+MAIN_CONFIG_FILE="${SINGBOX_DIR}/config.json"
+MAIN_METADATA_FILE="${SINGBOX_DIR}/metadata.json"
 
-# 辅助文件目录（用于存储中转机的证书和链接信息）
-RELAY_AUX_DIR="/usr/local/etc/sing-box"
+# 辅助文件目录 (存放中转机的证书和链接信息)
+RELAY_AUX_DIR="${SINGBOX_DIR}"
 # 中转机专用 YAML 配置文件
 RELAY_CLASH_YAML="${RELAY_AUX_DIR}/clash.yaml"
 # 中转/适配层专用 JSON 配置文件 (隔离配置)
@@ -137,26 +135,36 @@ EOF
 
 # 检查并下载解析脚本
 _check_parser() {
-    local PARSER_BIN="${SCRIPT_DIR}/parser.sh"
-    
-    if [ ! -f "$PARSER_BIN" ]; then
-        _info "正在下载解析脚本 (parser.sh)..."
-        local PARSER_URL="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/parser.sh"
-        if ! timeout 10 wget -qO "$PARSER_BIN" "$PARSER_URL"; then
+    local PARSER_NAME="parser.sh"
+    local local_parser="${SCRIPT_DIR}/${PARSER_NAME}"
+    local prod_parser="${SINGBOX_DIR}/${PARSER_NAME}"
+    local PARSER_BIN=""
+
+    if [ -f "$local_parser" ]; then
+        PARSER_BIN="$local_parser"
+    elif [ -f "$prod_parser" ]; then
+        PARSER_BIN="$prod_parser"
+    else
+        _info "正在下载解析脚本 (${PARSER_NAME})..."
+        local PARSER_URL="${GITHUB_RAW_BASE}/${PARSER_NAME}"
+        if ! timeout 10 wget -qO "$prod_parser" "$PARSER_URL"; then
              _error "解析脚本下载失败，请检查网络！"
              return 1
         fi
+        PARSER_BIN="$prod_parser"
         _success "解析脚本下载成功。"
     fi
     
     # 确保有执行权限
     chmod +x "$PARSER_BIN"
+    # 更新全局或局部变量以便后续使用
+    _PARSER_PATH="$PARSER_BIN"
 }
 
 # --- 2.1 导入第三方节点链接 ---
 _import_link_config() {
     _check_parser || return
-    local PARSER_BIN="${SCRIPT_DIR}/parser.sh"
+    local PARSER_BIN="$_PARSER_PATH"
 
     echo -e "${CYAN}"
     echo '  ╔═══════════════════════════════════════╗'
@@ -956,7 +964,7 @@ _menu() {
         echo -e "${CYAN}"
         echo '  ╔═══════════════════════════════════════╗'
         echo '  ║       singbox-lite 进阶转发管理       ║'
-        echo '  ║                (v11.3)                ║'
+        echo '  ║                (v11)                  ║'
         echo '  ╚═══════════════════════════════════════╝'
         echo -e "${NC}"
         echo ""

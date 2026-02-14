@@ -1,16 +1,14 @@
 #!/bin/bash
 
-# ==========================================================
-# singbox.sh - singbox-lite 核心管理脚本 (优化版)
-# ==========================================================
-
-# 引入工具库 (Self-Initialization Logic)
+# 基础路径定义
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+SINGBOX_DIR="/usr/local/etc/sing-box"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
 
+# --- 核心组件自动补全函数 ---
 _download_missing_component() {
     local name="$1"
-    local target="$SCRIPT_DIR/$name"
+    local target="$2"
     echo "检测到缺失核心组件: $name，正在尝试自动补全..."
     if command -v curl &>/dev/null; then
         curl -LfSs "$GITHUB_RAW_BASE/$name" -o "$target"
@@ -23,25 +21,32 @@ _download_missing_component() {
     [ -f "$target" ] && chmod +x "$target"
 }
 
-if [ ! -f "$SCRIPT_DIR/utils.sh" ]; then
-    _download_missing_component "utils.sh"
-fi
-
+# --- 引入工具库 (优先级: 1.脚本同级目录 2.生产配置目录 3.远程下载) ---
 if [ -f "$SCRIPT_DIR/utils.sh" ]; then
     source "$SCRIPT_DIR/utils.sh"
+elif [ -f "${SINGBOX_DIR}/utils.sh" ]; then
+    source "${SINGBOX_DIR}/utils.sh"
 else
-    echo "错误: 未找到 utils.sh，且自动补全失败。请确保网络连通或手动上传。"
-    exit 1
+    # 既然都没找到，才尝试下载到生产目录
+    mkdir -p "${SINGBOX_DIR}"
+    _download_missing_component "utils.sh" "${SINGBOX_DIR}/utils.sh"
+    if [ -f "${SINGBOX_DIR}/utils.sh" ]; then
+        source "${SINGBOX_DIR}/utils.sh"
+    else
+        echo "错误: 核心组件 utils.sh 缺失且自动补全失败。"
+        exit 1
+    fi
 fi
 
 # 文件路径常量
 SINGBOX_BIN="/usr/local/bin/sing-box"
-SINGBOX_DIR="/usr/local/etc/sing-box"
 CONFIG_FILE="${SINGBOX_DIR}/config.json"
 CLASH_YAML_FILE="${SINGBOX_DIR}/clash.yaml"
 METADATA_FILE="${SINGBOX_DIR}/metadata.json"
 YQ_BINARY="/usr/local/bin/yq"
 LOG_FILE="/var/log/sing-box.log"
+SERVICE_FILE="/etc/systemd/system/sing-box.service"
+[ "$INIT_SYSTEM" == "openrc" ] && SERVICE_FILE="/etc/init.d/sing-box"
 
 # Argo Tunnel 相关常量
 CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
@@ -58,7 +63,7 @@ SELF_SCRIPT_PATH=$(readlink -f "$0")
 PID_FILE="/var/run/singbox_manager.pid"
 
 # 脚本版本
-SCRIPT_VERSION="11.3"
+SCRIPT_VERSION="11"
 
 # 捕获退出信号
 trap 'rm -f ${SINGBOX_DIR}/*.tmp /tmp/singbox_links.tmp' EXIT
@@ -1281,12 +1286,10 @@ _uninstall() {
     
     echo ""
     echo "即将删除以下内容："
-    echo -e "  ${RED}-${NC} 主配置目录: ${SINGBOX_DIR}"
-    echo -e "  ${RED}-${NC} 中转辅助目录: /etc/singbox"
+    echo -e "  ${RED}-${NC} 主配置与脚本目录: ${SINGBOX_DIR}"
     echo -e "  ${RED}-${NC} sing-box 二进制: ${SINGBOX_BIN}"
     echo -e "  ${RED}-${NC} yq 二进制: ${YQ_BINARY}"
     [ -f "${CLOUDFLARED_BIN}" ] && echo -e "  ${RED}-${NC} cloudflared 二进制: ${CLOUDFLARED_BIN}"
-    echo -e "  ${RED}-${NC} 辅助组件: utils.sh, parser.sh, advanced_relay.sh"
     echo -e "  ${RED}-${NC} 系统别名: /usr/local/bin/sb"
     echo -e "  ${RED}-${NC} 管理脚本: ${SELF_SCRIPT_PATH}"
     echo ""
@@ -1317,6 +1320,8 @@ _uninstall() {
 
     # 4. 清理组件脚本与别名
     _info "正在清理组件脚本与环境配置..."
+    # 无论是生产目录还是当前测试目录，一并清理
+    rm -f "${SINGBOX_DIR}/utils.sh" "${SINGBOX_DIR}/parser.sh" "${SINGBOX_DIR}/advanced_relay.sh"
     rm -f "${SCRIPT_DIR}/utils.sh" "${SCRIPT_DIR}/parser.sh" "${SCRIPT_DIR}/advanced_relay.sh"
     rm -f "/usr/local/bin/sb"
     
@@ -2815,11 +2820,6 @@ _delete_node() {
     local inbound_ports=()
     local inbound_types=()
     local display_names=() # 存储显示名称
-    
-    local i=1
-    # [!] 已修改：使用进程替换 < <(...) 来避免 subshell，确保数组在循环外可用
-    local i=1
-    # [!] 已修改：使用进程替换 < <(...) 来避免 subshell，确保数组在循环外可用
     while IFS= read -r node; do
         local tag=$(echo "$node" | jq -r '.tag') 
         
@@ -3183,14 +3183,12 @@ _update_script() {
     local sub_scripts=("advanced_relay.sh" "parser.sh" "utils.sh")
     
     for script_name in "${sub_scripts[@]}"; do
-        # 定义可能的路径
-        local paths=("/root/${script_name}" "./${script_name}")
+        local script_path="${SINGBOX_DIR}/${script_name}"
         local updated=false
         
         _info "正在尝试更新子脚本: ${script_name}..."
         
-        for script_path in "${paths[@]}"; do
-            if [ -f "$script_path" ]; then
+        if [ -f "$script_path" ]; then
                 local script_url="${GITHUB_RAW_BASE}/${script_name}"
                 local temp_sub_path="${script_path}.tmp"
                 
@@ -3206,8 +3204,7 @@ _update_script() {
                 else
                     rm -f "$temp_sub_path"
                 fi
-            fi
-        done
+        fi
         
         if [ "$updated" = false ]; then
             _warning "子脚本 ${script_name} 未在常用路径中找到或下载失败，跳过更新。"
@@ -3244,12 +3241,11 @@ _update_singbox_core() {
 # --- 进阶功能 (子脚本) ---
 _advanced_features() {
     local script_name="advanced_relay.sh"
-    # 优先检查 /root 目录 (用户要求)
-    local script_path="/root/${script_name}"
+    local script_path="${SINGBOX_DIR}/${script_name}"
     
-    # [开发测试兼容] 如果 /root 下没有，但当前目录下有 (比如手动上传了)，则使用当前目录的
-    if [ ! -f "$script_path" ] && [ -f "./${script_name}" ]; then
-        script_path="./${script_name}"
+    # 优先检测当前目录 (开发者/测试点优先)
+    if [ -f "$SCRIPT_DIR/$script_name" ]; then
+        script_path="$SCRIPT_DIR/$script_name"
     fi
 
     # 如果都不存在，则下载
@@ -3294,7 +3290,7 @@ _main_menu() {
         # 版本标题
         echo -e "${CYAN}"
         echo "  ╔═══════════════════════════════════════╗"
-        echo "  ║         sing-box 管理脚本 v${SCRIPT_VERSION}        ║"
+        echo "  ║         sing-box 管理脚本 v${SCRIPT_VERSION}         ║"
         echo "  ╚═══════════════════════════════════════╝"
         echo -e "${NC}"
         echo ""
@@ -4117,9 +4113,9 @@ main() {
             need_update=true
         fi
         
-        # 检查2: OpenRC 是否缺少 command_background (新版必需的设置)
+        # 检查2: OpenRC 是否缺少 supervisor 设置 (新版必需的设置)
         # 如果没有这个设置，说明是旧版服务文件，需要更新
-        if [ "$INIT_SYSTEM" == "openrc" ] && ! grep -q "command_background" "$SERVICE_FILE"; then
+        if [ "$INIT_SYSTEM" == "openrc" ] && ! grep -q "supervisor=" "$SERVICE_FILE"; then
             _warn "检测到旧版 OpenRC 服务配置，正在修复以兼容 Alpine..."
             need_update=true
         fi

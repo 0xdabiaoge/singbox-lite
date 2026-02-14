@@ -1,23 +1,23 @@
 #!/bin/bash
 
-# ==========================================================
-# parser.sh - singbox-lite 全协议链路解析引擎 (v11.3)
-# ==========================================================
-
 # 引入工具库 (Self-Initialization Logic)
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+SINGBOX_DIR="/usr/local/etc/sing-box"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
 
-if [ ! -f "$SCRIPT_DIR/utils.sh" ]; then
+if [ -f "$SCRIPT_DIR/utils.sh" ]; then
+    source "$SCRIPT_DIR/utils.sh"
+elif [ -f "${SINGBOX_DIR}/utils.sh" ]; then
+    source "${SINGBOX_DIR}/utils.sh"
+else
     if command -v curl &>/dev/null; then
         curl -LfSs "$GITHUB_RAW_BASE/utils.sh" -o "$SCRIPT_DIR/utils.sh"
     elif command -v wget &>/dev/null; then
         wget -qO "$SCRIPT_DIR/utils.sh" "$GITHUB_RAW_BASE/utils.sh"
     fi
     [ -f "$SCRIPT_DIR/utils.sh" ] && chmod +x "$SCRIPT_DIR/utils.sh"
+    [ -f "$SCRIPT_DIR/utils.sh" ] && source "$SCRIPT_DIR/utils.sh"
 fi
-
-[ -f "$SCRIPT_DIR/utils.sh" ] && source "$SCRIPT_DIR/utils.sh"
 
 if ! command -v jq &>/dev/null; then
     echo '{"error": "缺少 jq 依赖"}'
