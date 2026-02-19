@@ -23,7 +23,10 @@ _url_encode() {
         local c="${string:i:1}"
         case "$c" in
             [a-zA-Z0-9.~_-]) res+="$c" ;;
-            *) printf -v res "%s%%%02X" "$res" "'$c" ;;
+            *) 
+                local hex=$(printf '%02X' "'$c" 2>/dev/null || echo "00")
+                res+="%${hex: -2}"
+                ;;
         esac
     done
     echo "$res"

@@ -40,14 +40,16 @@ _url_decode() {
 _url_encode() {
     local string="${1}"
     local res=""
-    # [关键修复] 强制使用 C 语言环境，确保 ${string:i:1} 提取的是单字节
-    # 这样中文等 UTF-8 字符会被按字节分为 3 次编码，符合标准 URI 规范
     local LC_ALL=C
     for (( i = 0; i < ${#string}; i++ )); do
         local c="${string:i:1}"
         case "$c" in
             [a-zA-Z0-9.~_-]) res+="$c" ;;
-            *) printf -v res "%s%%%02X" "$res" "'$c" ;;
+            *) 
+                # [终极修复] 通过获取 hex 并强制截断后两位，消除 Alpine 环境下的符号扩展 (如 %DFE6 -> %E6)
+                local hex=$(printf '%02X' "'$c" 2>/dev/null || echo "00")
+                res+="%${hex: -2}"
+                ;;
         esac
     done
     echo "$res"
