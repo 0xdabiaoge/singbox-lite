@@ -39,9 +39,11 @@ _url_decode() {
 }
 _url_encode() {
     local string="${1}"
-    local length="${#string}"
     local res=""
-    for (( i = 0; i < length; i++ )); do
+    # [关键修复] 强制使用 C 语言环境，确保 ${string:i:1} 提取的是单字节
+    # 这样中文等 UTF-8 字符会被按字节分为 3 次编码，符合标准 URI 规范
+    local LC_ALL=C
+    for (( i = 0; i < ${#string}; i++ )); do
         local c="${string:i:1}"
         case "$c" in
             [a-zA-Z0-9.~_-]) res+="$c" ;;

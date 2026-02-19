@@ -14,6 +14,21 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+# 核心工具函数
+_url_encode() {
+    local string="${1}"
+    local res=""
+    local LC_ALL=C
+    for (( i = 0; i < ${#string}; i++ )); do
+        local c="${string:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) res+="$c" ;;
+            *) printf -v res "%s%%%02X" "$res" "'$c" ;;
+        esac
+    done
+    echo "$res"
+}
+
 # 打印消息函数 (强制重定向到 stderr，防止干扰变量捕获)
 if ! declare -f _info >/dev/null; then
     _info() { echo -e "${CYAN}[信息] $1${NC}" >&2; }
@@ -664,7 +679,7 @@ _finalize_relay_setup() {
             '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":$f}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
              
         local server_ip=$(_get_public_ip)
-        link="vless://${uuid}@${server_ip}:${listen_port}?encryption=none&flow=${flow}&security=reality&sni=${entrance_sni}&fp=chrome&pbk=${pbk}&sid=${sid}&type=tcp#${node_name}"
+        link="vless://${uuid}@${server_ip}:${listen_port}?encryption=none&flow=${flow}&security=reality&sni=${entrance_sni}&fp=chrome&pbk=${pbk}&sid=${sid}&type=tcp#$(_url_encode "${node_name}")"
         
     elif [ "$relay_type" == "hysteria2" ]; then
         local password=$($SINGBOX_BIN generate rand --hex 16)
@@ -673,7 +688,7 @@ _finalize_relay_setup() {
             '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"server_name":$sn,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
 
         local server_ip=$(_get_public_ip)
-        link="hysteria2://${password}@${server_ip}:${listen_port}?sni=${entrance_sni}&insecure=1&up=10000&down=10000#${node_name}"
+        link="hysteria2://${password}@${server_ip}:${listen_port}?sni=${entrance_sni}&insecure=1&up=10000&down=10000#$(_url_encode "${node_name}")"
         
     elif [ "$relay_type" == "tuic" ]; then
         local uuid=$($SINGBOX_BIN generate uuid)
@@ -682,7 +697,7 @@ _finalize_relay_setup() {
             '{"type":"tuic","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"password":$pw}],"congestion_control":"bbr","tls":{"enabled":true,"server_name":$sn,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
             
         local server_ip=$(_get_public_ip)
-        link="tuic://${uuid}:${password}@${server_ip}:${listen_port}?sni=${entrance_sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#${node_name}"
+        link="tuic://${uuid}:${password}@${server_ip}:${listen_port}?sni=${entrance_sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "${node_name}")"
         
     elif [ "$relay_type" == "anytls" ]; then
         local password=$($SINGBOX_BIN generate uuid)
@@ -690,7 +705,7 @@ _finalize_relay_setup() {
             '{"type":"anytls","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"name":"default","password":$pw}],"padding_scheme":["stop=2","0=100-200","1=100-200"],"tls":{"enabled":true,"server_name":$sn,"certificate_path":$cert,"key_path":$key}}')
             
         local server_ip=$(_get_public_ip)
-        link="anytls://${password}@${server_ip}:${listen_port}?security=tls&sni=${entrance_sni}&insecure=1&allowInsecure=1&type=tcp#${node_name}"
+        link="anytls://${password}@${server_ip}:${listen_port}?security=tls&sni=${entrance_sni}&insecure=1&allowInsecure=1&type=tcp#$(_url_encode "${node_name}")"
     fi
     
     # 2. 写入配置到主配置文件
