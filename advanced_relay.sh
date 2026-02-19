@@ -19,13 +19,17 @@ _url_encode() {
     local string="${1}"
     local res=""
     local LC_ALL=C
+    # 使用 POSIX 兼容的字节循环与转换
     for (( i = 0; i < ${#string}; i++ )); do
         local c="${string:i:1}"
         case "$c" in
             [a-zA-Z0-9.~_-]) res+="$c" ;;
             *) 
-                local hex=$(printf '%02X' "'$c" 2>/dev/null || echo "00")
-                res+="%${hex: -2}"
+                # [加固] 使用 printf 直接转义，避免中间变量引起的 Bash 截断 Bug
+                local val=$(printf '%d' "'$c")
+                [[ $val -lt 0 ]] && ((val += 256))
+                printf -v part "%%%02X" "$val"
+                res+="$part"
                 ;;
         esac
     done
@@ -319,15 +323,14 @@ _import_link_config() {
 
 # 检查依赖 (主脚本已预装绝大部分，此处仅做快速校验)
 _check_deps() {
-    local missing=()
+    # [修复] 移除 Bash 数组语法，防止在部分环境（如 Ash/Dash）下闪退
     for cmd in jq openssl wget curl yq; do
-        if ! command -v $cmd &>/dev/null; then missing+=($cmd); fi
+        if ! command -v $cmd &>/dev/null; then
+            _error "缺少关键依赖: $cmd"
+            _warn "请先运行主脚本 [1) 安装环境]。"
+            exit 1
+        fi
     done
-    
-    if [ ${#missing[@]} -ne 0 ]; then
-        _error "缺少关键依赖: ${missing[*]}. 请先运行主脚本 [1) 安装环境]。"
-        exit 1
-    fi
 }
 
 # --- 1. 落地机配置 (生成 Token) ---

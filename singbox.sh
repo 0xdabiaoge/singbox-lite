@@ -46,9 +46,11 @@ _url_encode() {
         case "$c" in
             [a-zA-Z0-9.~_-]) res+="$c" ;;
             *) 
-                # [终极修复] 通过获取 hex 并强制截断后两位，消除 Alpine 环境下的符号扩展 (如 %DFE6 -> %E6)
-                local hex=$(printf '%02X' "'$c" 2>/dev/null || echo "00")
-                res+="%${hex: -2}"
+                # [加固] 使用 printf 配合十进制转换，确保在 Alpine 等极简环境下字节处理的一致性
+                local val=$(printf '%d' "'$c")
+                [[ $val -lt 0 ]] && ((val += 256))
+                printf -v part "%%%02X" "$val"
+                res+="$part"
                 ;;
         esac
     done
