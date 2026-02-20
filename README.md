@@ -1,4 +1,4 @@
-# sing-box 全功能管理脚本
+# sing-box & Xray 全功能管理脚本
 
 一套功能完整的 sing-box + Xray 双核心节点管理和中转配置脚本，支持多种协议和高级中转功能。
 
@@ -335,4 +335,5 @@
 ### 2026.02.21
 - **新增 Xray-core 管理**：新增 `xray_manager.sh` 脚本，通过主菜单 [16] 进入。支持 Xray-core 的一键安装/更新/卸载，以及 5 种 Xray 节点协议的部署管理（VLESS+TCP+Reality+Vision、VLESS+gRPC+Reality、Trojan+XHTTP+Reality、Trojan+gRPC+Reality、Shadowsocks），Xray 与 Sing-box 双核心共存互不干扰，共享 `clash.yaml` 输出。
 - **主菜单新增服务监控**：主菜单状态栏新增 Xray 服务运行状态和节点数量显示，与 Sing-box 和 Argo 状态并列展示。
+
 
