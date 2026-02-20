@@ -21,6 +21,21 @@
         <br><sub><b>懒猫云</b></sub>
       </a>
     </td>
+    </td>
+    <td align="center" width="220">
+      <a href="https://fuckip.me/" target="_blank">
+        <img src="https://fuckip.me/res/logo.png" width="100" alt="Incudal" />
+        <br><sub><b>独角鲸</b></sub>
+      </a>
+    </td>
+    </td>
+    </td>
+    <td align="center" width="220">
+      <a href="https://www.lxc.wiki/" target="_blank">
+        <img src="https://www.lxc.wiki/themes/web/starvm-phj/img/logo.png" width="100" alt="Incudal" />
+        <br><sub><b>拼好鸡</b></sub>
+      </a>
+    </td>
   </tr>
 </table>
 
@@ -320,3 +335,4 @@
 ### 2026.02.21
 - **新增 Xray-core 管理**：新增 `xray_manager.sh` 脚本，通过主菜单 [16] 进入。支持 Xray-core 的一键安装/更新/卸载，以及 5 种 Xray 节点协议的部署管理（VLESS+TCP+Reality+Vision、VLESS+gRPC+Reality、Trojan+XHTTP+Reality、Trojan+gRPC+Reality、Shadowsocks），Xray 与 Sing-box 双核心共存互不干扰，共享 `clash.yaml` 输出。
 - **主菜单新增服务监控**：主菜单状态栏新增 Xray 服务运行状态和节点数量显示，与 Sing-box 和 Argo 状态并列展示。
+
