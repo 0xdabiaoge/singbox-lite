@@ -1511,20 +1511,20 @@ _initialize_config_files() {
   "dns": {
     "servers": [
       {
-        "tag": "dns-aliyun",
-        "address": "https://223.5.5.5/dns-query",
+        "tag": "dns-cloudflare",
+        "address": "https://1.1.1.1/dns-query",
         "detour": "direct"
       },
       {
-        "tag": "dns-cloudflare",
-        "address": "https://1.1.1.1/dns-query",
+        "tag": "dns-aliyun",
+        "address": "https://223.5.5.5/dns-query",
         "detour": "direct"
       }
     ],
     "rules": [
       {
         "outbound": "any",
-        "server": "dns-aliyun"
+        "server": "dns-cloudflare"
       }
     ],
     "strategy": "ipv4_only"
@@ -1709,10 +1709,10 @@ _check_and_fix_dns() {
         jq '. + {
             "dns": {
                 "servers": [
-                    {"tag": "dns-aliyun", "address": "https://223.5.5.5/dns-query", "detour": "direct"},
-                    {"tag": "dns-cloudflare", "address": "https://1.1.1.1/dns-query", "detour": "direct"}
+                    {"tag": "dns-cloudflare", "address": "https://1.1.1.1/dns-query", "detour": "direct"},
+                    {"tag": "dns-aliyun", "address": "https://223.5.5.5/dns-query", "detour": "direct"}
                 ],
-                "rules": [{"outbound": "any", "server": "dns-aliyun"}],
+                "rules": [{"outbound": "any", "server": "dns-cloudflare"}],
                 "strategy": "ipv4_only"
             }
         } | del(.route.auto_detect_interface)' "$CONFIG_FILE" > "$tmp_file"

@@ -1105,6 +1105,367 @@ _modify_relay_port() {
 }
 
 
+# ============================================================
+# --- 端口转发管理模块 (Port Forwarding) ---
+# 利用 sing-box 原生 direct inbound/outbound 实现 L4 纯端口转发
+# 所有规则通过 "pf-" 前缀标签与中转规则完全隔离
+# 注: sing-box 1.11+ 要求 override_address/override_port 写在 route rule 中
+# ============================================================
+
+# 统计端口转发规则数量
+_pf_count() {
+    if [ -f "$RELAY_CONFIG_FILE" ]; then
+        jq '[.inbounds[] | select(.tag | startswith("pf-in-"))] | length' "$RELAY_CONFIG_FILE" 2>/dev/null || echo 0
+    else
+        echo 0
+    fi
+}
+
+# 添加端口转发规则
+_pf_add() {
+    echo ""
+    _info "=== 添加端口转发规则 ==="
+    echo ""
+    
+    # 1. 输入本地监听端口
+    local listen_port
+    while true; do
+        read -p "  请输入本机监听端口: " listen_port
+        if [[ ! "$listen_port" =~ ^[0-9]+$ ]] || [ "$listen_port" -lt 1 ] || [ "$listen_port" -gt 65535 ]; then
+            _error "无效端口，请输入 1-65535 之间的数字"
+            continue
+        fi
+        if _check_port_occupied "$listen_port"; then
+            _error "端口 $listen_port 已被系统占用，请换一个"
+            continue
+        fi
+        if [ -f "$RELAY_CONFIG_FILE" ] && jq -e ".inbounds[] | select(.tag == \"pf-in-${listen_port}\")" "$RELAY_CONFIG_FILE" >/dev/null 2>&1; then
+            _error "端口 $listen_port 已存在转发规则，请换一个"
+            continue
+        fi
+        break
+    done
+    
+    # 2. 输入目标地址
+    local target_addr
+    read -p "  请输入目标地址 (IP 或域名): " target_addr
+    if [ -z "$target_addr" ]; then
+        _error "目标地址不能为空"; read -p "  按回车继续..."; return
+    fi
+    
+    # 3. 输入目标端口
+    local target_port
+    read -p "  请输入目标端口: " target_port
+    if [[ ! "$target_port" =~ ^[0-9]+$ ]] || [ "$target_port" -lt 1 ] || [ "$target_port" -gt 65535 ]; then
+        _error "无效端口"; read -p "  按回车继续..."; return
+    fi
+    
+    # 4. 选择转发协议
+    echo ""
+    echo -e "  ${CYAN}【选择转发协议】${NC}"
+    echo -e "    ${GREEN}[1]${NC} 仅 TCP"
+    echo -e "    ${GREEN}[2]${NC} 仅 UDP"
+    echo -e "    ${GREEN}[3]${NC} TCP + UDP (全部转发)"
+    echo ""
+    read -p "  请选择 [1-3] (默认 1): " proto_choice
+    
+    local network="tcp"
+    local network_display="TCP"
+    case "$proto_choice" in
+        2) network="udp"; network_display="UDP" ;;
+        3) network=""; network_display="TCP+UDP" ;;
+        *) network="tcp"; network_display="TCP" ;;
+    esac
+    
+    # 5. 构造 JSON 并写入
+    local in_tag="pf-in-${listen_port}"
+    local out_tag="pf-out-${listen_port}"
+    
+    # inbound: direct 类型监听
+    local inbound_json
+    if [ -n "$network" ]; then
+        inbound_json=$(jq -n --arg t "$in_tag" --argjson p "$listen_port" --arg net "$network" \
+            '{"type":"direct","tag":$t,"listen":"0.0.0.0","listen_port":$p,"network":$net}')
+    else
+        inbound_json=$(jq -n --arg t "$in_tag" --argjson p "$listen_port" \
+            '{"type":"direct","tag":$t,"listen":"0.0.0.0","listen_port":$p}')
+    fi
+    
+    # outbound: 纯 direct（不带 override，兼容 sing-box 1.11+）
+    local outbound_json=$(jq -n --arg t "$out_tag" '{"type":"direct","tag":$t}')
+    
+    # route rule: override_address 和 override_port 写在路由规则中
+    local rule_json=$(jq -n --arg it "$in_tag" --arg ot "$out_tag" --arg addr "$target_addr" --argjson port "$target_port" \
+        '{"inbound":$it,"outbound":$ot,"action":"route","override_address":$addr,"override_port":$port}')
+    
+    # 确保配置文件存在
+    if [ ! -f "$RELAY_CONFIG_FILE" ]; then
+        echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
+    fi
+    
+    local combined_filter=".inbounds += [$inbound_json] | .outbounds += [$outbound_json]"
+    if ! jq -e '.route' "$RELAY_CONFIG_FILE" >/dev/null 2>&1; then
+        combined_filter="${combined_filter} | . + {\"route\":{\"rules\":[]}}"
+    fi
+    combined_filter="${combined_filter} | .route.rules += [$rule_json]"
+    
+    if ! _atomic_modify_json "$RELAY_CONFIG_FILE" "$combined_filter"; then
+        _error "配置写入失败"
+        read -p "  按回车继续..."; return
+    fi
+    
+    _manage_service restart
+    echo ""
+    _success "端口转发规则已添加并生效！"
+    echo -e "  转发模式: ${CYAN}${network_display}${NC}"
+    echo -e "  本机端口: ${GREEN}${listen_port}${NC} → 目标: ${GREEN}${target_addr}:${target_port}${NC}"
+    echo ""
+    read -p "  按回车继续..."
+}
+
+# 查看当前转发规则
+_pf_view() {
+    echo ""
+    _info "=== 当前端口转发规则 ==="
+    echo ""
+    
+    if [ ! -f "$RELAY_CONFIG_FILE" ]; then
+        _warn "暂无转发规则"; read -p "  按回车继续..."; return
+    fi
+    
+    local count=$(_pf_count)
+    if [ "$count" -eq 0 ]; then
+        _warn "暂无转发规则"; read -p "  按回车继续..."; return
+    fi
+    
+    # 遍历所有 pf-in- 开头的 inbound
+    local i=1
+    jq -r '.inbounds[] | select(.tag | startswith("pf-in-")) | .tag' "$RELAY_CONFIG_FILE" 2>/dev/null | while read -r in_tag; do
+        local port=$(jq -r ".inbounds[] | select(.tag == \"$in_tag\") | .listen_port" "$RELAY_CONFIG_FILE")
+        local net=$(jq -r ".inbounds[] | select(.tag == \"$in_tag\") | .network // \"tcp+udp\"" "$RELAY_CONFIG_FILE")
+        
+        # 从 route rule 中读取目标地址和端口
+        local addr=$(jq -r ".route.rules[] | select(.inbound == \"$in_tag\") | .override_address // \"N/A\"" "$RELAY_CONFIG_FILE")
+        local tport=$(jq -r ".route.rules[] | select(.inbound == \"$in_tag\") | .override_port // \"N/A\"" "$RELAY_CONFIG_FILE")
+        
+        local net_display=$(echo "$net" | tr '[:lower:]' '[:upper:]')
+        [ "$net_display" == "TCP+UDP" ] || [ "$net_display" == "null" ] && net_display="TCP+UDP"
+        
+        echo -e "  ${GREEN}[$i]${NC} 本机 :${CYAN}${port}${NC} → ${CYAN}${addr}:${tport}${NC}  [${YELLOW}${net_display}${NC}]"
+        i=$((i+1))
+    done
+    
+    echo ""
+    echo -e "  共 ${GREEN}${count}${NC} 条转发规则"
+    echo ""
+    read -p "  按回车继续..."
+}
+
+# 删除指定转发规则
+_pf_delete() {
+    echo ""
+    _info "=== 删除端口转发规则 ==="
+    echo ""
+    
+    if [ ! -f "$RELAY_CONFIG_FILE" ]; then
+        _warn "暂无转发规则"; read -p "  按回车继续..."; return
+    fi
+    
+    local count=$(_pf_count)
+    if [ "$count" -eq 0 ]; then
+        _warn "暂无转发规则"; read -p "  按回车继续..."; return
+    fi
+    
+    # 列出所有规则
+    local tags=()
+    local i=1
+    while IFS= read -r in_tag; do
+        tags+=("$in_tag")
+        local port=$(jq -r ".inbounds[] | select(.tag == \"$in_tag\") | .listen_port" "$RELAY_CONFIG_FILE")
+        local addr=$(jq -r ".route.rules[] | select(.inbound == \"$in_tag\") | .override_address // \"N/A\"" "$RELAY_CONFIG_FILE")
+        local tport=$(jq -r ".route.rules[] | select(.inbound == \"$in_tag\") | .override_port // \"N/A\"" "$RELAY_CONFIG_FILE")
+        echo -e "  ${GREEN}[$i]${NC} 本机 :${CYAN}${port}${NC} → ${CYAN}${addr}:${tport}${NC}"
+        i=$((i+1))
+    done < <(jq -r '.inbounds[] | select(.tag | startswith("pf-in-")) | .tag' "$RELAY_CONFIG_FILE" 2>/dev/null)
+    
+    echo ""
+    read -p "  请输入要删除的序号 (0 取消): " sel
+    if [[ ! "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt "${#tags[@]}" ]; then
+        [ "$sel" != "0" ] && _error "无效选择"
+        return
+    fi
+    
+    local selected_tag="${tags[$((sel-1))]}"
+    local selected_port=$(jq -r ".inbounds[] | select(.tag == \"$selected_tag\") | .listen_port" "$RELAY_CONFIG_FILE")
+    local selected_out="pf-out-${selected_port}"
+    
+    local del_filter="del(.inbounds[] | select(.tag == \"$selected_tag\"))"
+    del_filter="${del_filter} | del(.outbounds[] | select(.tag == \"$selected_out\"))"
+    del_filter="${del_filter} | .route.rules = [.route.rules[] | select(.inbound != \"$selected_tag\")]"
+    
+    if _atomic_modify_json "$RELAY_CONFIG_FILE" "$del_filter"; then
+        _manage_service restart
+        _success "已删除端口 ${selected_port} 的转发规则"
+    else
+        _error "删除失败"
+    fi
+    read -p "  按回车继续..."
+}
+
+# 修改转发规则
+_pf_modify() {
+    echo ""
+    _info "=== 修改端口转发规则 ==="
+    echo ""
+    
+    if [ ! -f "$RELAY_CONFIG_FILE" ]; then
+        _warn "暂无转发规则"; read -p "  按回车继续..."; return
+    fi
+    
+    local count=$(_pf_count)
+    if [ "$count" -eq 0 ]; then
+        _warn "暂无转发规则"; read -p "  按回车继续..."; return
+    fi
+    
+    # 列出所有规则
+    local tags=()
+    local i=1
+    while IFS= read -r in_tag; do
+        tags+=("$in_tag")
+        local port=$(jq -r ".inbounds[] | select(.tag == \"$in_tag\") | .listen_port" "$RELAY_CONFIG_FILE")
+        local net=$(jq -r ".inbounds[] | select(.tag == \"$in_tag\") | .network // \"tcp+udp\"" "$RELAY_CONFIG_FILE")
+        local addr=$(jq -r ".route.rules[] | select(.inbound == \"$in_tag\") | .override_address // \"N/A\"" "$RELAY_CONFIG_FILE")
+        local tport=$(jq -r ".route.rules[] | select(.inbound == \"$in_tag\") | .override_port // \"N/A\"" "$RELAY_CONFIG_FILE")
+        local net_display=$(echo "$net" | tr '[:lower:]' '[:upper:]')
+        [ "$net_display" == "TCP+UDP" ] || [ "$net_display" == "null" ] && net_display="TCP+UDP"
+        echo -e "  ${GREEN}[$i]${NC} :${CYAN}${port}${NC} → ${CYAN}${addr}:${tport}${NC}  [${YELLOW}${net_display}${NC}]"
+        i=$((i+1))
+    done < <(jq -r '.inbounds[] | select(.tag | startswith("pf-in-")) | .tag' "$RELAY_CONFIG_FILE" 2>/dev/null)
+    
+    echo ""
+    read -p "  请输入要修改的序号 (0 取消): " sel
+    if [[ ! "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt "${#tags[@]}" ]; then
+        [ "$sel" != "0" ] && _error "无效选择"
+        return
+    fi
+    
+    local selected_tag="${tags[$((sel-1))]}"
+    local current_port=$(jq -r ".inbounds[] | select(.tag == \"$selected_tag\") | .listen_port" "$RELAY_CONFIG_FILE")
+    local current_addr=$(jq -r ".route.rules[] | select(.inbound == \"$selected_tag\") | .override_address" "$RELAY_CONFIG_FILE")
+    local current_tport=$(jq -r ".route.rules[] | select(.inbound == \"$selected_tag\") | .override_port" "$RELAY_CONFIG_FILE")
+    local current_net=$(jq -r ".inbounds[] | select(.tag == \"$selected_tag\") | .network // \"\"" "$RELAY_CONFIG_FILE")
+    
+    echo ""
+    echo -e "  当前规则: :${CYAN}${current_port}${NC} → ${CYAN}${current_addr}:${current_tport}${NC}"
+    echo ""
+    
+    # 修改目标地址
+    read -p "  新目标地址 (回车保持 ${current_addr}): " new_addr
+    [ -z "$new_addr" ] && new_addr="$current_addr"
+    
+    # 修改目标端口
+    read -p "  新目标端口 (回车保持 ${current_tport}): " new_tport
+    if [ -n "$new_tport" ]; then
+        if [[ ! "$new_tport" =~ ^[0-9]+$ ]] || [ "$new_tport" -lt 1 ] || [ "$new_tport" -gt 65535 ]; then
+            _error "无效端口，保持原值"; new_tport="$current_tport"
+        fi
+    else
+        new_tport="$current_tport"
+    fi
+    
+    # 修改协议
+    local current_net_display="TCP+UDP"
+    [ "$current_net" == "tcp" ] && current_net_display="TCP"
+    [ "$current_net" == "udp" ] && current_net_display="UDP"
+    
+    echo ""
+    echo -e "  当前协议: ${YELLOW}${current_net_display}${NC}"
+    echo -e "    ${GREEN}[1]${NC} 仅 TCP  ${GREEN}[2]${NC} 仅 UDP  ${GREEN}[3]${NC} TCP+UDP  ${GREEN}[0]${NC} 不改"
+    read -p "  请选择 (默认不改): " proto_choice
+    
+    local new_net="$current_net"
+    case "$proto_choice" in
+        1) new_net="tcp" ;;
+        2) new_net="udp" ;;
+        3) new_net="" ;;
+    esac
+    
+    # 应用修改: override 字段在 route rule 中
+    local mod_filter=".route.rules = [.route.rules[] | if .inbound == \"$selected_tag\" then .override_address = \"$new_addr\" | .override_port = $new_tport else . end]"
+    
+    if [ -n "$new_net" ]; then
+        mod_filter="${mod_filter} | .inbounds = [.inbounds[] | if .tag == \"$selected_tag\" then .network = \"$new_net\" else . end]"
+    else
+        mod_filter="${mod_filter} | .inbounds = [.inbounds[] | if .tag == \"$selected_tag\" then del(.network) else . end]"
+    fi
+    
+    if _atomic_modify_json "$RELAY_CONFIG_FILE" "$mod_filter"; then
+        _manage_service restart
+        _success "转发规则已修改并生效！"
+        echo -e "  本机端口: ${GREEN}${current_port}${NC} → 目标: ${GREEN}${new_addr}:${new_tport}${NC}"
+    else
+        _error "修改失败"
+    fi
+    read -p "  按回车继续..."
+}
+
+# 清空所有端口转发规则
+_pf_clear() {
+    local count=$(_pf_count)
+    if [ "$count" -eq 0 ]; then
+        _warn "暂无转发规则"; read -p "  按回车继续..."; return
+    fi
+    
+    echo ""
+    _warn "确认清空全部 ${count} 条端口转发规则？（中转规则不受影响）"
+    read -p "  (y/N): " confirm
+    if [ "$confirm" != "y" ]; then return; fi
+    
+    local clear_filter='.inbounds = [.inbounds[] | select(.tag | startswith("pf-in-") | not)]'
+    clear_filter="${clear_filter} | .outbounds = [.outbounds[] | select(.tag | startswith(\"pf-out-\") | not)]"
+    clear_filter="${clear_filter} | .route.rules = [.route.rules[] | select(.inbound | startswith(\"pf-in-\") | not)]"
+    
+    if _atomic_modify_json "$RELAY_CONFIG_FILE" "$clear_filter"; then
+        _manage_service restart
+        _success "所有端口转发规则已清空"
+    else
+        _error "清空失败"
+    fi
+    read -p "  按回车继续..."
+}
+
+# 端口转发子菜单
+_port_forward_menu() {
+    while true; do
+        clear
+        local count=$(_pf_count)
+        echo -e "${CYAN}"
+        echo "  ╔═══════════════════════════════════════╗"
+        echo -e "  ║    端口转发管理 (当前规则: ${GREEN}${count}${CYAN} 条)      ║"
+        echo "  ╠═══════════════════════════════════════╣"
+        echo -e "  ║  ${GREEN}[1]${CYAN} 添加转发规则                    ║"
+        echo -e "  ║  ${GREEN}[2]${CYAN} 查看当前转发规则                ║"
+        echo -e "  ║  ${GREEN}[3]${CYAN} 修改转发规则                    ║"
+        echo -e "  ║  ${GREEN}[4]${CYAN} 删除转发规则                    ║"
+        echo -e "  ║  ${RED}[5]${CYAN} 清空所有转发规则                ║"
+        echo -e "  ║  ${YELLOW}[0]${CYAN} 返回上级菜单                    ║"
+        echo "  ╚═══════════════════════════════════════╝"
+        echo -e "${NC}"
+        
+        read -p "  请输入选项 [0-5]: " pf_choice
+        case "$pf_choice" in
+            1) _pf_add ;;
+            2) _pf_view ;;
+            3) _pf_modify ;;
+            4) _pf_delete ;;
+            5) _pf_clear ;;
+            0) return ;;
+            *) _error "无效输入"; sleep 1 ;;
+        esac
+    done
+}
+
+
 _menu() {
     _check_deps
     _init_relay_dirs
@@ -1158,10 +1519,13 @@ _menu() {
         echo -e "    ${GREEN}[6]${NC} 修改中转监听端口"
         echo -e "    ${RED}[7]${NC} 清空所有中转配置"
         echo ""
+        echo -e "  ${CYAN}【端口转发】${NC}"
+        echo -e "    ${GREEN}[8]${NC} 端口转发管理"
+        echo ""
         echo -e "  ─────────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
         echo ""
-        read -p "  请输入选项 [0-7]: " choice
+        read -p "  请输入选项 [0-8]: " choice
         case $choice in
             1) _landing_config ;;
             2) _relay_config ;;
@@ -1182,6 +1546,7 @@ _menu() {
                    _success "全部中转已清空"
                fi ;;
             0) exit 0 ;;
+            8) _port_forward_menu ;;
             *) _error "无效输入"; sleep 1 ;;
         esac
     done
