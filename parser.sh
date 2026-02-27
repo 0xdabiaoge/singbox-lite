@@ -157,8 +157,15 @@ _parse_ss() {
     if [[ "$body" == *"@"* ]]; then
         local userinfo="${body%@*}"
         server_port="${body#*@}"
-        [[ "$userinfo" != *":"* ]] && userinfo=$(_decode_base64_urlsafe "$userinfo")
-        method_pass="$userinfo"
+        # 先 URL 解码 userinfo（处理 %3A 等编码字符）
+        local decoded_userinfo=$(_url_decode "$userinfo")
+        if [[ "$decoded_userinfo" == *":"* ]]; then
+            # 已经是明文 method:password 格式（或 URL 编码后的明文）
+            method_pass="$decoded_userinfo"
+        else
+            # 没有冒号，可能是 base64 编码
+            method_pass=$(_decode_base64_urlsafe "$userinfo")
+        fi
     else
         local decoded=$(_decode_base64_urlsafe "$body")
         method_pass="${decoded%@*}"
