@@ -167,7 +167,7 @@ _parse_ss() {
 
     echo "$server_port" | grep -q "?" && server_port="${server_port%%\?*}"
 
-    jq -n --arg s "${server_port%:*}" --argjson p "${server_port#*:}" --arg m "${method_pass%:*}" --arg pw "${method_pass#*:}" \
+    jq -n --arg s "${server_port%:*}" --argjson p "${server_port#*:}" --arg m "${method_pass%%:*}" --arg pw "${method_pass#*:}" \
         '{type:"shadowsocks", tag:"proxy", server:$s, server_port:$p, method:$m, password:$pw}'
 }
 
