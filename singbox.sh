@@ -3276,7 +3276,9 @@ _delete_node() {
 
 _check_config() {
     _info "正在检查 sing-box 配置文件..."
-    local result=$(${SINGBOX_BIN} check -c ${CONFIG_FILE})
+    # 捕获所有输出（包括 stderr 产生的大量 WARN 和 TRACE 弃用警告）
+    local result
+    result=$(${SINGBOX_BIN} check -c ${CONFIG_FILE} 2>&1)
     if [[ $? -eq 0 ]]; then
         _success "配置文件 (${CONFIG_FILE}) 格式正确。"
     else
