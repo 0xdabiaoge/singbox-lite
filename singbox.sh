@@ -1373,6 +1373,7 @@ command="${SINGBOX_BIN}"
 command_args="run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json"
 # 使用 supervise-daemon 实现守护和重启
 supervisor="supervise-daemon"
+supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB --env ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true"
 respawn_delay=3
 respawn_max=0
 
@@ -1385,11 +1386,6 @@ error_log="${LOG_FILE}"
 depend() {
     need net
     after firewall
-}
-
-start_pre() {
-    export GOMEMLIMIT="${mem_limit_mb}MiB"
-    export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS="true"
 }
 EOF
     chmod +x "$SERVICE_FILE"
