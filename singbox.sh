@@ -1349,6 +1349,7 @@ After=network.target nss-lookup.target
 
 [Service]
 Environment="GOMEMLIMIT=${mem_limit_mb}MiB"
+Environment="ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true"
 ExecStart=${SINGBOX_BIN} run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json
 Restart=on-failure
 RestartSec=3s
@@ -1388,13 +1389,13 @@ depend() {
 
 start_pre() {
     export GOMEMLIMIT="${mem_limit_mb}MiB"
+    export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS="true"
 }
 EOF
     chmod +x "$SERVICE_FILE"
 }
 
 _create_service_files() {
-    if [ -f "$SERVICE_FILE" ]; then return; fi
     
     _info "正在创建 ${INIT_SYSTEM} 服务文件..."
     if [ "$INIT_SYSTEM" == "systemd" ]; then
@@ -3518,6 +3519,7 @@ _do_update_singbox() {
     
     if [ $? -eq 0 ]; then
         _success "sing-box 安装/更新成功！"
+        _create_service_files
         _sync_system_time
         _info "正在重启 [主] 服务 (sing-box)..."
         _manage_service "restart"
