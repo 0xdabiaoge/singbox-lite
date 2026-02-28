@@ -7,6 +7,7 @@ SELF_SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
+SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
 
 # --- 核心工具函数 ---
 
@@ -314,10 +315,18 @@ _install_sing_box() {
         *) _error "不支持的架构：$arch"; exit 1 ;;
     esac
     
-    local api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
-    local download_url=$(curl -s "$api_url" | jq -r ".assets[] | select(.name | contains(\"linux-${arch_tag}.tar.gz\")) | .browser_download_url")
+    # 检测 C 库类型：Alpine 等系统使用 musl，需要下载对应版本
+    local libc_suffix=""
+    if ldd --version 2>&1 | grep -qi musl || [ -f /etc/alpine-release ]; then
+        _info "检测到 musl libc (Alpine 等系统)，将下载 musl 版本..."
+        libc_suffix="-musl"
+    fi
     
-    if [ -z "$download_url" ]; then _error "无法获取 sing-box 下载链接。"; exit 1; fi
+    local api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+    local search_pattern="linux-${arch_tag}${libc_suffix}.tar.gz"
+    local download_url=$(curl -s "$api_url" | jq -r ".assets[] | select(.name | contains(\"${search_pattern}\")) | .browser_download_url")
+    
+    if [ -z "$download_url" ]; then _error "无法获取 sing-box 下载链接 (搜索: ${search_pattern})。"; exit 1; fi
     
     wget -qO sing-box.tar.gz "$download_url" || { _error "下载失败!"; exit 1; }
     
@@ -3486,24 +3495,95 @@ _update_script() {
 }
 
 _update_singbox_core() {
-    _info "--- 更新 Sing-box 核心 ---"
-    _info "这将下载并覆盖 Sing-box 的最新稳定版。"
+    echo ""
+    echo -e "  ${CYAN}【更新核心二进制】${NC}"
+    echo -e "    ${GREEN}[1]${NC} 仅更新 Sing-box 核心"
+    echo -e "    ${GREEN}[2]${NC} 仅更新 Xray 核心"
+    echo -e "    ${GREEN}[3]${NC} 全部更新 (Sing-box + Xray)"
+    echo ""
+    read -p "  请选择 [1-3] (默认 1): " core_choice
     
-    # 1. 调用已有的安装函数，它会下载最新版
+    case "${core_choice:-1}" in
+        1) _do_update_singbox ;;
+        2) _do_update_xray ;;
+        3) _do_update_singbox; _do_update_xray ;;
+        *) _error "无效选项"; return ;;
+    esac
+}
+
+# 更新 sing-box 核心
+_do_update_singbox() {
+    _info "--- 更新 Sing-box 核心 ---"
     _install_sing_box
     
     if [ $? -eq 0 ]; then
         _success "sing-box 安装/更新成功！"
-        _sync_system_time # 在核心更新后同步时间
-        # 2. 重启主服务
+        _sync_system_time
         _info "正在重启 [主] 服务 (sing-box)..."
         _manage_service "restart"
         _success "[主] 服务已重启。"
-        # 3. 提醒重启线路机
-        _warning "如果您的 [线路机] 服务 (sing-box-relay) 也在本机运行，"
-        _warning "请使用 [菜单 10] -> [重启] 来应用核心更新。"
     else
         _error "Sing-box 核心更新失败。"
+    fi
+}
+
+# 更新 Xray 核心 (内联实现，避免依赖 xray_manager.sh 的 source)
+_do_update_xray() {
+    _info "--- 更新 Xray 核心 ---"
+    
+    local xray_bin="/usr/local/bin/xray"
+    local xray_dir="/usr/local/etc/xray"
+    
+    # 确保 unzip 可用
+    command -v unzip &>/dev/null || _pkg_install unzip
+    
+    local arch=$(uname -m)
+    local xray_arch=""
+    case "$arch" in
+        x86_64|amd64)  xray_arch="64" ;;
+        aarch64|arm64) xray_arch="arm64-v8a" ;;
+        armv7l)        xray_arch="arm32-v7a" ;;
+        *)             xray_arch="64" ;;
+    esac
+    
+    local download_url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${xray_arch}.zip"
+    local tmp_dir=$(mktemp -d)
+    local tmp_zip="${tmp_dir}/xray.zip"
+    
+    _info "下载地址: ${download_url}"
+    if ! wget -qO "$tmp_zip" "$download_url"; then
+        _error "Xray 下载失败！"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    
+    if ! unzip -qo "$tmp_zip" -d "$tmp_dir"; then
+        _error "Xray 解压失败！"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    
+    mv "${tmp_dir}/xray" "$xray_bin"
+    chmod +x "$xray_bin"
+    
+    mkdir -p "$xray_dir"
+    [ -f "${tmp_dir}/geoip.dat" ] && mv "${tmp_dir}/geoip.dat" "$xray_dir/"
+    [ -f "${tmp_dir}/geosite.dat" ] && mv "${tmp_dir}/geosite.dat" "$xray_dir/"
+    
+    rm -rf "$tmp_dir"
+    
+    local version=$($xray_bin version 2>/dev/null | head -1 | awk '{print $2}')
+    _success "Xray-core v${version} 更新成功！"
+    
+    # 如果 Xray 服务正在运行，重启它
+    if command -v systemctl &>/dev/null && systemctl is-active xray &>/dev/null; then
+        _info "正在重启 Xray 服务..."
+        systemctl restart xray
+        _success "Xray 服务已重启。"
+    elif command -v rc-service &>/dev/null && rc-service xray status &>/dev/null 2>&1; then
+        _info "正在重启 Xray 服务..."
+        rc-service xray restart
+        _success "Xray 服务已重启。"
     fi
 }
 
