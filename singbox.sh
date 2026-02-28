@@ -1351,6 +1351,7 @@ After=network.target nss-lookup.target
 Environment="GOMEMLIMIT=${mem_limit_mb}MiB"
 Environment="ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true"
 Environment="ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true"
+Environment="ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
 ExecStart=${SINGBOX_BIN} run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json
 Restart=on-failure
 RestartSec=3s
@@ -1374,7 +1375,7 @@ command="${SINGBOX_BIN}"
 command_args="run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json"
 # 使用 supervise-daemon 实现守护和重启
 supervisor="supervise-daemon"
-supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB --env ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true --env ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true"
+supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB --env ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true --env ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true --env ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
 respawn_delay=3
 respawn_max=0
 
