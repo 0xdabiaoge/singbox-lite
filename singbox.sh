@@ -9,6 +9,11 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
 
+# 注入 sing-box 1.12+ 废弃配置兼容环境变量 (用于脚本内嵌的前台命令调用，如 check/generate)
+export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS="true"
+export ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM="true"
+export ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER="true"
+
 # --- 核心工具函数 ---
 
 # 颜色定义
