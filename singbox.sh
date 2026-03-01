@@ -3460,7 +3460,7 @@ _update_script() {
     fi
     
     # 需要更新的子脚本列表
-    local sub_scripts=("advanced_relay.sh" "parser.sh")
+    local sub_scripts=("advanced_relay.sh" "parser.sh" "xray_manager.sh")
     
     for script_name in "${sub_scripts[@]}"; do
         local updated=false
