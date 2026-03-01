@@ -1165,7 +1165,7 @@ _pf_add() {
     echo -e "  ${CYAN}【选择转发协议】${NC}"
     echo -e "    ${GREEN}[1]${NC} 仅 TCP"
     echo -e "    ${GREEN}[2]${NC} 仅 UDP"
-    echo -e "    ${GREEN}[3]${NC} TCP + UDP (全部转发)"
+    echo -e "    ${GREEN}[3]${NC} TCP+UDP (全部转发)"
     echo ""
     read -p "  请选择 [1-3] (默认 1): " proto_choice
     
@@ -1177,8 +1177,18 @@ _pf_add() {
         *) network="tcp"; network_display="TCP" ;;
     esac
     
-    # 5. 构造 JSON 并写入
-    local in_tag="pf-in-${listen_port}"
+    # 5. 输入备注名称
+    echo ""
+    local custom_name
+    read -p "  请输入备注名称 (直接回车默认: 转发规则-${listen_port}): " custom_name
+    [ -z "$custom_name" ] && custom_name="转发规则-${listen_port}"
+    # 净化危险字符，防止打断 jq json 过滤器或分隔符
+    custom_name="${custom_name//\"/}"
+    custom_name="${custom_name//\\/}"
+    custom_name="${custom_name//#/}"
+    
+    # 6. 构造 JSON 并写入
+    local in_tag="pf-in-${listen_port}#${custom_name}"
     local out_tag="pf-out-${listen_port}"
     
     # inbound: direct 类型监听
@@ -1241,6 +1251,9 @@ _pf_view() {
     # 遍历所有 pf-in- 开头的 inbound
     local i=1
     jq -r '.inbounds[] | select(.tag | startswith("pf-in-")) | .tag' "$RELAY_CONFIG_FILE" 2>/dev/null | while read -r in_tag; do
+        local custom_name="${in_tag#*#}"
+        [ "$custom_name" == "$in_tag" ] && custom_name="未命名"
+        
         local port=$(jq -r ".inbounds[] | select(.tag == \"$in_tag\") | .listen_port" "$RELAY_CONFIG_FILE")
         local net=$(jq -r ".inbounds[] | select(.tag == \"$in_tag\") | .network // \"tcp+udp\"" "$RELAY_CONFIG_FILE")
         
@@ -1251,7 +1264,7 @@ _pf_view() {
         local net_display=$(echo "$net" | tr '[:lower:]' '[:upper:]')
         [ "$net_display" == "TCP+UDP" ] || [ "$net_display" == "null" ] && net_display="TCP+UDP"
         
-        echo -e "  ${GREEN}[$i]${NC} 本机 :${CYAN}${port}${NC} → ${CYAN}${addr}:${tport}${NC}  [${YELLOW}${net_display}${NC}]"
+        echo -e "  ${GREEN}[$i]${NC} 【${custom_name}】 本机 :${CYAN}${port}${NC} → ${CYAN}${addr}:${tport}${NC}  [${YELLOW}${net_display}${NC}]"
         i=$((i+1))
     done
     
@@ -1281,10 +1294,13 @@ _pf_delete() {
     local i=1
     while IFS= read -r in_tag; do
         tags+=("$in_tag")
+        local custom_name="${in_tag#*#}"
+        [ "$custom_name" == "$in_tag" ] && custom_name="未命名"
+        
         local port=$(jq -r ".inbounds[] | select(.tag == \"$in_tag\") | .listen_port" "$RELAY_CONFIG_FILE")
         local addr=$(jq -r ".route.rules[] | select(.inbound == \"$in_tag\") | .override_address // \"N/A\"" "$RELAY_CONFIG_FILE")
         local tport=$(jq -r ".route.rules[] | select(.inbound == \"$in_tag\") | .override_port // \"N/A\"" "$RELAY_CONFIG_FILE")
-        echo -e "  ${GREEN}[$i]${NC} 本机 :${CYAN}${port}${NC} → ${CYAN}${addr}:${tport}${NC}"
+        echo -e "  ${GREEN}[$i]${NC} 【${custom_name}】 本机 :${CYAN}${port}${NC} → ${CYAN}${addr}:${tport}${NC}"
         i=$((i+1))
     done < <(jq -r '.inbounds[] | select(.tag | startswith("pf-in-")) | .tag' "$RELAY_CONFIG_FILE" 2>/dev/null)
     
@@ -1332,13 +1348,16 @@ _pf_modify() {
     local i=1
     while IFS= read -r in_tag; do
         tags+=("$in_tag")
+        local custom_name="${in_tag#*#}"
+        [ "$custom_name" == "$in_tag" ] && custom_name="未命名"
+        
         local port=$(jq -r ".inbounds[] | select(.tag == \"$in_tag\") | .listen_port" "$RELAY_CONFIG_FILE")
         local net=$(jq -r ".inbounds[] | select(.tag == \"$in_tag\") | .network // \"tcp+udp\"" "$RELAY_CONFIG_FILE")
         local addr=$(jq -r ".route.rules[] | select(.inbound == \"$in_tag\") | .override_address // \"N/A\"" "$RELAY_CONFIG_FILE")
         local tport=$(jq -r ".route.rules[] | select(.inbound == \"$in_tag\") | .override_port // \"N/A\"" "$RELAY_CONFIG_FILE")
         local net_display=$(echo "$net" | tr '[:lower:]' '[:upper:]')
         [ "$net_display" == "TCP+UDP" ] || [ "$net_display" == "null" ] && net_display="TCP+UDP"
-        echo -e "  ${GREEN}[$i]${NC} :${CYAN}${port}${NC} → ${CYAN}${addr}:${tport}${NC}  [${YELLOW}${net_display}${NC}]"
+        echo -e "  ${GREEN}[$i]${NC} 【${custom_name}】 :${CYAN}${port}${NC} → ${CYAN}${addr}:${tport}${NC}  [${YELLOW}${net_display}${NC}]"
         i=$((i+1))
     done < <(jq -r '.inbounds[] | select(.tag | startswith("pf-in-")) | .tag' "$RELAY_CONFIG_FILE" 2>/dev/null)
     
@@ -1350,14 +1369,23 @@ _pf_modify() {
     fi
     
     local selected_tag="${tags[$((sel-1))]}"
+    local current_name="${selected_tag#*#}"
+    [ "$current_name" == "$selected_tag" ] && current_name="未命名"
     local current_port=$(jq -r ".inbounds[] | select(.tag == \"$selected_tag\") | .listen_port" "$RELAY_CONFIG_FILE")
     local current_addr=$(jq -r ".route.rules[] | select(.inbound == \"$selected_tag\") | .override_address" "$RELAY_CONFIG_FILE")
     local current_tport=$(jq -r ".route.rules[] | select(.inbound == \"$selected_tag\") | .override_port" "$RELAY_CONFIG_FILE")
     local current_net=$(jq -r ".inbounds[] | select(.tag == \"$selected_tag\") | .network // \"\"" "$RELAY_CONFIG_FILE")
     
     echo ""
-    echo -e "  当前规则: :${CYAN}${current_port}${NC} → ${CYAN}${current_addr}:${current_tport}${NC}"
+    echo -e "  当前规则: 【${current_name}】 :${CYAN}${current_port}${NC} → ${CYAN}${current_addr}:${current_tport}${NC}"
     echo ""
+    
+    # 修改备注名称
+    read -p "  新备注名称 (回车保持 ${current_name}): " new_name
+    [ -z "$new_name" ] && new_name="$current_name"
+    new_name="${new_name//\"/}"
+    new_name="${new_name//\\/}"
+    new_name="${new_name//#/}"
     
     # 修改目标地址
     read -p "  新目标地址 (回车保持 ${current_addr}): " new_addr
@@ -1399,10 +1427,16 @@ _pf_modify() {
         mod_filter="${mod_filter} | .inbounds = [.inbounds[] | if .tag == \"$selected_tag\" then del(.network) else . end]"
     fi
     
+    if [ "$new_name" != "$current_name" ]; then
+        local new_tag="pf-in-${current_port}#${new_name}"
+        mod_filter="${mod_filter} | .inbounds = [.inbounds[] | if .tag == \"$selected_tag\" then .tag = \"$new_tag\" else . end]"
+        mod_filter="${mod_filter} | .route.rules = [.route.rules[] | if .inbound == \"$selected_tag\" then .inbound = \"$new_tag\" else . end]"
+    fi
+    
     if _atomic_modify_json "$RELAY_CONFIG_FILE" "$mod_filter"; then
         _manage_service restart
         _success "转发规则已修改并生效！"
-        echo -e "  本机端口: ${GREEN}${current_port}${NC} → 目标: ${GREEN}${new_addr}:${new_tport}${NC}"
+        echo -e "  【${new_name}】 本机端口: ${GREEN}${current_port}${NC} → 目标: ${GREEN}${new_addr}:${new_tport}${NC}"
     else
         _error "修改失败"
     fi
