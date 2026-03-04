@@ -1993,6 +1993,7 @@ _add_vless_ws_tls() {
     local client_server_addr="${server_ip}"
 
     if [ "$BATCH_MODE" = "true" ]; then
+        [[ -n "$BATCH_IP" ]] && client_server_addr="$BATCH_IP"
         port="$BATCH_PORT"
         camouflage_domain="${BATCH_WS_TLS_DOMAIN:-$BATCH_SNI}"
     else
@@ -2174,6 +2175,7 @@ _add_trojan_ws_tls() {
     local client_server_addr="${server_ip}"
 
     if [ "$BATCH_MODE" = "true" ]; then
+        [[ -n "$BATCH_IP" ]] && client_server_addr="$BATCH_IP"
         port="$BATCH_PORT"
         camouflage_domain="${BATCH_WS_TLS_DOMAIN:-$BATCH_SNI}"
     else
@@ -2360,6 +2362,7 @@ _add_trojan_ws_tls() {
 
 _add_anytls() {
     local node_ip="${server_ip}"
+    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
     local server_name="www.amd.com"
 
@@ -2521,6 +2524,7 @@ _add_anytls() {
 _add_vless_reality() {
     [ -z "$server_ip" ] && server_ip=$(_get_ip)
     local node_ip="${server_ip}"
+    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local server_name="www.amd.com"
     local port=""
     local name=""
@@ -2573,6 +2577,7 @@ _add_vless_reality() {
 
 _add_vless_tcp() {
     local node_ip="${server_ip}"
+    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
     if [ "$BATCH_MODE" = "true" ]; then
         port="$BATCH_PORT"
@@ -2620,6 +2625,7 @@ _add_vless_tcp() {
 _add_hysteria2() {
     [ -z "$server_ip" ] && server_ip=$(_get_ip)
     local node_ip="${server_ip}"
+    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
     local server_name="www.amd.com"
     local obfs_password=""
@@ -2781,6 +2787,7 @@ _add_hysteria2() {
 
 _add_tuic() {
     local node_ip="${server_ip}"
+    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
     local server_name="www.amd.com"
 
@@ -2883,6 +2890,7 @@ _add_shadowsocks_menu() {
     esac
 
     local node_ip="${server_ip}"
+    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
     if [ "$BATCH_MODE" = "true" ]; then
         port="$BATCH_PORT"
@@ -2976,6 +2984,7 @@ _add_shadowsocks_menu() {
 
 _add_socks() {
     local node_ip="${server_ip}"
+    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
     local username=""
     local password=""
@@ -4396,10 +4405,9 @@ _batch_create_nodes() {
     # [修复] 强制初始化服务器 IP，防止各协议函数因变量未定义生成空配置
     [ -z "$server_ip" ] && server_ip=$(_get_ip)
     local batch_ip="${server_ip}"
-    if [ -z "$batch_ip" ]; then
-        read -p "未检测到公网IP，请输入服务器IP: " batch_ip
-        server_ip="$batch_ip"
-    fi
+    read -p "请输入批量节点绑定的IP地址 (回车默认: ${server_ip}): " custom_batch_ip
+    batch_ip=${custom_batch_ip:-$server_ip}
+    export BATCH_IP="$batch_ip"
     
     # 2.1 SNI 收集 (强制净化处理)
     export BATCH_SNI="$DEFAULT_SNI"
@@ -4501,7 +4509,7 @@ _batch_create_nodes() {
         fi
     done
 
-    unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SS_VARIANT
+    unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SS_VARIANT BATCH_IP
     
     echo ""
     echo -e "${YELLOW}══════════════════ 批量创建完成提示 ══════════════════${NC}"
