@@ -4426,11 +4426,12 @@ _batch_create_nodes() {
     # 2.4 SS 专项 (支持多选)
     local ss_variant="1"
     if [ "$has_ss" = true ]; then
-        echo "选择 Shadowsocks 批量加密方式 (支持多选，如 1,2,3):"
-        echo " 1) aes-256-gcm (默认)"
-        echo " 2) ss-2022"
-        echo " 3) ss-2022-padding"
-        read -p "选择 [1-3]: " ss_choice
+        echo "选择 Shadowsocks 批量加密方式 (支持多选，如 1,2,3,4):"
+        echo " 1) aes-256-gcm"
+        echo " 2) chacha20-ietf-poly1305"
+        echo " 3) 2022-blake3-aes-256-gcm"
+        echo " 4) 2022-blake3-aes-256-gcm (带 Padding)"
+        read -p "选择 [1-4] (默认1): " ss_choice
         ss_variant=${ss_choice:-1}
         # 计算 SS 实际需要的端口数
         local ss_needed=$(echo "$ss_variant" | tr ',' ' ' | wc -w)
