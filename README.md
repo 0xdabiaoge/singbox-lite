@@ -360,3 +360,8 @@
 - **Shadowsocks节点协议变动**：singbox和xray同步支持经典SS（aes-256-gcm、chacha20-ietf-poly1305）和SS2022（2022-blake3-aes-256-gcm、2022-blake3-aes-256-gcm (带 Padding)）。singbox核心加入了时间不同步的补丁，如有想使用SS2022节点协议的，建议使用singbox搭建。
 
 
+
+
+## Preflight & Diagnose
+- scripts/core/preflight.sh — 端口/环境体检
+- scripts/core/detect_argo_host.sh — 从日志/journal检测 Argo 实际域名
