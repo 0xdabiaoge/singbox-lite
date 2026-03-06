@@ -40,6 +40,12 @@ if ! declare -f _url_encode >/dev/null 2>&1; then
     }
 fi
 
+if ! declare -f _ss_base64_encode >/dev/null 2>&1; then
+    _ss_base64_encode() {
+        # SS 标准 Base64 (无 Padding)
+        printf '%s' "$1" | base64 | tr -d '\n\r ' | sed 's/=//g'
+    }
+fi
 # --- 环境检测 ---
 if ! declare -f _detect_init_system >/dev/null 2>&1; then
     _detect_init_system() {
@@ -780,7 +786,8 @@ _add_shadowsocks_xray() {
     fi
     _add_node_to_yaml "$proxy_json"
     
-    local link="ss://$(_url_encode "${method}:${password}")@${link_ip}:${port}#$(_url_encode "$name")"
+    local ss_user_info=$(_ss_base64_encode "${method}:${password}")
+    local link="ss://${ss_user_info}@${link_ip}:${port}#$(_url_encode "$name")"
     
     _save_xray_meta "$tag" "$name" "$link"
     

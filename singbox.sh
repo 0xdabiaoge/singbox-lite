@@ -50,6 +50,11 @@ _url_encode() {
     printf '%s' "$1" | jq -sRr @uri
 }
 
+_ss_base64_encode() {
+    # Shadowsocks SIP002 规范要求 Base64 编码不带填充 (No Padding)
+    printf '%s' "$1" | base64 | tr -d '\n\r ' | sed 's/=//g'
+}
+
 # 公网 IP 获取 (带全局缓存)
 _get_public_ip() {
     [ -n "$server_ip" ] && [ "$server_ip" != "null" ] && { echo "$server_ip"; return; }
@@ -1929,7 +1934,8 @@ _show_node_link() {
         "shadowsocks")
             # 参数: method, password
             local method="$1" password="$2"
-            url="ss://$(_url_encode "${method}:${password}")@${link_ip}:${port}#$(_url_encode "$name")"
+            local ss_user_info=$(_ss_base64_encode "${method}:${password}")
+            url="ss://${ss_user_info}@${link_ip}:${port}#$(_url_encode "$name")"
             ;;
         "vless-ws")
             # Argo 专用: uuid, path
