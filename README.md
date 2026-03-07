@@ -130,21 +130,6 @@
 
 **快捷命令：sb**
 
-### 快速部署
-
-一条命令自动部署 VLESS-Reality、Hysteria2、TUICv5 三节点，适用于实例初始化：
-
-```
-(curl -sSL https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -qO /usr/local/bin/sb https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh) && chmod +x /usr/local/bin/sb && sb -q
-```
-
-**特点**：
-- ✅ 端口随机分配
-- ✅ SNI 默认使用 www.apple.com
-- ✅ 自动输出节点链接和 Base64 订阅
-- ✅ SSH 登录时自动显示节点信息
-- ✅ 部署后可运行 `sb` 进入管理菜单
-
 ---
 
 ## 📖 使用指南
@@ -363,4 +348,5 @@
 - **移除快速部署**：快速部署功能已移除，用不上的功能。
 - **核心安装逻辑改动**：此前版本的核心安装逻辑是加载脚本的同时去下载，目前已经改为手动下载，目的是脚本存在双核心管理，如果只是想单独使用其中一个的话，就可以单独安装所需要使用的核心，算是节省一些资源占用。
 - **Argo隧道问题**：
+
 
