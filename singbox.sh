@@ -1527,11 +1527,35 @@ _uninstall() {
 
     # 2. 清理配置与日志
     _info "正在清理配置文件与日志..."
-    if [ -f "${SINGBOX_DIR}/advanced_relay.sh" ]; then
-        _info "正在清理可能存在的端口转发规则 (iptables)..."
-        source "${SINGBOX_DIR}/advanced_relay.sh"
-        if type _pf_clear >/dev/null 2>&1; then
-            _pf_clear >/dev/null 2>&1
+    # 清理端口转发的 iptables 规则 (内联执行，避免 source 整个脚本导致 _menu 被调用)
+    local pf_meta="${SINGBOX_DIR}/relay_pf.json"
+    if [ -f "$pf_meta" ] && command -v jq &>/dev/null; then
+        _info "正在清理端口转发规则 (iptables)..."
+        local _pf_ports
+        _pf_ports=$(jq -r 'keys[]' "$pf_meta" 2>/dev/null)
+        for _pf_p in $_pf_ports; do
+            local _pf_eng=$(jq -r --arg p "$_pf_p" '.[$p].engine // empty' "$pf_meta" 2>/dev/null)
+            local _pf_net=$(jq -r --arg p "$_pf_p" '.[$p].network // empty' "$pf_meta" 2>/dev/null)
+            local _pf_addr=$(jq -r --arg p "$_pf_p" '.[$p].target_addr // empty' "$pf_meta" 2>/dev/null)
+            local _pf_tport=$(jq -r --arg p "$_pf_p" '.[$p].target_port // empty' "$pf_meta" 2>/dev/null)
+            if [ "$_pf_eng" == "iptables" ] && [ -n "$_pf_addr" ]; then
+                if [[ "$_pf_net" == "tcp" || "$_pf_net" == "tcp+udp" ]]; then
+                    iptables -t nat -D PREROUTING -p tcp --dport "$_pf_p" -j DNAT --to-destination "${_pf_addr}:${_pf_tport}" 2>/dev/null
+                    iptables -t nat -D OUTPUT -p tcp --dport "$_pf_p" -j DNAT --to-destination "${_pf_addr}:${_pf_tport}" 2>/dev/null
+                fi
+                if [[ "$_pf_net" == "udp" || "$_pf_net" == "tcp+udp" ]]; then
+                    iptables -t nat -D PREROUTING -p udp --dport "$_pf_p" -j DNAT --to-destination "${_pf_addr}:${_pf_tport}" 2>/dev/null
+                    iptables -t nat -D OUTPUT -p udp --dport "$_pf_p" -j DNAT --to-destination "${_pf_addr}:${_pf_tport}" 2>/dev/null
+                fi
+                iptables -t nat -D POSTROUTING -d "$_pf_addr" -j MASQUERADE 2>/dev/null
+            fi
+        done
+        # 保存 iptables 规则
+        if command -v iptables-save &>/dev/null; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules 2>/dev/null
+        fi
+        if command -v ip6tables-save &>/dev/null; then
+            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || ip6tables-save > /etc/ip6tables.rules 2>/dev/null
         fi
     fi
     rm -rf "${SINGBOX_DIR}" "${LOG_FILE}"

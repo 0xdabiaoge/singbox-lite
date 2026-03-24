@@ -1263,12 +1263,51 @@ _modify_relay_port() {
 
 PF_METADATA_FILE="${RELAY_AUX_DIR}/relay_pf.json"
 
-# 引擎探测: 检测 iptables NAT 权限是否可用
+# 引擎探测: 基于底层虚拟化架构特征进行一刀切硬性判定
+# 彻底放弃容易被宿主机欺骗的 iptables 权限测试，改用查户口方式判定
 _pf_detect_engine() {
-    if command -v iptables &>/dev/null && iptables -t nat -L PREROUTING -n &>/dev/null 2>&1; then
-        PF_ENGINE="iptables"
-    else
+    local virt_type="unknown"
+    
+    # 1. 首选: 标准化系统自带的虚拟化检测工具
+    if command -v systemd-detect-virt &>/dev/null; then
+        local svirt=$(systemd-detect-virt 2>/dev/null)
+        case "$svirt" in
+            lxc|lxc-libvirt|systemd-nspawn|docker|podman|wsl) virt_type="container" ;;
+            kvm|qemu|vmware|oracle|microsoft|xen|zvm|none) virt_type="kvm" ;;
+        esac
+    fi
+    
+    # 2. 兜底: 针对无 systemd 的精简容器（如 Alpine）的底层特征探查
+    if [ "$virt_type" == "unknown" ]; then
+        if [ -f /.dockerenv ] || grep -qa 'docker' /proc/1/cgroup 2>/dev/null; then
+            virt_type="container"
+        elif grep -qa 'container=lxc' /proc/1/environ 2>/dev/null || grep -qa 'lxc' /proc/1/cgroup 2>/dev/null || grep -qa 'lxd' /proc/1/cgroup 2>/dev/null || [ -e /dev/lxd ]; then
+            virt_type="container"
+        elif dmesg 2>/dev/null | grep -qi 'kvm\|qemu\|vmware\|virtualbox'; then
+            virt_type="kvm"
+        elif [ -f /sys/class/dmi/id/product_name ] && grep -qi 'kvm\|qemu\|vmware\|bochs' /sys/class/dmi/id/product_name 2>/dev/null; then
+            virt_type="kvm"
+        else
+            # 最后的倔强: 如果查不出虚拟化特征，用回最古老的测试作为补漏
+            if iptables -t nat -A PREROUTING -p tcp --dport 65535 -j DNAT --to-destination 127.0.0.1:65535 2>/dev/null; then
+                iptables -t nat -D PREROUTING -p tcp --dport 65535 -j DNAT --to-destination 127.0.0.1:65535 2>/dev/null
+                virt_type="kvm"
+            else
+                virt_type="container"
+            fi
+        fi
+    fi
+    
+    # 3. 结果分配
+    if [ "$virt_type" == "container" ]; then
         PF_ENGINE="singbox"
+    else
+        # 即使判为物理机/KVM，也必须保证工具存在
+        if command -v iptables &>/dev/null; then
+            PF_ENGINE="iptables"
+        else
+            PF_ENGINE="singbox"
+        fi
     fi
 }
 
@@ -1372,30 +1411,44 @@ _pf_add() {
     
     # 4. 选择转发协议
     echo ""
-    echo -e "  ${CYAN}【选择转发协议】${NC}"
-    echo -e "    ${GREEN}[1]${NC} 仅 TCP"
-    echo -e "    ${GREEN}[2]${NC} 仅 UDP"
-    echo -e "    ${GREEN}[3]${NC} TCP+UDP (全部转发)"
-    echo ""
-    read -p "  请选择 [1-3] (默认 1): " proto_choice
-    
-    local network="tcp"
-    local network_display="TCP"
-    case "$proto_choice" in
-        2) network="udp"; network_display="UDP" ;;
-        3) network="tcp+udp"; network_display="TCP+UDP" ;;
-        *) network="tcp"; network_display="TCP" ;;
-    esac
-    
-    # sing-box 引擎下拦截 UDP
-    if [ "$PF_ENGINE" == "singbox" ] && [[ "$network" == *"udp"* ]]; then
+    if [ "$PF_ENGINE" == "iptables" ]; then
+        echo -e "  ${CYAN}【信息】检测到完整主机虚拟化环境，已启用内核级极速中转 (iptables)${NC}"
+        echo -e "  ${CYAN}请选择转发协议：${NC}"
+        echo -e "    ${GREEN}[1]${NC} 仅 TCP"
+        echo -e "    ${GREEN}[2]${NC} 仅 UDP"
+        echo -e "    ${GREEN}[3]${NC} TCP+UDP (全部支持)"
         echo ""
-        _error "当前环境非完整KVM，属于无特权LXC、精简LXC、Docker虚拟化LXC等，不支持内核级 iptables NAT。"
-        _error "UDP 端口转发在此环境下不可用 (sing-box 已知限制)。"
-        _warn "基于目标节点对 UDP 的依赖，强行降级为 TCP 将导致其无法连通。请部署TCP类节点协议进行TCP转发"
+        read -p "  请选择 [1-3] (默认 1): " proto_choice
+        
+        local network="tcp"
+        local network_display="TCP"
+        case "$proto_choice" in
+            2) network="udp"; network_display="UDP" ;;
+            3) network="tcp+udp"; network_display="TCP+UDP" ;;
+            *) network="tcp"; network_display="TCP" ;;
+        esac
+    else
+        echo -e "  ${YELLOW}【警告】检测到受限容器环境 (LXC/Docker)，已降级为安全层中转 (sing-box)${NC}"
+        echo -e "  ${CYAN}请选择转发协议：${NC}"
+        echo -e "    ${GREEN}[1]${NC} 仅 TCP"
+        echo -e "    ${YELLOW}[2]${NC} 仅 UDP (容器底层网络干涉，不支持)"
+        echo -e "    ${YELLOW}[3]${NC} TCP+UDP (不支持)"
         echo ""
-        read -n 1 -s -r -p "按任意键返回上一级菜单..."
-        return
+        read -p "  请选择 [1-3] (默认 1): " proto_choice
+        
+        local network="tcp"
+        local network_display="TCP"
+        case "$proto_choice" in
+            2|3)
+                echo ""
+                _error "受限的容器底层网络会导致 UDP 转发永久断连 (宿主机丢包/本地环回)。"
+                _warn "请不要勉强转换！目标为 Hysteria2 等纯 UDP 节点的，请更换真实的 KVM 物理机；否则请退回创建仅 TCP 类的代理节点进行中转！"
+                echo ""
+                read -n 1 -s -r -p "按任意键返回上一级菜单..."
+                return
+                ;;
+            *) network="tcp"; network_display="TCP" ;;
+        esac
     fi
     
     # 5. 输入备注名称
@@ -1640,25 +1693,38 @@ _pf_modify() {
     local old_net_display=$(echo "$old_net" | tr '[:lower:]' '[:upper:]')
     [ "$old_net" == "tcp+udp" ] && old_net_display="TCP+UDP"
     
-    echo ""
-    echo -e "  当前协议: ${YELLOW}${old_net_display}${NC}"
-    echo -e "    ${GREEN}[1]${NC} 仅 TCP  ${GREEN}[2]${NC} 仅 UDP  ${GREEN}[3]${NC} TCP+UDP  ${GREEN}[0]${NC} 不改"
-    read -p "  请选择 (默认不改): " proto_choice
-    
-    local new_net="$old_net"
-    case "$proto_choice" in
-        1) new_net="tcp" ;;
-        2) new_net="udp" ;;
-        3) new_net="tcp+udp" ;;
-    esac
-    
     # 引擎探测 (可能环境已变化)
     _pf_detect_engine
     
-    # sing-box 引擎下拦截 UDP
-    if [ "$PF_ENGINE" == "singbox" ] && [[ "$new_net" == *"udp"* ]]; then
-        _warn "当前环境不支持 iptables NAT，UDP 不可用，已降级为仅 TCP。"
-        new_net="tcp"
+    echo ""
+    echo -e "  当前协议: ${YELLOW}${old_net_display}${NC}"
+    local new_net="$old_net"
+    if [ "$PF_ENGINE" == "iptables" ]; then
+        echo -e "  ${CYAN}【信息】检测到完整虚拟化环境，已分配 iptables 极速中转${NC}"
+        echo -e "    ${GREEN}[1]${NC} 仅 TCP  ${GREEN}[2]${NC} 仅 UDP  ${GREEN}[3]${NC} TCP+UDP  ${GREEN}[0]${NC} 不改"
+        read -p "  请选择 [0-3] (默认不改): " proto_choice
+        case "$proto_choice" in
+            1) new_net="tcp" ;;
+            2) new_net="udp" ;;
+            3) new_net="tcp+udp" ;;
+            *) ;;
+        esac
+    else
+        echo -e "  ${YELLOW}【警告】检测到受限容器环境 (LXC/Docker)，已分配 sing-box 兜底中转${NC}"
+        echo -e "    ${GREEN}[1]${NC} 仅 TCP  ${YELLOW}[2]${NC} 仅 UDP (受限环境不支持)  ${YELLOW}[3]${NC} TCP+UDP (不支持)  ${GREEN}[0]${NC} 不改"
+        read -p "  请选择 [0-3] (默认不改): " proto_choice
+        case "$proto_choice" in
+            1) new_net="tcp" ;;
+            2|3)
+                echo ""
+                _error "当前容器环境无法稳定转发 UDP (宿主网络拦截)。"
+                _warn "取消修改。如需强行转发 UDP，请自行搭建/更换真实的 KVM 物理服务器。"
+                echo ""
+                read -n 1 -s -r -p "按任意键返回上一级菜单..."
+                return
+                ;;
+            *) ;;
+        esac
     fi
     
     local new_net_display=$(echo "$new_net" | tr '[:lower:]' '[:upper:]')
