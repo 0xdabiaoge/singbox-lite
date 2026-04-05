@@ -190,9 +190,14 @@ _pkg_install() {
     if command -v apk &>/dev/null; then
         apk add --no-cache $pkgs >/dev/null 2>&1
     elif command -v apt-get &>/dev/null; then
-        DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || {
+        # 全新 LXC/容器上 apt 缓存可能为空，必须先 update
+        if [ ! -d "/var/lib/apt/lists" ] || [ "$(ls -A /var/lib/apt/lists/ 2>/dev/null | wc -l)" -le 1 ]; then
             apt-get update -qq >/dev/null 2>&1
-            DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1
+        fi
+        DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || {
+            # 兜底：如果安装失败，强制刷新索引后重试
+            apt-get update -qq >/dev/null 2>&1
+            DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs 2>&1 | tail -5
         }
     elif command -v yum &>/dev/null; then yum install -y $pkgs >/dev/null 2>&1
     elif command -v dnf &>/dev/null; then dnf install -y $pkgs >/dev/null 2>&1
@@ -309,18 +314,30 @@ BATCH_MODE=false
 trap 'rm -f ${SINGBOX_DIR}/*.tmp /tmp/singbox_links.tmp' EXIT
 # 依赖安装
 _install_dependencies() {
-    # 集中预装所有脚本可能用到的基础工具 (Master Installer Strategy)
-    local pkgs="curl jq openssl wget procps iptables socat tar iproute2 cron lsof"
+    # 核心依赖：脚本运行的绝对前提，必须全部装上
+    local core_pkgs="curl jq openssl wget tar"
+    # 可选依赖：部分功能需要，即使装失败也不致命
+    local optional_pkgs="procps iptables socat iproute2 cron lsof"
     
     # 针对不同发行版的 cron 包名适配
     if command -v apk &>/dev/null; then
-        pkgs="${pkgs/cron/dcron}"
+        optional_pkgs="${optional_pkgs/cron/dcron}"
     elif ! command -v apt-get &>/dev/null && ! command -v yum &>/dev/null && ! command -v dnf &>/dev/null; then
-        pkgs="${pkgs/cron/cronie}"
+        optional_pkgs="${optional_pkgs/cron/cronie}"
     fi
 
-    _info "正在进行全家桶式依赖预装 (Master Installer Strategy)..."
-    _pkg_install $pkgs
+    _info "正在安装核心依赖..."
+    _pkg_install $core_pkgs
+    
+    _info "正在安装可选依赖..."
+    _pkg_install $optional_pkgs 2>/dev/null || {
+        # 可选依赖批量安装失败时（如 iptables 冲突），逐个尝试
+        _warn "部分可选依赖批量安装遇到冲突，正在逐个重试..."
+        for pkg in $optional_pkgs; do
+            _pkg_install "$pkg" 2>/dev/null || true
+        done
+    }
+    
     _install_yq
 
     # [修复] Alpine 上 dcron 安装后需手动启动 cron 守护进程
@@ -329,6 +346,19 @@ _install_dependencies() {
             rc-service dcron start 2>/dev/null
             rc-update add dcron default 2>/dev/null
         fi
+    fi
+
+    # 关键依赖验证：如果核心工具缺失则无法继续
+    local missing=""
+    for cmd in jq curl wget openssl tar; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing="$missing $cmd"
+        fi
+    done
+    if [ -n "$missing" ]; then
+        _error "以下关键依赖安装失败:${missing}"
+        _error "请手动执行: apt-get update && apt-get install -y${missing}"
+        exit 1
     fi
 }
 
