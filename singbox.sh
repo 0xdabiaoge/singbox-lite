@@ -197,7 +197,7 @@ _pkg_install() {
         DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || {
             # 兜底：如果安装失败，强制刷新索引后重试
             apt-get update -qq >/dev/null 2>&1
-            DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs 2>&1 | tail -5
+            DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1
         }
     elif command -v yum &>/dev/null; then yum install -y $pkgs >/dev/null 2>&1
     elif command -v dnf &>/dev/null; then dnf install -y $pkgs >/dev/null 2>&1
