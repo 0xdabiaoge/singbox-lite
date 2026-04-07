@@ -1558,7 +1558,7 @@ _uninstall() {
     # 2. 清理配置与日志
     _info "正在清理配置文件与日志..."
     # 清理端口转发的 iptables 规则 (内联执行，避免 source 整个脚本导致 _menu 被调用)
-    local pf_meta="${SINGBOX_DIR}/relay_pf.json"
+    local pf_meta="${SINGBOX_DIR}/pf_metadata.json"
     if [ -f "$pf_meta" ] && command -v jq &>/dev/null; then
         _info "正在清理端口转发规则 (iptables)..."
         local _pf_ports
@@ -1568,18 +1568,26 @@ _uninstall() {
             local _pf_net=$(jq -r --arg p "$_pf_p" '.[$p].network // empty' "$pf_meta" 2>/dev/null)
             local _pf_addr=$(jq -r --arg p "$_pf_p" '.[$p].target_addr // empty' "$pf_meta" 2>/dev/null)
             local _pf_tport=$(jq -r --arg p "$_pf_p" '.[$p].target_port // empty' "$pf_meta" 2>/dev/null)
-            if [ "$_pf_eng" == "iptables" ] && [ -n "$_pf_addr" ]; then
+            local _pf_resolved=$(jq -r --arg p "$_pf_p" '.[$p].resolved_ip // empty' "$pf_meta" 2>/dev/null)
+            local _pf_del_dest="${_pf_resolved:-$_pf_addr}"
+            
+            if [ "$_pf_eng" == "iptables" ] && [ -n "$_pf_del_dest" ]; then
                 if [[ "$_pf_net" == "tcp" || "$_pf_net" == "tcp+udp" ]]; then
-                    iptables -t nat -D PREROUTING -p tcp --dport "$_pf_p" -j DNAT --to-destination "${_pf_addr}:${_pf_tport}" 2>/dev/null
-                    iptables -t nat -D OUTPUT -p tcp --dport "$_pf_p" -j DNAT --to-destination "${_pf_addr}:${_pf_tport}" 2>/dev/null
+                    iptables -t nat -D PREROUTING -p tcp --dport "$_pf_p" -j DNAT --to-destination "${_pf_del_dest}:${_pf_tport}" 2>/dev/null
+                    iptables -t nat -D OUTPUT -p tcp --dport "$_pf_p" -j DNAT --to-destination "${_pf_del_dest}:${_pf_tport}" 2>/dev/null
                 fi
                 if [[ "$_pf_net" == "udp" || "$_pf_net" == "tcp+udp" ]]; then
-                    iptables -t nat -D PREROUTING -p udp --dport "$_pf_p" -j DNAT --to-destination "${_pf_addr}:${_pf_tport}" 2>/dev/null
-                    iptables -t nat -D OUTPUT -p udp --dport "$_pf_p" -j DNAT --to-destination "${_pf_addr}:${_pf_tport}" 2>/dev/null
+                    iptables -t nat -D PREROUTING -p udp --dport "$_pf_p" -j DNAT --to-destination "${_pf_del_dest}:${_pf_tport}" 2>/dev/null
+                    iptables -t nat -D OUTPUT -p udp --dport "$_pf_p" -j DNAT --to-destination "${_pf_del_dest}:${_pf_tport}" 2>/dev/null
                 fi
-                iptables -t nat -D POSTROUTING -d "$_pf_addr" -j MASQUERADE 2>/dev/null
+                iptables -t nat -D POSTROUTING -d "$_pf_del_dest" -j MASQUERADE 2>/dev/null
             fi
         done
+        
+        # 清理 DNS 动态刷新的 cron 任务
+        if crontab -l 2>/dev/null | grep -qF "# pf-dns-auto-refresh"; then
+            crontab -l 2>/dev/null | grep -vF "# pf-dns-auto-refresh" | crontab -
+        fi
         # 保存 iptables 规则
         if command -v iptables-save &>/dev/null; then
             iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules 2>/dev/null
@@ -1990,13 +1998,34 @@ _show_node_link() {
             if [ "$skip_verify" == "true" ]; then
                 insecure_param="&insecure=1&allowInsecure=1"
             fi
-            url="anytls://${password}@${link_ip}:${port}?security=tls&sni=${sni}${insecure_param}&type=tcp#$(_url_encode "$name")"
+            url="vless://${password}@${link_ip}:${port}?security=tls&encryption=none&type=tcp&headerType=none&sni=${sni}${insecure_param}#$(_url_encode "$name")"
             ;;
         "shadowsocks")
             # 参数: method, password
             local method="$1" password="$2"
-            local ss_user_info=$(_ss_base64_encode "${method}:${password}")
-            url="ss://${ss_user_info}@${link_ip}:${port}#$(_url_encode "$name")"
+            local userinfo=$(echo -n "${method}:${password}" | base64 -w 0 | tr '+/' '-_' | tr -d '=')
+            url="ss://${userinfo}@${link_ip}:${port}#$(_url_encode "$name")"
+            ;;
+        "shadowsocks-shadowtls")
+            # 参数: method, pw, spw, sni
+            local method="$1" pw="$2" spw="$3" sni="$4"
+            url=""
+            echo -e "${YELLOW}====== [客户端配置参考片段 (Clash Meta / Mihomo)] ======${NC}"
+            echo -e "  - name: \"${name}\""
+            echo -e "    type: ss"
+            echo -e "    server: ${link_ip}"
+            echo -e "    port: ${port}"
+            echo -e "    cipher: ${method}"
+            echo -e "    password: ${pw}"
+            echo -e "    plugin: shadow-tls"
+            echo -e "    plugin-opts:"
+            echo -e "      host: ${sni}"
+            echo -e "      password: ${spw}"
+            echo -e "      version: 3"
+            echo -e "${YELLOW}========================================================${NC}"
+            echo -e "${CYAN}[提示] ShadowTLS 需要特定的客户端配置。${NC}"
+            echo -e "${CYAN}您也可以直接打开本机位于 ${YELLOW}/usr/local/etc/sing-box/clash.yaml${CYAN} 的配置文件，${NC}"
+            echo -e "${CYAN}找到对应节点的 YAML 代码块，并复制到您的客户端中使用！${NC}"
             ;;
         "vless-ws")
             # Argo 专用: uuid, path
@@ -2921,12 +2950,14 @@ _add_shadowsocks_menu() {
         echo " [SS-2022 (强抗重放保护)]"
         echo " 3) 2022-blake3-aes-256-gcm"
         echo " 4) 2022-blake3-aes-256-gcm (带 Padding)"
+        echo " [SS-2022 + ShadowTLS (完美伪装组合)]"
+        echo " 5) 2022-blake3-aes-256-gcm + ShadowTLS v3"
         echo " 0) 返回"
         echo "========================================"
-        read -p "请选择加密方式 [0-4]: " choice
+        read -p "请选择加密方式 [0-5]: " choice
     fi
 
-    local method="" password="" name_prefix="" use_multiplex=false
+    local method="" password="" name_prefix="" use_multiplex=false use_shadowtls=false
     case $choice in
         1) 
             method="aes-256-gcm"
@@ -2952,6 +2983,13 @@ _add_shadowsocks_menu() {
             _info "已启用 Multiplex + Padding 模式"
             _warning "注意：客户端也必须启用 Multiplex + Padding 才能连接！"
             ;;
+        5)
+            # SS-2022 256 位版本（抗重放增强）
+            method="2022-blake3-aes-256-gcm"
+            password=$(${SINGBOX_BIN} generate rand --base64 32)
+            name_prefix="SS-ShadowTLS"
+            use_shadowtls=true
+            ;;
         0) return 1 ;;
         *) _error "无效输入"; return 1 ;;
     esac
@@ -2976,14 +3014,53 @@ _add_shadowsocks_menu() {
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
+    
+    local shadowtls_password=""
+    local shadowtls_sni="www.amd.com"
+    if [ "$use_shadowtls" == "true" ]; then
+        shadowtls_password=$(${SINGBOX_BIN} generate rand --hex 16)
+        read -p "请输入 ShadowTLS 伪装白名单域名 (默认: www.amd.com): " custom_sni
+        shadowtls_sni=${custom_sni:-www.amd.com}
+    fi
 
     local tag="${name_prefix}-in-${port}"
     local yaml_ip="$node_ip"
     local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
 
-    # 根据是否启用 Multiplex 生成不同配置
+    # 根据是否启用 Multiplex 或 ShadowTLS 生成不同配置
     local inbound_json=""
-    if [ "$use_multiplex" == "true" ]; then
+    local jq_modify_expr=".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)"
+    
+    if [ "$use_shadowtls" == "true" ]; then
+        local ss_tag="${tag}-ss"
+        inbound_json=$(jq -n --arg t "$tag" --arg st "$ss_tag" --arg p "$port" --arg m "$method" --arg pw "$password" --arg spw "$shadowtls_password" --arg sni "$shadowtls_sni" \
+            '[
+                {
+                    "type": "shadowtls",
+                    "tag": $t,
+                    "listen": "::",
+                    "listen_port": ($p|tonumber),
+                    "version": 3,
+                    "users": [
+                        {
+                            "password": $spw
+                        }
+                    ],
+                    "handshake": {
+                        "server": $sni,
+                        "server_port": 443
+                    },
+                    "detour": $st
+                },
+                {
+                    "type": "shadowsocks",
+                    "tag": $st,
+                    "method": $m,
+                    "password": $pw
+                }
+            ]')
+        jq_modify_expr=".inbounds += $inbound_json | .inbounds |= unique_by(.tag)"
+    elif [ "$use_multiplex" == "true" ]; then
         # 带 Multiplex + Padding 的配置
         inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg m "$method" --arg pw "$password" \
             '{
@@ -2998,6 +3075,7 @@ _add_shadowsocks_menu() {
                     "padding": true
                 }
             }')
+        jq_modify_expr=".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)"
     else
         # 标准配置
         inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg m "$method" --arg pw "$password" \
@@ -3009,12 +3087,29 @@ _add_shadowsocks_menu() {
                 "method": $m,
                 "password": $pw
             }')
+        jq_modify_expr=".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)"
     fi
-    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
+    _atomic_modify_json "$CONFIG_FILE" "$jq_modify_expr" || return 1
 
-    # YAML 配置也需要根据 Multiplex 状态生成
+    # YAML 配置也需要根据特定状态生成
     local proxy_json=""
-    if [ "$use_multiplex" == "true" ]; then
+    if [ "$use_shadowtls" == "true" ]; then
+        proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg m "$method" --arg pw "$password" --arg spw "$shadowtls_password" --arg sni "$shadowtls_sni" \
+            '{
+                "name": $n,
+                "type": "ss",
+                "server": $s,
+                "port": ($p|tonumber),
+                "cipher": $m,
+                "password": $pw,
+                "plugin": "shadow-tls",
+                "plugin-opts": {
+                    "host": $sni,
+                    "password": $spw,
+                    "version": 3
+                }
+            }')
+    elif [ "$use_multiplex" == "true" ]; then
         proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg m "$method" --arg pw "$password" \
             '{
                 "name": $n,
@@ -3045,7 +3140,11 @@ _add_shadowsocks_menu() {
     if [ "$use_multiplex" == "true" ]; then
         _info "Multiplex + Padding 已启用，客户端需配置对应选项"
     fi
-    _show_node_link "shadowsocks" "$name" "$link_ip" "$port" "$tag" "$method" "$password"
+    if [ "$use_shadowtls" == "true" ]; then
+        _show_node_link "shadowsocks-shadowtls" "$name" "$link_ip" "$port" "$tag" "$method" "$password" "$shadowtls_password" "$shadowtls_sni"
+    else
+        _show_node_link "shadowsocks" "$name" "$link_ip" "$port" "$tag" "$method" "$password"
+    fi
     return 0
 }
 

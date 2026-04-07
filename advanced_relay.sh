@@ -1322,6 +1322,34 @@ _pf_count() {
     jq 'length' "$PF_METADATA_FILE" 2>/dev/null || echo 0
 }
 
+# 域名解析辅助函数：iptables DNAT 只接受 IP 地址，不支持域名
+# 如果目标地址是域名，自动解析为 IPv4；如果已是 IP 则原样返回
+_pf_resolve_domain() {
+    local addr="$1"
+    # 如果已经是 IPv4 地址，直接返回
+    if [[ "$addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "$addr"
+        return 0
+    fi
+    # 域名解析（优先 getent，其次 dig，兜底 nslookup）
+    local resolved=""
+    if command -v getent &>/dev/null; then
+        resolved=$(getent ahostsv4 "$addr" 2>/dev/null | head -1 | awk '{print $1}')
+    fi
+    if [ -z "$resolved" ] && command -v dig &>/dev/null; then
+        resolved=$(dig +short A "$addr" 2>/dev/null | grep -E '^[0-9]+\.' | head -1)
+    fi
+    if [ -z "$resolved" ] && command -v nslookup &>/dev/null; then
+        resolved=$(nslookup "$addr" 2>/dev/null | awk '/^Address:/ && !/127\.0\.0\.|#/ {print $2}' | head -1)
+    fi
+    if [ -z "$resolved" ]; then
+        _error "无法解析域名 $addr，iptables 需要 IP 地址" >&2
+        return 1
+    fi
+    echo "$resolved"
+    return 0
+}
+
 # 确保 MASQUERADE 规则存在 (iptables 引擎用)
 _pf_ensure_masquerade() {
     local target_ip="$1"
@@ -1463,24 +1491,35 @@ _pf_add() {
     # 6. 根据引擎执行转发
     if [ "$PF_ENGINE" == "iptables" ]; then
         # ===== 引擎A: iptables DNAT =====
+        # iptables 只接受 IP 地址，域名需要先解析
+        local iptables_dest="$target_addr"
+        if ! [[ "$target_addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            _info "检测到域名目标 $target_addr，正在解析为 IP..."
+            iptables_dest=$(_pf_resolve_domain "$target_addr")
+            if [ $? -ne 0 ] || [ -z "$iptables_dest" ]; then
+                _error "域名解析失败，无法创建 iptables 转发规则"
+                read -p "  按回车继续..."; return
+            fi
+            _success "域名已解析: $target_addr -> $iptables_dest"
+        fi
         _pf_enable_forwarding
         if [[ "$network" == "tcp" || "$network" == "tcp+udp" ]]; then
-            iptables -t nat -A PREROUTING -p tcp --dport "$listen_port" -j DNAT --to-destination "${target_addr}:${target_port}"
-            iptables -t nat -A OUTPUT -p tcp --dport "$listen_port" -j DNAT --to-destination "${target_addr}:${target_port}"
+            iptables -t nat -A PREROUTING -p tcp --dport "$listen_port" -j DNAT --to-destination "${iptables_dest}:${target_port}"
+            iptables -t nat -A OUTPUT -p tcp --dport "$listen_port" -j DNAT --to-destination "${iptables_dest}:${target_port}"
             if command -v ip6tables &>/dev/null && ip6tables -t nat -L PREROUTING -n &>/dev/null 2>&1; then
-                ip6tables -t nat -A PREROUTING -p tcp --dport "$listen_port" -j DNAT --to-destination "${target_addr}:${target_port}" 2>/dev/null
-                ip6tables -t nat -A OUTPUT -p tcp --dport "$listen_port" -j DNAT --to-destination "${target_addr}:${target_port}" 2>/dev/null
+                ip6tables -t nat -A PREROUTING -p tcp --dport "$listen_port" -j DNAT --to-destination "${iptables_dest}:${target_port}" 2>/dev/null
+                ip6tables -t nat -A OUTPUT -p tcp --dport "$listen_port" -j DNAT --to-destination "${iptables_dest}:${target_port}" 2>/dev/null
             fi
         fi
         if [[ "$network" == "udp" || "$network" == "tcp+udp" ]]; then
-            iptables -t nat -A PREROUTING -p udp --dport "$listen_port" -j DNAT --to-destination "${target_addr}:${target_port}"
-            iptables -t nat -A OUTPUT -p udp --dport "$listen_port" -j DNAT --to-destination "${target_addr}:${target_port}"
+            iptables -t nat -A PREROUTING -p udp --dport "$listen_port" -j DNAT --to-destination "${iptables_dest}:${target_port}"
+            iptables -t nat -A OUTPUT -p udp --dport "$listen_port" -j DNAT --to-destination "${iptables_dest}:${target_port}"
             if command -v ip6tables &>/dev/null && ip6tables -t nat -L PREROUTING -n &>/dev/null 2>&1; then
-                ip6tables -t nat -A PREROUTING -p udp --dport "$listen_port" -j DNAT --to-destination "${target_addr}:${target_port}" 2>/dev/null
-                ip6tables -t nat -A OUTPUT -p udp --dport "$listen_port" -j DNAT --to-destination "${target_addr}:${target_port}" 2>/dev/null
+                ip6tables -t nat -A PREROUTING -p udp --dport "$listen_port" -j DNAT --to-destination "${iptables_dest}:${target_port}" 2>/dev/null
+                ip6tables -t nat -A OUTPUT -p udp --dport "$listen_port" -j DNAT --to-destination "${iptables_dest}:${target_port}" 2>/dev/null
             fi
         fi
-        _pf_ensure_masquerade "$target_addr"
+        _pf_ensure_masquerade "$iptables_dest"
         _save_iptables_rules
     else
         # ===== 引擎B: sing-box direct =====
@@ -1522,6 +1561,10 @@ _pf_add() {
         --argjson tport "$target_port" --arg net "$network" --arg net_display "$network_display" \
         --arg created "$(date '+%Y-%m-%d %H:%M:%S')" \
         '{engine:$engine, name:$name, target_addr:$addr, target_port:$tport, network:$net, network_display:$net_display, created_at:$created}')
+    # 如果是 iptables 引擎且目标为域名，记录解析后的 IP 以便定时刷新
+    if [ "$PF_ENGINE" == "iptables" ] && [ -n "${iptables_dest:-}" ] && [ "$iptables_dest" != "$target_addr" ]; then
+        meta=$(echo "$meta" | jq --arg ip "$iptables_dest" '. + {resolved_ip: $ip}')
+    fi
     jq --arg port "$listen_port" --argjson meta "$meta" '.[$port] = $meta' "$PF_METADATA_FILE" > "${PF_METADATA_FILE}.tmp" \
         && mv "${PF_METADATA_FILE}.tmp" "$PF_METADATA_FILE"
     
@@ -1531,6 +1574,8 @@ _pf_add() {
     echo -e "  转发模式: ${CYAN}${network_display}${NC}"
     echo -e "  本机端口: ${GREEN}${listen_port}${NC} → 目标: ${GREEN}${target_addr}:${target_port}${NC}"
     echo ""
+    # 域名规则自动管理 cron 定时刷新
+    _pf_auto_manage_dns_cron
     read -p "  按回车继续..."
 }
 
@@ -1599,20 +1644,23 @@ _pf_delete() {
     local sel_addr=$(jq -r ".\"$selected_port\".target_addr" "$PF_METADATA_FILE")
     local sel_tport=$(jq -r ".\"$selected_port\".target_port" "$PF_METADATA_FILE")
     local sel_net=$(jq -r ".\"$selected_port\".network" "$PF_METADATA_FILE")
+    # 域名规则的 iptables 是用解析后的 IP 创建的，删除时必须用同一个 IP 匹配
+    local sel_resolved=$(jq -r ".\"$selected_port\".resolved_ip // empty" "$PF_METADATA_FILE")
+    local del_dest="${sel_resolved:-$sel_addr}"
     
     # 根据引擎类型清理
     if [ "$sel_engine" == "iptables" ]; then
         if [[ "$sel_net" == "tcp" || "$sel_net" == "tcp+udp" ]]; then
-            iptables -t nat -D PREROUTING -p tcp --dport "$selected_port" -j DNAT --to-destination "${sel_addr}:${sel_tport}" 2>/dev/null
-            iptables -t nat -D OUTPUT -p tcp --dport "$selected_port" -j DNAT --to-destination "${sel_addr}:${sel_tport}" 2>/dev/null
-            ip6tables -t nat -D PREROUTING -p tcp --dport "$selected_port" -j DNAT --to-destination "${sel_addr}:${sel_tport}" 2>/dev/null
-            ip6tables -t nat -D OUTPUT -p tcp --dport "$selected_port" -j DNAT --to-destination "${sel_addr}:${sel_tport}" 2>/dev/null
+            iptables -t nat -D PREROUTING -p tcp --dport "$selected_port" -j DNAT --to-destination "${del_dest}:${sel_tport}" 2>/dev/null
+            iptables -t nat -D OUTPUT -p tcp --dport "$selected_port" -j DNAT --to-destination "${del_dest}:${sel_tport}" 2>/dev/null
+            ip6tables -t nat -D PREROUTING -p tcp --dport "$selected_port" -j DNAT --to-destination "${del_dest}:${sel_tport}" 2>/dev/null
+            ip6tables -t nat -D OUTPUT -p tcp --dport "$selected_port" -j DNAT --to-destination "${del_dest}:${sel_tport}" 2>/dev/null
         fi
         if [[ "$sel_net" == "udp" || "$sel_net" == "tcp+udp" ]]; then
-            iptables -t nat -D PREROUTING -p udp --dport "$selected_port" -j DNAT --to-destination "${sel_addr}:${sel_tport}" 2>/dev/null
-            iptables -t nat -D OUTPUT -p udp --dport "$selected_port" -j DNAT --to-destination "${sel_addr}:${sel_tport}" 2>/dev/null
-            ip6tables -t nat -D PREROUTING -p udp --dport "$selected_port" -j DNAT --to-destination "${sel_addr}:${sel_tport}" 2>/dev/null
-            ip6tables -t nat -D OUTPUT -p udp --dport "$selected_port" -j DNAT --to-destination "${sel_addr}:${sel_tport}" 2>/dev/null
+            iptables -t nat -D PREROUTING -p udp --dport "$selected_port" -j DNAT --to-destination "${del_dest}:${sel_tport}" 2>/dev/null
+            iptables -t nat -D OUTPUT -p udp --dport "$selected_port" -j DNAT --to-destination "${del_dest}:${sel_tport}" 2>/dev/null
+            ip6tables -t nat -D PREROUTING -p udp --dport "$selected_port" -j DNAT --to-destination "${del_dest}:${sel_tport}" 2>/dev/null
+            ip6tables -t nat -D OUTPUT -p udp --dport "$selected_port" -j DNAT --to-destination "${del_dest}:${sel_tport}" 2>/dev/null
         fi
         _save_iptables_rules
     else
@@ -1630,6 +1678,7 @@ _pf_delete() {
         && mv "${PF_METADATA_FILE}.tmp" "$PF_METADATA_FILE"
     
     _success "已删除端口 ${selected_port} 的转发规则"
+    _pf_auto_manage_dns_cron
     read -p "  按回车继续..."
 }
 
@@ -1732,18 +1781,22 @@ _pf_modify() {
     
     # 策略: 先删旧规则再建新规则
     # 1. 删除旧规则
+    # 域名规则的 iptables 是用 resolved_ip 创建的，删除时必须匹配
+    local old_resolved=$(jq -r ".\"$selected_port\".resolved_ip // empty" "$PF_METADATA_FILE")
+    local old_del_dest="${old_resolved:-$old_addr}"
+    
     if [ "$old_engine" == "iptables" ]; then
         if [[ "$old_net" == "tcp" || "$old_net" == "tcp+udp" ]]; then
-            iptables -t nat -D PREROUTING -p tcp --dport "$selected_port" -j DNAT --to-destination "${old_addr}:${old_tport}" 2>/dev/null
-            iptables -t nat -D OUTPUT -p tcp --dport "$selected_port" -j DNAT --to-destination "${old_addr}:${old_tport}" 2>/dev/null
-            ip6tables -t nat -D PREROUTING -p tcp --dport "$selected_port" -j DNAT --to-destination "${old_addr}:${old_tport}" 2>/dev/null
-            ip6tables -t nat -D OUTPUT -p tcp --dport "$selected_port" -j DNAT --to-destination "${old_addr}:${old_tport}" 2>/dev/null
+            iptables -t nat -D PREROUTING -p tcp --dport "$selected_port" -j DNAT --to-destination "${old_del_dest}:${old_tport}" 2>/dev/null
+            iptables -t nat -D OUTPUT -p tcp --dport "$selected_port" -j DNAT --to-destination "${old_del_dest}:${old_tport}" 2>/dev/null
+            ip6tables -t nat -D PREROUTING -p tcp --dport "$selected_port" -j DNAT --to-destination "${old_del_dest}:${old_tport}" 2>/dev/null
+            ip6tables -t nat -D OUTPUT -p tcp --dport "$selected_port" -j DNAT --to-destination "${old_del_dest}:${old_tport}" 2>/dev/null
         fi
         if [[ "$old_net" == "udp" || "$old_net" == "tcp+udp" ]]; then
-            iptables -t nat -D PREROUTING -p udp --dport "$selected_port" -j DNAT --to-destination "${old_addr}:${old_tport}" 2>/dev/null
-            iptables -t nat -D OUTPUT -p udp --dport "$selected_port" -j DNAT --to-destination "${old_addr}:${old_tport}" 2>/dev/null
-            ip6tables -t nat -D PREROUTING -p udp --dport "$selected_port" -j DNAT --to-destination "${old_addr}:${old_tport}" 2>/dev/null
-            ip6tables -t nat -D OUTPUT -p udp --dport "$selected_port" -j DNAT --to-destination "${old_addr}:${old_tport}" 2>/dev/null
+            iptables -t nat -D PREROUTING -p udp --dport "$selected_port" -j DNAT --to-destination "${old_del_dest}:${old_tport}" 2>/dev/null
+            iptables -t nat -D OUTPUT -p udp --dport "$selected_port" -j DNAT --to-destination "${old_del_dest}:${old_tport}" 2>/dev/null
+            ip6tables -t nat -D PREROUTING -p udp --dport "$selected_port" -j DNAT --to-destination "${old_del_dest}:${old_tport}" 2>/dev/null
+            ip6tables -t nat -D OUTPUT -p udp --dport "$selected_port" -j DNAT --to-destination "${old_del_dest}:${old_tport}" 2>/dev/null
         fi
     else
         local in_tag="pf-in-${selected_port}"
@@ -1756,19 +1809,30 @@ _pf_modify() {
     
     # 2. 创建新规则
     if [ "$PF_ENGINE" == "iptables" ]; then
+        # iptables 只接受 IP 地址，域名需要先解析
+        local iptables_dest="$new_addr"
+        if ! [[ "$new_addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            _info "检测到域名目标 $new_addr，正在解析为 IP..."
+            iptables_dest=$(_pf_resolve_domain "$new_addr")
+            if [ $? -ne 0 ] || [ -z "$iptables_dest" ]; then
+                _error "域名解析失败，无法创建 iptables 转发规则"
+                read -p "  按回车继续..."; return
+            fi
+            _success "域名已解析: $new_addr -> $iptables_dest"
+        fi
         if [[ "$new_net" == "tcp" || "$new_net" == "tcp+udp" ]]; then
-            iptables -t nat -A PREROUTING -p tcp --dport "$selected_port" -j DNAT --to-destination "${new_addr}:${new_tport}"
-            iptables -t nat -A OUTPUT -p tcp --dport "$selected_port" -j DNAT --to-destination "${new_addr}:${new_tport}"
-            ip6tables -t nat -A PREROUTING -p tcp --dport "$selected_port" -j DNAT --to-destination "${new_addr}:${new_tport}" 2>/dev/null
-            ip6tables -t nat -A OUTPUT -p tcp --dport "$selected_port" -j DNAT --to-destination "${new_addr}:${new_tport}" 2>/dev/null
+            iptables -t nat -A PREROUTING -p tcp --dport "$selected_port" -j DNAT --to-destination "${iptables_dest}:${new_tport}"
+            iptables -t nat -A OUTPUT -p tcp --dport "$selected_port" -j DNAT --to-destination "${iptables_dest}:${new_tport}"
+            ip6tables -t nat -A PREROUTING -p tcp --dport "$selected_port" -j DNAT --to-destination "${iptables_dest}:${new_tport}" 2>/dev/null
+            ip6tables -t nat -A OUTPUT -p tcp --dport "$selected_port" -j DNAT --to-destination "${iptables_dest}:${new_tport}" 2>/dev/null
         fi
         if [[ "$new_net" == "udp" || "$new_net" == "tcp+udp" ]]; then
-            iptables -t nat -A PREROUTING -p udp --dport "$selected_port" -j DNAT --to-destination "${new_addr}:${new_tport}"
-            iptables -t nat -A OUTPUT -p udp --dport "$selected_port" -j DNAT --to-destination "${new_addr}:${new_tport}"
-            ip6tables -t nat -A PREROUTING -p udp --dport "$selected_port" -j DNAT --to-destination "${new_addr}:${new_tport}" 2>/dev/null
-            ip6tables -t nat -A OUTPUT -p udp --dport "$selected_port" -j DNAT --to-destination "${new_addr}:${new_tport}" 2>/dev/null
+            iptables -t nat -A PREROUTING -p udp --dport "$selected_port" -j DNAT --to-destination "${iptables_dest}:${new_tport}"
+            iptables -t nat -A OUTPUT -p udp --dport "$selected_port" -j DNAT --to-destination "${iptables_dest}:${new_tport}"
+            ip6tables -t nat -A PREROUTING -p udp --dport "$selected_port" -j DNAT --to-destination "${iptables_dest}:${new_tport}" 2>/dev/null
+            ip6tables -t nat -A OUTPUT -p udp --dport "$selected_port" -j DNAT --to-destination "${iptables_dest}:${new_tport}" 2>/dev/null
         fi
-        _pf_ensure_masquerade "$new_addr"
+        _pf_ensure_masquerade "$iptables_dest"
         _save_iptables_rules
     else
         local in_tag="pf-in-${selected_port}"
@@ -1800,11 +1864,15 @@ _pf_modify() {
         --argjson tport "$new_tport" --arg net "$new_net" --arg net_display "$new_net_display" \
         --arg created "$(date '+%Y-%m-%d %H:%M:%S')" \
         '{engine:$engine, name:$name, target_addr:$addr, target_port:$tport, network:$net, network_display:$net_display, created_at:$created}')
+    if [ "$PF_ENGINE" == "iptables" ] && [ -n "${iptables_dest:-}" ] && [ "$iptables_dest" != "$new_addr" ]; then
+        meta=$(echo "$meta" | jq --arg ip "$iptables_dest" '. + {resolved_ip: $ip}')
+    fi
     jq --arg port "$selected_port" --argjson meta "$meta" '.[$port] = $meta' "$PF_METADATA_FILE" > "${PF_METADATA_FILE}.tmp" \
         && mv "${PF_METADATA_FILE}.tmp" "$PF_METADATA_FILE"
     
     _success "转发规则已修改并生效！"
     echo -e "  【${new_name}】 本机端口: ${GREEN}${selected_port}${NC} → 目标: ${GREEN}${new_addr}:${new_tport}${NC}  [${new_net_display}]"
+    _pf_auto_manage_dns_cron
     read -p "  按回车继续..."
 }
 
@@ -1823,21 +1891,24 @@ _pf_clear() {
     local need_singbox_restart=false
     
     # 逐条读取元数据并按引擎清理
-    while IFS=$'\t' read -r port engine addr tport net; do
+    while IFS=$'\t' read -r port engine addr tport net resolved; do
         [ -z "$port" ] && continue
+        # 域名规则的 iptables 使用的是 resolved_ip，删除时必须匹配
+        local del_dest="${resolved:-$addr}"
+        [ "$del_dest" == "null" ] && del_dest="$addr"
         
         if [ "$engine" == "iptables" ]; then
             if [[ "$net" == "tcp" || "$net" == "tcp+udp" ]]; then
-                iptables -t nat -D PREROUTING -p tcp --dport "$port" -j DNAT --to-destination "${addr}:${tport}" 2>/dev/null
-                iptables -t nat -D OUTPUT -p tcp --dport "$port" -j DNAT --to-destination "${addr}:${tport}" 2>/dev/null
-                ip6tables -t nat -D PREROUTING -p tcp --dport "$port" -j DNAT --to-destination "${addr}:${tport}" 2>/dev/null
-                ip6tables -t nat -D OUTPUT -p tcp --dport "$port" -j DNAT --to-destination "${addr}:${tport}" 2>/dev/null
+                iptables -t nat -D PREROUTING -p tcp --dport "$port" -j DNAT --to-destination "${del_dest}:${tport}" 2>/dev/null
+                iptables -t nat -D OUTPUT -p tcp --dport "$port" -j DNAT --to-destination "${del_dest}:${tport}" 2>/dev/null
+                ip6tables -t nat -D PREROUTING -p tcp --dport "$port" -j DNAT --to-destination "${del_dest}:${tport}" 2>/dev/null
+                ip6tables -t nat -D OUTPUT -p tcp --dport "$port" -j DNAT --to-destination "${del_dest}:${tport}" 2>/dev/null
             fi
             if [[ "$net" == "udp" || "$net" == "tcp+udp" ]]; then
-                iptables -t nat -D PREROUTING -p udp --dport "$port" -j DNAT --to-destination "${addr}:${tport}" 2>/dev/null
-                iptables -t nat -D OUTPUT -p udp --dport "$port" -j DNAT --to-destination "${addr}:${tport}" 2>/dev/null
-                ip6tables -t nat -D PREROUTING -p udp --dport "$port" -j DNAT --to-destination "${addr}:${tport}" 2>/dev/null
-                ip6tables -t nat -D OUTPUT -p udp --dport "$port" -j DNAT --to-destination "${addr}:${tport}" 2>/dev/null
+                iptables -t nat -D PREROUTING -p udp --dport "$port" -j DNAT --to-destination "${del_dest}:${tport}" 2>/dev/null
+                iptables -t nat -D OUTPUT -p udp --dport "$port" -j DNAT --to-destination "${del_dest}:${tport}" 2>/dev/null
+                ip6tables -t nat -D PREROUTING -p udp --dport "$port" -j DNAT --to-destination "${del_dest}:${tport}" 2>/dev/null
+                ip6tables -t nat -D OUTPUT -p udp --dport "$port" -j DNAT --to-destination "${del_dest}:${tport}" 2>/dev/null
             fi
         else
             local in_tag="pf-in-${port}"
@@ -1848,7 +1919,7 @@ _pf_clear() {
             _atomic_modify_json "$RELAY_CONFIG_FILE" "$del_filter"
             need_singbox_restart=true
         fi
-    done < <(jq -r 'to_entries[] | [.key, .value.engine, .value.target_addr, (.value.target_port|tostring), .value.network] | @tsv' "$PF_METADATA_FILE" 2>/dev/null)
+    done < <(jq -r 'to_entries[] | [.key, .value.engine, .value.target_addr, (.value.target_port|tostring), .value.network, (.value.resolved_ip // "null")] | @tsv' "$PF_METADATA_FILE" 2>/dev/null)
     
     # 清空元数据
     echo '{}' > "$PF_METADATA_FILE"
@@ -1860,7 +1931,114 @@ _pf_clear() {
     fi
     
     _success "所有端口转发规则已清空"
+    _pf_auto_manage_dns_cron
     read -p "  按回车继续..."
+}
+# ============================================================
+# --- 域名动态刷新机制 (DNS Refresh for iptables DNAT) ---
+# 定时重新解析域名目标，当 IP 变化时自动更新 iptables 规则
+# ============================================================
+
+# 核心刷新函数：遍历所有含域名的 iptables 转发规则，检查 IP 变化
+_pf_dns_refresh() {
+    local PF_METADATA_FILE="${SINGBOX_DIR}/pf_metadata.json"
+    [ ! -f "$PF_METADATA_FILE" ] && return 0
+    
+    local updated=false
+    
+    while IFS=$'\t' read -r port addr old_ip tport network; do
+        [ -z "$port" ] && continue
+        [ -z "$old_ip" ] || [ "$old_ip" == "null" ] && continue
+        
+        # 重新解析域名
+        local new_ip=""
+        if command -v getent &>/dev/null; then
+            new_ip=$(getent ahostsv4 "$addr" 2>/dev/null | head -1 | awk '{print $1}')
+        fi
+        if [ -z "$new_ip" ] && command -v dig &>/dev/null; then
+            new_ip=$(dig +short A "$addr" 2>/dev/null | grep -E '^[0-9]+\.' | head -1)
+        fi
+        if [ -z "$new_ip" ] && command -v nslookup &>/dev/null; then
+            new_ip=$(nslookup "$addr" 2>/dev/null | awk '/^Address:/ && !/127\.0\.0\.|#/ {print $2}' | head -1)
+        fi
+        
+        [ -z "$new_ip" ] && continue
+        [ "$new_ip" == "$old_ip" ] && continue
+        
+        # IP 发生变化，更新 iptables 规则
+        logger -t "pf-dns-refresh" "域名 $addr 的 IP 已变化: $old_ip -> $new_ip (端口 $port)"
+        
+        # 删除旧规则
+        if [[ "$network" == "tcp" || "$network" == "tcp+udp" ]]; then
+            iptables -t nat -D PREROUTING -p tcp --dport "$port" -j DNAT --to-destination "${old_ip}:${tport}" 2>/dev/null
+            iptables -t nat -D OUTPUT -p tcp --dport "$port" -j DNAT --to-destination "${old_ip}:${tport}" 2>/dev/null
+            iptables -t nat -A PREROUTING -p tcp --dport "$port" -j DNAT --to-destination "${new_ip}:${tport}"
+            iptables -t nat -A OUTPUT -p tcp --dport "$port" -j DNAT --to-destination "${new_ip}:${tport}"
+        fi
+        if [[ "$network" == "udp" || "$network" == "tcp+udp" ]]; then
+            iptables -t nat -D PREROUTING -p udp --dport "$port" -j DNAT --to-destination "${old_ip}:${tport}" 2>/dev/null
+            iptables -t nat -D OUTPUT -p udp --dport "$port" -j DNAT --to-destination "${old_ip}:${tport}" 2>/dev/null
+            iptables -t nat -A PREROUTING -p udp --dport "$port" -j DNAT --to-destination "${new_ip}:${tport}"
+            iptables -t nat -A OUTPUT -p udp --dport "$port" -j DNAT --to-destination "${new_ip}:${tport}"
+        fi
+        
+        # 更新 MASQUERADE
+        if ! iptables -t nat -C POSTROUTING -d "$new_ip" -j MASQUERADE 2>/dev/null; then
+            iptables -t nat -A POSTROUTING -d "$new_ip" -j MASQUERADE
+        fi
+        
+        # 更新元数据中的 resolved_ip
+        jq --arg p "$port" --arg ip "$new_ip" '.[$p].resolved_ip = $ip' "$PF_METADATA_FILE" > "${PF_METADATA_FILE}.tmp" \
+            && mv "${PF_METADATA_FILE}.tmp" "$PF_METADATA_FILE"
+        
+        updated=true
+    done < <(jq -r 'to_entries[] | select(.value.engine == "iptables" and .value.resolved_ip != null) | [.key, .value.target_addr, .value.resolved_ip, (.value.target_port|tostring), .value.network] | @tsv' "$PF_METADATA_FILE" 2>/dev/null)
+    
+    if [ "$updated" = true ]; then
+        # 保存 iptables 规则
+        if command -v iptables-save &>/dev/null; then
+            mkdir -p /etc/iptables
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        fi
+        logger -t "pf-dns-refresh" "iptables 规则已自动更新"
+    fi
+}
+
+# 安装/卸载 DNS 定时刷新 cron 任务
+_pf_setup_dns_cron() {
+    local SCRIPT_PATH="$(readlink -f "$0")"
+    local CRON_CMD="*/5 * * * * ${SCRIPT_PATH} pf-dns-refresh >/dev/null 2>&1"
+    local CRON_TAG="# pf-dns-auto-refresh"
+    
+    # 检查是否已安装
+    if crontab -l 2>/dev/null | grep -qF "$CRON_TAG"; then
+        return 0
+    fi
+    
+    # 添加 cron 任务
+    (crontab -l 2>/dev/null | grep -v "$CRON_TAG"; echo "${CRON_CMD} ${CRON_TAG}") | crontab -
+    _info "已安装域名动态刷新定时任务 (每 5 分钟检查一次)"
+}
+
+_pf_remove_dns_cron() {
+    local CRON_TAG="# pf-dns-auto-refresh"
+    if crontab -l 2>/dev/null | grep -qF "$CRON_TAG"; then
+        crontab -l 2>/dev/null | grep -vF "$CRON_TAG" | crontab -
+        _info "已卸载域名动态刷新定时任务"
+    fi
+}
+
+# 检查是否有域名规则，有则自动安装 cron，无则卸载
+_pf_auto_manage_dns_cron() {
+    local PF_METADATA_FILE="${SINGBOX_DIR}/pf_metadata.json"
+    [ ! -f "$PF_METADATA_FILE" ] && return 0
+    
+    local domain_count=$(jq '[to_entries[] | select(.value.resolved_ip != null)] | length' "$PF_METADATA_FILE" 2>/dev/null || echo 0)
+    if [ "$domain_count" -gt 0 ]; then
+        _pf_setup_dns_cron
+    else
+        _pf_remove_dns_cron
+    fi
 }
 
 # 端口转发子菜单
@@ -1980,4 +2158,12 @@ _menu() {
         esac
     done
 }
+# 命令行参数解析：支持 cron 定时任务直接调用刷新函数
+case "${1:-}" in
+    pf-dns-refresh)
+        _pf_dns_refresh
+        exit 0
+        ;;
+esac
+
 _menu
