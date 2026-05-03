@@ -24,7 +24,7 @@
     </td>
     <td align="center" width="220">
       <a href="https://fuckip.me/" target="_blank">
-        <img src="https://fuckip.me/res/logo.png" width="100" alt="独角鲸" />
+        <img src="https://dash.fuckip.me/logo.png" width="100" alt="独角鲸" />
         <br><sub><b>独角鲸</b></sub>
       </a>
     </td>
