@@ -2,44 +2,6 @@
 
 一套功能完整的 sing-box + Xray 双核心节点管理和中转配置脚本，支持多种协议和高级中转功能。
 
-## 💯 本项目顺利落地，特别鸣谢以下商家提供机器（本排名不分先后顺序）
-
-<div align="center">
-
-<table>
-  <tr>
-    </td>
-    <td align="center" width="220">
-      <a href="https://incudal.com/" target="_blank">
-        <img src="https://incudal.com/incudal_logo.webp" width="100" alt="Incudal" />
-        <br><sub><b>Incudal</b></sub>
-      </a>
-    </td>
-    <td align="center" width="220">
-      <a href="https://lxc.lazycat.wiki/" target="_blank">
-        <img src="https://lxc.lazycat.wiki/upload/logo2.png" width="100" alt="懒猫云" />
-        <br><sub><b>懒猫云</b></sub>
-      </a>
-    </td>
-    </td>
-    <td align="center" width="220">
-      <a href="https://fuckip.me/" target="_blank">
-        <img src="https://dash.fuckip.me/logo.png" width="100" alt="独角鲸" />
-        <br><sub><b>独角鲸</b></sub>
-      </a>
-    </td>
-    </td>
-    </td>
-    <td align="center" width="220">
-      <a href="https://www.lxc.wiki/" target="_blank">
-        <img src="https://www.lxc.wiki/themes/web/starvm-phj/img/logo.png" width="100" alt="Incudal" />
-        <br><sub><b>拼好鸡</b></sub>
-      </a>
-    </td>
-  </tr>
-</table>
-</div>
-
 ## ✨ 特性
 
 ### 主脚本 (singbox.sh)
