@@ -1949,6 +1949,50 @@ _create_service_files() {
     _success "${INIT_SYSTEM} 服务创建并启用成功。"
 }
 
+# 每 48 小时清空一次本脚本产生的运行日志，避免小磁盘被持续写满。
+_cleanup_runtime_logs() {
+    local state_file="${SINGBOX_DIR}/.last_log_cleanup"
+    local now last
+    now=$(date +%s 2>/dev/null) || return 1
+    last=$(cat "$state_file" 2>/dev/null)
+
+    # 首次启用时立即清理一次，先释放可能已经被占满的磁盘空间。
+    if ! [[ "$last" =~ ^[0-9]+$ ]]; then
+        last=0
+    fi
+    [ $((now - last)) -lt 172800 ] && return 0
+
+    local log
+    for log in "$LOG_FILE" "$ARGO_LOG_FILE" /var/log/xray.log /tmp/singbox_argo_*.log; do
+        [ -f "$log" ] && : > "$log"
+    done
+    printf '%s\n' "$now" > "$state_file"
+}
+
+_setup_log_cleanup() {
+    command -v crontab >/dev/null 2>&1 || {
+        _warning "未找到 crontab，无法启用每 2 天自动清理日志。"
+        return 1
+    }
+
+    local tag="# sing-box-log-cleanup"
+    local job="17 * * * * bash ${SELF_SCRIPT_PATH} cleanup-logs >/dev/null 2>&1 ${tag}"
+    local current
+    current=$(crontab -l 2>/dev/null || true)
+    if ! printf '%s\n' "$current" | grep -Fq "$tag"; then
+        { printf '%s\n' "$current"; printf '%s\n' "$job"; } | sed '/^$/d' | crontab - || return 1
+    fi
+    _cleanup_runtime_logs
+}
+
+_remove_log_cleanup() {
+    local tag="# sing-box-log-cleanup"
+    if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -Fq "$tag"; then
+        crontab -l 2>/dev/null | grep -Fv "$tag" | crontab -
+    fi
+    rm -f "${SINGBOX_DIR}/.last_log_cleanup"
+}
+
 
 # 注意: _manage_service 已在上方定义，此处不再重复定义
 
@@ -1996,6 +2040,7 @@ _uninstall() {
 
     # 2. 清理配置与日志
     _info "正在清理配置文件与日志..."
+    _remove_log_cleanup
     # 清理脚本创建的 nftables 规则
     local pf_meta="${SINGBOX_DIR}/relay_pf.json"
     [ ! -f "$pf_meta" ] && pf_meta="${SINGBOX_DIR}/pf_metadata.json"
@@ -4837,6 +4882,7 @@ _do_update_singbox() {
             echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "${SINGBOX_DIR}/relay.json"
         fi
         _create_service_files
+        _setup_log_cleanup
         _info "正在启动/重启 [主] 服务 (sing-box)..."
         _manage_service "restart"
         _success "[主] 服务已就绪。"
@@ -5820,6 +5866,7 @@ main() {
         elif [ "$INIT_SYSTEM" == "direct" ] && [ ! -f "$LOG_FILE" ]; then
             touch "$LOG_FILE"
         fi
+        _setup_log_cleanup
     else
         # --- sing-box 未安装：仅显示提示，不自动安装 ---
         _warn "sing-box 核心未安装。请通过主菜单【核心管理】进行安装。"
@@ -5834,6 +5881,10 @@ while [[ $# -gt 0 ]]; do
         keepalive)
             _argo_keepalive
             exit 0
+            ;;
+        cleanup-logs)
+            _cleanup_runtime_logs
+            exit $?
             ;;
         *)
             shift
