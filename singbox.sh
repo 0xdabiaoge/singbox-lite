@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="17"
+export SCRIPT_VERSION="18"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -2299,7 +2299,7 @@ _cleanup_legacy_config() {
 
 _check_and_fix_dns() {
     # 热修复：1.补充缺失的 DNS 模块，2.将容易引起出站路由绑定死循环（连接被秒重置）的 auto_detect_interface 清除
-    # 3. 将旧版 ipv4_only 策略升级为 prefer_ipv4，保留 IPv4 优先但允许纯 IPv6 目标站点
+    # 3. 为未设置策略的旧配置补充 prefer_ipv4；保留用户在 DNS 菜单中明确选择的策略
     if [ ! -f "$CONFIG_FILE" ]; then return; fi
     
     local has_dns=$(jq 'has("dns")' "$CONFIG_FILE" 2>/dev/null)
@@ -2307,7 +2307,7 @@ _check_and_fix_dns() {
     local dns_strategy=$(jq -r 'try .dns.strategy // "" catch ""' "$CONFIG_FILE" 2>/dev/null)
     local needs_restart=false
     
-    if [ "$has_dns" == "false" ] || [ "$has_auto_detect" == "true" ] || [ "$dns_strategy" == "ipv4_only" ] || [ -z "$dns_strategy" ]; then
+    if [ "$has_dns" == "false" ] || [ "$has_auto_detect" == "true" ] || [ -z "$dns_strategy" ]; then
         _warn "检测到 DNS/路由配置需要兼容性修复，正在自动处理..."
         
         local tmp_file="${CONFIG_FILE}.tmp"
@@ -2321,7 +2321,7 @@ _check_and_fix_dns() {
                     "strategy": "prefer_ipv4"
                 }
             } end
-            | if ((.dns.strategy // "") == "" or (.dns.strategy // "") == "ipv4_only") then .dns.strategy = "prefer_ipv4" else . end
+            | if ((.dns.strategy // "") == "") then .dns.strategy = "prefer_ipv4" else . end
             | del(.route.auto_detect_interface)
         ' "$CONFIG_FILE" > "$tmp_file"
         
@@ -4446,6 +4446,146 @@ _check_config() {
     fi
 }
 
+_apply_dns_config() {
+    local dns_address="$1"
+    local dns_strategy="$2"
+    local tmp_file="${CONFIG_FILE}.dns.tmp.$$"
+    local backup_file="${CONFIG_FILE}.bak_dns_$(date +%Y%m%d_%H%M%S)"
+    local check_result
+
+    if ! jq --arg address "$dns_address" --arg strategy "$dns_strategy" '
+        .dns = {
+            "servers": [
+                {
+                    "tag": "dns-local",
+                    "address": $address,
+                    "detour": "direct"
+                }
+            ],
+            "rules": [
+                {
+                    "outbound": "any",
+                    "server": "dns-local"
+                }
+            ],
+            "strategy": $strategy
+        }
+    ' "$CONFIG_FILE" > "$tmp_file"; then
+        _error "生成 DNS 配置失败。"
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    check_result=$(${SINGBOX_BIN} check -c "$tmp_file" 2>&1)
+    if [ $? -ne 0 ]; then
+        _error "新的 DNS 配置未通过 sing-box 校验，原配置未修改："
+        echo "$check_result"
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    if ! cp "$CONFIG_FILE" "$backup_file" || ! mv "$tmp_file" "$CONFIG_FILE"; then
+        _error "保存 DNS 配置失败。"
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    _success "DNS 配置已保存，备份文件：${backup_file}"
+    _manage_service "restart"
+}
+
+_dns_config_menu() {
+    local current_address current_strategy choice dns_address dns_strategy
+
+    while true; do
+        current_address=$(jq -r '.dns.servers[0].address // "未设置"' "$CONFIG_FILE" 2>/dev/null)
+        current_strategy=$(jq -r '.dns.strategy // "prefer_ipv4"' "$CONFIG_FILE" 2>/dev/null)
+        [ -z "$current_address" ] || [ "$current_address" = "null" ] && current_address="未设置"
+        [ -z "$current_strategy" ] || [ "$current_strategy" = "null" ] && current_strategy="prefer_ipv4"
+
+        clear
+        echo -e "${CYAN}"
+        echo "  ╔═══════════════════════════════════════╗"
+        echo "  ║          sing-box DNS 设置            ║"
+        echo "  ╚═══════════════════════════════════════╝"
+        echo -e "${NC}"
+        echo -e "  当前 DNS:  ${GREEN}${current_address}${NC}"
+        echo -e "  当前策略:  ${GREEN}${current_strategy}${NC}"
+        echo ""
+        echo -e "    ${GREEN}[1]${NC} 系统 DNS（local）"
+        echo -e "    ${GREEN}[2]${NC} 阿里 DNS（DoH）"
+        echo -e "    ${GREEN}[3]${NC} 腾讯 DNSPod（DoH）"
+        echo -e "    ${GREEN}[4]${NC} Cloudflare（DoH）"
+        echo -e "    ${GREEN}[5]${NC} Google（DoH）"
+        echo -e "    ${GREEN}[6]${NC} 自定义 DNS 地址"
+        echo -e "    ${GREEN}[7]${NC} 修改域名解析策略"
+        echo -e "    ${GREEN}[8]${NC} 查看完整 DNS 配置"
+        echo ""
+        echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
+        echo ""
+        read -p "  请输入选项 [0-8]: " choice
+
+        dns_address=""
+        dns_strategy="$current_strategy"
+        case "$choice" in
+            1) dns_address="local" ;;
+            2) dns_address="https://dns.alidns.com/dns-query" ;;
+            3) dns_address="https://doh.pub/dns-query" ;;
+            4) dns_address="https://1.1.1.1/dns-query" ;;
+            5) dns_address="https://dns.google/dns-query" ;;
+            6)
+                echo ""
+                echo "  支持 local、IP、udp://、tcp://、tls://、https:// 等 sing-box DNS 地址。"
+                read -r -p "  请输入 DNS 地址（留空取消）: " dns_address
+                [ -z "$dns_address" ] && continue
+                if [[ "$dns_address" =~ [[:space:]] ]]; then
+                    _error "DNS 地址不能包含空白字符。"
+                    read -n 1 -s -r -p "按任意键继续..."
+                    continue
+                fi
+                ;;
+            7)
+                echo ""
+                echo "    1) prefer_ipv4（推荐，IPv4 优先）"
+                echo "    2) prefer_ipv6（IPv6 优先）"
+                echo "    3) ipv4_only（仅 IPv4）"
+                echo "    4) ipv6_only（仅 IPv6）"
+                read -p "  请选择解析策略 [1-4]: " strategy_choice
+                case "$strategy_choice" in
+                    1) dns_strategy="prefer_ipv4" ;;
+                    2) dns_strategy="prefer_ipv6" ;;
+                    3) dns_strategy="ipv4_only" ;;
+                    4) dns_strategy="ipv6_only" ;;
+                    *) _error "无效输入。"; read -n 1 -s -r -p "按任意键继续..."; continue ;;
+                esac
+                dns_address="$current_address"
+                if [ "$dns_address" = "未设置" ]; then
+                    dns_address="local"
+                fi
+                ;;
+            8)
+                echo ""
+                jq '.dns' "$CONFIG_FILE" 2>/dev/null || _error "无法读取 DNS 配置。"
+                echo ""
+                read -n 1 -s -r -p "按任意键继续..."
+                continue
+                ;;
+            0) return ;;
+            *) _error "无效输入，请重试。"; read -n 1 -s -r -p "按任意键继续..."; continue ;;
+        esac
+
+        echo ""
+        _info "准备设置 DNS 为 ${dns_address}，解析策略为 ${dns_strategy}。"
+        read -r -p "  确认保存并重启 sing-box？[Y/n]: " confirm
+        if [[ "$confirm" =~ ^[Nn]$ ]]; then
+            continue
+        fi
+        _apply_dns_config "$dns_address" "$dns_strategy"
+        echo ""
+        read -n 1 -s -r -p "按任意键继续..."
+    done
+}
+
 _modify_port() {
     if ! jq -e '.inbounds | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
         _warning "当前没有任何节点。"
@@ -5248,6 +5388,7 @@ _main_menu() {
         # 配置与更新
         echo -e "  ${CYAN}【配置与更新】${NC}"
         echo -e "    ${GREEN}[12]${NC} 检查配置文件    ${GREEN}[13]${NC} 更新脚本"
+        echo -e "    ${GREEN}[19]${NC} DNS 设置"
         echo ""
         
         # 核心管理
@@ -5267,7 +5408,7 @@ _main_menu() {
         echo -e "    ${YELLOW}[0]${NC} 退出脚本"
         echo ""
         
-        read -p "  请输入选项 [0-18]: " choice
+        read -p "  请输入选项 [0-19]: " choice
  
         case $choice in
             1) _require_singbox && _show_add_node_menu ;;
@@ -5288,6 +5429,7 @@ _main_menu() {
             16) _uninstall ;; 
             17) _require_singbox && _advanced_features ;;
             18) _xray_features ;;
+            19) _require_singbox && _dns_config_menu ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
