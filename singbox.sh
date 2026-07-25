@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="18"
+export SCRIPT_VERSION="19"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -4987,7 +4987,7 @@ _update_script() {
 # 守卫函数：检查 sing-box 核心是否已安装
 _require_singbox() {
     if [ ! -f "${SINGBOX_BIN}" ]; then
-        _error "此功能需要先安装 Sing-box 核心。请前往主菜单【核心管理】-> [14] 进行安装。"
+        _error "此功能需要先安装 Sing-box 核心。请前往主菜单【核心管理】-> [15] 进行安装。"
         return 1
     fi
     return 0
@@ -5220,7 +5220,7 @@ _advanced_features() {
 _xray_features() {
     # 前置检查：Xray 核心必须已安装
     if [ ! -f "/usr/local/bin/xray" ]; then
-        _error "Xray 核心未安装！请先通过主菜单【核心管理】-> [15] 进行安装。"
+        _error "Xray 核心未安装！请先通过主菜单【核心管理】-> [16] 进行安装。"
         return 1
     fi
 
@@ -5388,20 +5388,20 @@ _main_menu() {
         # 配置与更新
         echo -e "  ${CYAN}【配置与更新】${NC}"
         echo -e "    ${GREEN}[12]${NC} 检查配置文件    ${GREEN}[13]${NC} 更新脚本"
-        echo -e "    ${GREEN}[19]${NC} DNS 设置"
+        echo -e "    ${GREEN}[14]${NC} DNS 设置"
         echo ""
         
         # 核心管理
         echo -e "  ${CYAN}【核心管理】${NC}"
-        echo -e "    ${GREEN}[14]${NC} 安装/更新 Sing-box 核心"
-        echo -e "    ${GREEN}[15]${NC} 安装/更新 Xray 核心"
-        echo -e "    ${RED}[16]${NC} 卸载脚本"
+        echo -e "    ${GREEN}[15]${NC} 安装/更新 Sing-box 核心"
+        echo -e "    ${GREEN}[16]${NC} 安装/更新 Xray 核心"
+        echo -e "    ${RED}[17]${NC} 卸载脚本"
         echo ""
         
         # 进阶功能
         echo -e "  ${CYAN}【进阶功能】${NC}"
-        echo -e "    ${GREEN}[17]${NC} 落地/中转/第三方节点导入"
-        echo -e "    ${GREEN}[18]${NC} Xray 节点管理"
+        echo -e "    ${GREEN}[18]${NC} 落地/中转/第三方节点导入"
+        echo -e "    ${GREEN}[19]${NC} Xray 节点管理"
         echo ""
         
         echo -e "  ─────────────────────────────────────────────────"
@@ -5424,12 +5424,12 @@ _main_menu() {
             11) _sync_system_time ;;
             12) _require_singbox && _check_config ;;
             13) _update_script ;;
-            14) _install_or_update_singbox ;;
-            15) _install_or_update_xray ;;
-            16) _uninstall ;; 
-            17) _require_singbox && _advanced_features ;;
-            18) _xray_features ;;
-            19) _require_singbox && _dns_config_menu ;;
+            14) _require_singbox && _dns_config_menu ;;
+            15) _install_or_update_singbox ;;
+            16) _install_or_update_xray ;;
+            17) _uninstall ;; 
+            18) _require_singbox && _advanced_features ;;
+            19) _xray_features ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
