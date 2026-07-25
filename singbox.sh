@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="19"
+export SCRIPT_VERSION="20"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -4923,20 +4923,37 @@ _update_script() {
         return 1
     fi
 
-    # 更新主脚本
+    # 更新主脚本。时间戳查询参数用于绕过代理/CDN 的旧文件缓存。
     _info "正在从 GitHub 下载最新版本..."
     local temp_script_path="${SELF_SCRIPT_PATH}.tmp"
+    local cache_bust
+    local main_script_url
+    local downloaded_version
+    cache_bust=$(date +%s)
+    main_script_url="${SCRIPT_UPDATE_URL}?v=${cache_bust}"
     
-    if wget -qO "$temp_script_path" "$SCRIPT_UPDATE_URL"; then
+    if wget -qO "$temp_script_path" "$main_script_url"; then
         if [ ! -s "$temp_script_path" ]; then
             _error "主脚本下载失败或文件为空！"
+            rm -f "$temp_script_path"
+            return 1
+        fi
+
+        downloaded_version=$(sed -n 's/^export SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$temp_script_path" | head -n 1)
+        if [ -z "$downloaded_version" ] || ! head -n 1 "$temp_script_path" | grep -q '^#!/bin/bash'; then
+            _error "下载内容不是有效的 singbox.sh，已拒绝覆盖本地脚本。"
+            rm -f "$temp_script_path"
+            return 1
+        fi
+        if ! bash -n "$temp_script_path" 2>/dev/null; then
+            _error "下载的新脚本未通过 Bash 语法检查，已拒绝覆盖本地脚本。"
             rm -f "$temp_script_path"
             return 1
         fi
         
         chmod +x "$temp_script_path"
         mv "$temp_script_path" "$SELF_SCRIPT_PATH"
-        _success "主脚本 (singbox.sh) 更新成功！"
+        _success "主脚本更新成功：v${SCRIPT_VERSION} -> v${downloaded_version}"
     else
         _error "主脚本下载失败！请检查网络或 GitHub 链接。"
         rm -f "$temp_script_path"
@@ -4953,7 +4970,7 @@ _update_script() {
         
         for script_path in "${paths_to_check[@]}"; do
             if [ -f "$script_path" ]; then
-                local script_url="${GITHUB_RAW_BASE}/${script_name}"
+                local script_url="${GITHUB_RAW_BASE}/${script_name}?v=${cache_bust}"
                 local temp_sub_path="${script_path}.tmp"
                 
                 _info "正在更新子脚本: ${script_name} -> ${script_path}..."
@@ -4978,7 +4995,7 @@ _update_script() {
     # 更新 yq 工具（如果缺失或版本过旧）
     _install_yq
     
-    _success "所有脚本组件已更新至最新版 (v${SCRIPT_VERSION})！"
+    _success "所有脚本组件已更新至最新版 (v${downloaded_version})！"
     _info "请重新运行脚本以应用所有变更："
     echo -e "${YELLOW}bash ${SELF_SCRIPT_PATH}${NC}"
     exit 0
