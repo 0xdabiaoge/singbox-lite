@@ -2304,7 +2304,7 @@ _check_and_fix_dns() {
     
     local has_dns=$(jq 'has("dns")' "$CONFIG_FILE" 2>/dev/null)
     local has_auto_detect=$(jq 'try .route.auto_detect_interface catch false' "$CONFIG_FILE" 2>/dev/null)
-    local dns_strategy=$(jq -r 'try .dns.strategy // "" catch ""' "$CONFIG_FILE" 2>/dev/null)
+    local dns_strategy=$(jq -r '.dns.strategy // ""' "$CONFIG_FILE" 2>/dev/null)
     local needs_restart=false
     
     if [ "$has_dns" == "false" ] || [ "$has_auto_detect" == "true" ] || [ -z "$dns_strategy" ]; then
