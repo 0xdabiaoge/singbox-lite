@@ -1,346 +1,348 @@
-# sing-box & Xray 全功能管理脚本
+# sing-box + Xray 多协议管理脚本
 
-一套功能完整的 sing-box + Xray 双核心节点管理和中转配置脚本，支持多种协议和高级中转功能。
+一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-## ✨ 特性
+当前文档按以下脚本版本整理：`singbox.sh v20`、`advanced_relay.sh v17`、`xray_manager.sh v3.1.0`。
 
-### 主脚本 (singbox.sh)
+> 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
-- 🚀 **一键安装** - 自动检测系统环境（systemd/OpenRC），自动安装依赖
-- 📦 **多协议支持** - 支持多种 sing-box 代理协议以及 Argo 临时隧道和固定隧道节点的部署
-- 🦘 **端口跳跃** - 支持 LXC/NAT 环境下的 Hysteria2 端口跳跃（应用层多端口监听）
-- ⚡ **批量创建** - 智能批量部署，支持自定义 SNI 和端口冲突检测
-- 🔄 **智能管理** - 列表自动隐藏辅助节点，支持级联删除
-- 🌐 **IPv6 完美支持** - 自动处理 IPv6 地址格式
-- 🎯 **自定义名称** - 所有节点支持自定义命名
-- 📊 **服务监控** - 主菜单实时显示 Sing-box / Argo / Xray 三大服务运行状态
+## 项目组成
 
-### Xray 管理脚本 (xray_manager.sh)
+| 文件 | 作用 |
+| --- | --- |
+| `singbox.sh` | 主入口；负责依赖、sing-box、节点、Argo、DNS、服务和子脚本调度 |
+| `advanced_relay.sh` | 落地/中转、第三方节点导入、端口转发和规则管理 |
+| `parser.sh` | 第三方节点链接的严格解析器，通常由中转脚本调用 |
+| `xray_manager.sh` | Xray-core 安装、服务和节点管理，与主脚本共享 `clash.yaml` |
 
-- 🔥 **Xray 核心管理** - 一键安装/更新/卸载 Xray-core
-- 🛡️ **Reality 协议** - 支持 VLESS 和 Trojan 的 Reality 安全传输
-- 📡 **8 种协议** - Reality 系列 4 种 + TLS 系列 3 种 (CF回源) + Shadowsocks
-- ☁️ **CF CDN 回源** - TLS 协议支持 Cloudflare CDN 端口回源加速
-- 🔗 **双格式输出** - 自动生成分享链接 + Clash YAML 配置
-- 🔧 **端口全同步** - 修改端口时标签、名称、分享链接、YAML 四处联动更新
+## 主要能力
 
-### 进阶脚本 (advanced_relay.sh)
+- sing-box 与 Xray 双核心可独立安装、更新和运行。
+- 节点创建、查看、删除、端口修改、批量创建和分享链接输出。
+- VLESS、Trojan、Hysteria2、TUIC、AnyTLS、Shadowsocks、SOCKS5 等协议管理。
+- VLESS-WS / Trojan-WS 的 Argo 临时隧道和固定隧道。
+- 支持本机节点 Token 与第三方落地节点两种接入流程，并可选择四种中转入口协议。
+- nftables 内核转发与 sing-box 用户态转发双引擎，按实际权限自动选择。
+- IPv4/IPv6 地址、域名目标、TCP、UDP、TCP+UDP 端口转发。
+- 共享状态锁、原子写入、事务快照和失败回滚，降低跨脚本并发修改造成的配置损坏风险。
+- 对配置、元数据、私钥、Token 和临时文件采用收紧的权限与清理策略。
 
-- 🔀 **中转配置** - 支持落地机/中转机完整配置流程
-- 🎫 **Token 机制** - 安全的落地节点 Token 生成与导入
-- 🔗 **第三方节点导入** - 导入并适配第三方节点为本地监听
-- 🛠️ **端口修改** - 在线修改中转端口，无需重建
-- 🗑️ **完整清理** - 删除中转时自动清理所有相关配置
-- 📊 **可视化管理** - 查看所有中转路由和落地节点
-- 🔀 **端口转发** - 利用iptables内核转发和singbox用户态进行端口转发，支持TCP、UDP端口转发
+## 系统与环境
 
----
+### 重点支持
 
-## 📋 支持的协议
+- Debian / Ubuntu：systemd
+- Alpine Linux：OpenRC
+- 无 systemd/OpenRC 的精简环境：使用 direct 后台模式
+- CPU：`x86_64/amd64`、`aarch64/arm64`、`armv7l`
 
-### Sing-box 协议
+脚本也包含 `yum`/`dnf` 依赖安装路径；主要适配系统为 Debian、Ubuntu 和 Alpine。
 
-| 协议 | 节点添加 | 第三方导入 | 中转支持 |
-|------|---------|-----------|---------|
-| VLESS-Reality | ✅ | ✅ | ✅ |
-| VLESS-WS-TLS | ✅ | ❌ | ❌ |
-| AnyTLS | ✅ | ❌ | ✅ |
-| Trojan-WS-TLS | ✅ | ❌ | ❌ |
-| Hysteria2 | ✅ | ✅ | ✅ |
-| TUICv5 | ✅ | ✅ | ✅ |
-| Shadowsocks | ✅ | ✅ | ✅ |
-| VLESS-TCP | ✅ | ❌ | ✅ |
-| SOCKS5 | ✅ | ❌ | ❌ |
+### 虚拟化与容器
 
-### Xray 协议
+- KVM、具备 `NET_ADMIN` 的 LXC：优先使用 nftables。
+- 无特权 LXC、Docker、Podman：nftables 探测失败时自动降级为 sing-box 用户态转发。
+- Docker/Podman 如果不是 host 网络，必须在宿主机预先发布对应的 TCP/UDP 端口；容器内创建监听并不等于宿主机端口已经开放。
+- 128 MB Podman Alpine/Debian 的核心安装路径已做低内存优化，但实际可用内存仍受宿主机、页缓存和同时运行的服务影响。Argo、测速和多核心并发运行需要预留更多内存。
 
-| 协议 | V2rayN | Clash Verge | 说明 |
-|------|--------|-------------|------|
-| VLESS+TCP+Reality+Vision | ✅ | ✅ | 推荐，最稳定 |
-| VLESS+gRPC+Reality | ✅ | ✅ | gRPC 传输 |
-| Trojan+XHTTP+Reality | ✅ | ❌ | mihomo 不支持 XHTTP |
-| Trojan+gRPC+Reality | ✅ | ✅ | gRPC 传输 |
-| VLESS+XHTTP+TLS | ✅ | ❌ | CF H2回源，基于 XHTTP stream-one |
-| VLESS+gRPC+TLS | ✅ | ✅ | CF gRPC回源，需CF开启 gRPC |
-| Trojan+gRPC+TLS | ✅ | ✅ | CF gRPC回源，需CF开启 gRPC |
-| Shadowsocks | ✅ | ✅ | 支持 3 种加密方式 |
+## 安装与启动
 
-> ⚠️ XHTTP 传输层节点仅支持 V2rayN 等 Xray 内核客户端，不支持 Clash Verge (mihomo)
-> 
-> 💡 TLS 协议支持 CF CDN 回源加速，也可直连使用（直连时域名可填大厂域名）
-
----
-
-## 🔧 系统要求
-
-### 支持的系统
-- Debian/Ubuntu (systemd)
-- Alpine Linux (OpenRC)
-
----
-
-## 📥 安装
-
-### 交互式安装（推荐）
-
-进入交互菜单手动配置节点：
-
-```
+```bash
 (curl -LfsS https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -q https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
 ```
 
-**快捷命令：sb**
+以后直接运行：
 
----
+```bash
+sb
+```
 
-## 📖 使用指南
+首次启动会安装基础依赖并初始化状态文件，但不会强制同时安装两个核心。请按需要使用主菜单 `[15]` 安装/更新 sing-box，使用 `[16]` 安装/更新 Xray。
 
-### 主脚本 (singbox.sh)
+子脚本缺失时，主脚本会从同一仓库下载，并在覆盖或执行前检查 HTTPS 来源、非空内容、Bash shebang 和语法。
 
-#### 基本操作
-
-**主菜单选项：**
+## 主菜单
 
 | 分类 | 编号 | 功能 |
-|------|------|------|
-| **节点管理** | [1] | 添加节点 |
-| | [2] | Argo 隧道节点（临时/固定） |
-| | [3] | 查看节点分享链接 |
-| | [4] | 删除节点 |
-| | [5] | 修改节点端口 |
-| **服务控制** | [6] | 重启服务 |
-| | [7] | 停止服务 |
-| | [8] | 查看运行状态 |
-| | [9] | 查看实时日志 |
-| | [10] | 定时重启设置 |
-| | [11] | 同步系统时间 |
-| **配置与更新** | [12] | 检查配置文件 |
-| | [13] | 更新脚本 |
-| | [14] | 安装/更新 Sing-box 核心 |
-| | [15] | 安装/更新 Xray 核心 |
-| | [16] | 卸载脚本 |
-| **进阶功能** | [17] | 落地/中转/第三方节点导入 |
-| | [18] | Xray 核心管理 |
+| --- | ---: | --- |
+| 节点管理 | 1 | 添加 sing-box 节点 |
+|  | 2 | Argo 隧道节点 |
+|  | 3 | 查看节点链接 |
+|  | 4 | 删除节点 |
+|  | 5 | 修改节点端口 |
+| 服务控制 | 6 | 重启 sing-box |
+|  | 7 | 停止 sing-box |
+|  | 8 | 查看运行状态 |
+|  | 9 | 查看实时日志 |
+|  | 10 | 定时重启设置 |
+|  | 11 | 同步系统时间 |
+| 配置与更新 | 12 | 检查配置文件 |
+|  | 13 | 更新脚本 |
+|  | 14 | DNS 设置 |
+| 核心管理 | 15 | 安装/更新 sing-box 核心 |
+|  | 16 | 安装/更新 Xray 核心 |
+|  | 17 | 卸载脚本 |
+| 进阶功能 | 18 | 落地/中转/第三方节点导入/端口转发 |
+|  | 19 | Xray 节点管理 |
+| 退出 | 0 | 退出脚本 |
 
-#### 导入第三方节点
+## sing-box 节点协议
 
-```
-1. 选择"导入第三方节点"
-2. 粘贴第三方节点链接
-3. 选择本地适配协议（推荐 VLESS-TCP）
-4. 设置本地监听端口
-5. 自定义适配层名称（可选）
-6. 自动创建本地适配层
-```
+| 菜单 | 协议 | 说明 |
+| ---: | --- | --- |
+| 1 | VLESS + TCP + Reality + Vision | `type=tcp`、`security=reality`、`flow=xtls-rprx-vision` |
+| 2 | VLESS + WebSocket + TLS | 支持自签名或自备证书，可输出直连/CF 场景配置 |
+| 3 | Trojan + WebSocket + TLS | 支持自签名或自备证书，可输出直连/CF 场景配置 |
+| 4 | VLESS + gRPC + TLS | 支持 gRPC TLS 节点创建 |
+| 5 | AnyTLS / Any-Reality | 可单独创建或同时创建；Any-Reality 不写入 Mihomo `clash.yaml` |
+| 6 | Hysteria2 | 支持 Salamander 混淆和端口跳跃 |
+| 7 | TUIC v5 | 使用 QUIC/UDP |
+| 8 | Shadowsocks | 经典 SS、SS2022、Padding、SS2022 + ShadowTLS v3 |
+| 9 | 纯 VLESS + TCP | 无 TLS/Reality，适合明确知道风险和使用场景的用户 |
+| 10 | SOCKS5 | 本机创建的是用户名/密码认证节点 |
+| 11 | 批量创建 | 支持多协议组合、端口规划、冲突检查和整批回滚 |
 
-**支持导入的第三方节点链接：**
-```
-- VLESS (Vision+REALITY)
+sing-box Shadowsocks 可选项：
+
+- `aes-256-gcm`
+- `chacha20-ietf-poly1305`
+- `2022-blake3-aes-256-gcm`
+- `2022-blake3-aes-256-gcm` + Multiplex/Padding
+- `2022-blake3-aes-256-gcm` + ShadowTLS v3
+
+ShadowTLS 组合没有通用的单行分享链接，脚本会给出 Mihomo 配置参考，并把完整配置写入 `clash.yaml`。
+
+## 第三方节点导入
+
+入口：主菜单 `[18]` → 进阶转发菜单 `[3]`。
+
+第三方导入采用“先选协议、再输入对应信息”的严格模式，不会猜测协议或静默降级传输方式。
+
+| 选项 | 支持方式 | 约束 |
+| --- | --- | --- |
+| VLESS + TCP + Reality + Vision | `vless://` 链接 | 必须是原生 TCP、Reality、`xtls-rprx-vision` |
+| 纯 VLESS + TCP | `vless://` 链接 | 必须是原生 TCP，不能启用 TLS/Reality |
+| Shadowsocks `aes-128-gcm` | `ss://` 链接 | 不接受插件或其他加密方法 |
+| Shadowsocks `aes-256-gcm` | `ss://` 链接 | 不接受插件或其他加密方法 |
+| SOCKS5 无认证 | 手动输入 | 输入服务器地址和端口 |
+| SOCKS5 用户名/密码认证 | 手动输入 | 输入服务器地址、端口、用户名和密码 |
+
+Hysteria2、TUIC、VMess、Trojan、AnyTLS 等第三方分享链接不属于当前导入白名单；解析器会明确拒绝，而不是生成可能错误的配置。
+
+VLESS 两种导入结果都会显式写入 `network: "tcp"`。Reality 模式还会严格检查 SNI、公钥、Short ID、uTLS 指纹和 `flow`。
+
+## 落地与中转
+
+### 方式一：本机节点 Token
+
+1. 在落地机进入主菜单 `[18]` → `[1]`，选择可导出的本机节点。
+2. 脚本生成 `ENC2` 加密 Token 和独立解密口令。
+3. 使用不同渠道传递 Token 与口令。
+4. 在中转机进入 `[18]` → `[2]`，导入 Token 并输入口令。
+5. 选择中转入口协议、监听端口、SNI 和节点名称。
+
+新版 Token 使用 AES-256-CBC + PBKDF2，并把密文与口令分开显示。旧版 `ENC` 和 Base64 Token 仍可兼容导入，但会给出安全警告。
+
+当前文档化的 Token 兼容范围是：原生 TCP/Reality/WS 类型的 VLESS、Trojan-WS、经典 Shadowsocks、Hysteria2、TUIC 和 AnyTLS。SS2022 会从 Token 列表中隐藏；VLESS gRPC、Any-Reality、ShadowTLS 组合和 SOCKS5 不应视为已保证的 Token 导出类型。
+
+### 方式二：第三方落地节点
+
+1. 在中转机进入 `[18]` → `[3]`。
+2. 选择第三方节点类型并输入链接或 SOCKS5 信息。
+3. 解析器和中转脚本执行双重 schema 校验。
+4. 选择本机中转入口协议。
+5. 脚本创建入口、落地 outbound、路由、分享链接和客户端配置。
+
+可选中转入口：
+
+- VLESS + TCP + Reality + Vision
 - Hysteria2
-- TUICv5
-- Shadowsocks
-```
+- TUIC v5
+- AnyTLS
 
----
+创建、删除和修改中转路由都使用事务快照；配置检查或服务重启失败时会尝试恢复原状态。
 
-### 进阶脚本 (advanced_relay.sh)
+## 端口转发
 
-#### 中转配置流程
+入口：主菜单 `[18]` → 进阶转发菜单 `[8]`。
 
-**场景：** 落地机（有节点）→ 中转机（中转流量）→ 客户端
+### 自动选择引擎
 
-#### 1. 落地机配置
+脚本不是只根据“LXC/KVM/Podman”名称做判断，而是实际尝试创建并删除一条 nftables 测试规则：
 
-```
-# 选择"进阶功能" → "落地机配置"
-# 选择要中转的节点
-# 生成 Token（Base64 编码）
-# 复制 Token 到中转机
-```
+- 探测成功：使用 nftables DNAT 内核转发。
+- 探测失败或缺少权限：使用 sing-box `direct` 用户态转发。
 
-**支持的落地节点：**
-- VLESS-TCP（第三方适配层）
-- Shadowsocks（第三方适配层）
-- 本地创建的节点
+因此，具备权限的 LXC 和 KVM 可以使用 nftables；常见的无特权 Docker/Podman 会自动降级为 sing-box。规则创建后也可以在菜单中手动切换引擎，切换失败会恢复旧规则。
 
-> 第三方适配层的 Token 会自动使用 `127.0.0.1`
+### 支持能力
 
-#### 2. 中转机配置
+- TCP、UDP、TCP+UDP
+- IPv4、IPv6、域名目标
+- 规则命名、查看、修改、删除、清空
+- 主配置、中转配置、Xray、端口转发和 Hysteria2 跳跃范围的冲突检查
+- nftables 域名目标每 1 分钟检查一次解析结果并更新规则
+- nftables 规则写入独立的 `inet singboxlite` 表，减少对系统其他防火墙规则的干扰
 
-```
-# 选择"进阶功能" → "中转机配置"
-# 选择中转协议（VLESS-Reality/Hysteria2/TUIC）
-# 粘贴落地机 Token
-# 设置监听端口
-# 设置伪装域名/SNI
-# 输入节点名称
-# 生成中转节点分享链接
-```
+sing-box 用户态 UDP 转发的性能通常低于 nftables，但适合没有 netfilter 权限的容器环境。
 
-#### 3. 查看中转路由
+## Xray 节点管理
 
-```
-# 进阶功能 → 查看中转路由
-# 显示所有中转入口→落地出口的映射
-# 显示节点名称和端口信息
-```
+主菜单 `[19]` 进入 Xray 管理；`[16]` 只负责安装/更新 Xray 核心。
 
-#### 4. 修改中转端口
+| 添加菜单 | Xray 协议 | 客户端提示 |
+| ---: | --- | --- |
+| 1 | VLESS + TCP + Reality + Vision | 客户端需支持 Reality/Vision |
+| 2 | VLESS + gRPC + Reality | 客户端需支持 gRPC Reality |
+| 3 | Trojan + XHTTP + Reality | Mihomo/Clash 不支持 XHTTP |
+| 4 | Trojan + gRPC + Reality | 客户端需支持 gRPC Reality |
+| 5 | VLESS + XHTTP + TLS | 面向 Xray 客户端；可用于 CF H2 回源 |
+| 6 | VLESS + gRPC + TLS | 使用 CF 时需开启 gRPC 并正确配置 SSL 模式 |
+| 7 | Trojan + gRPC + TLS | 使用 CF 时需开启 gRPC 并正确配置 SSL 模式 |
+| 8 | Shadowsocks | AES-256-GCM、ChaCha20、SS2022、SS2022 + Padding |
 
-```
-# 进阶功能 → 修改中转路由端口
-# 选择要修改的中转路由
-# 输入新端口
-# 自动更新配置、证书和链接
-```
+Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/etc/sing-box/clash.yaml`。删除和修改节点时只处理归属于目标节点的 YAML 项，避免误删另一核心的同名或相邻配置。
 
-#### 5. 删除中转路由
+## IPv6
 
-```
-# 进阶功能 → 删除中转路由
-# 选择要删除的中转路由
-# 自动清理：inbound、outbound、route、证书、YAML
-```
+- sing-box 和 Xray 入站默认使用 `::` 监听；是否同时接受 IPv4 取决于系统的双栈设置。
+- YAML 中保留 IPv6 原始地址，分享链接中的 IPv6 使用 `[地址]` 格式。
+- 端口转发可识别 IPv4/IPv6 字面量和域名解析结果。
+- 最终可用性仍取决于 VPS 路由、防火墙、容器端口发布、客户端和具体协议实现；不再承诺“所有客户端完美兼容”。
 
----
+## 配置与数据位置
 
-### Xray 管理脚本 (xray_manager.sh)
+| 路径 | 内容 |
+| --- | --- |
+| `/usr/local/bin/sb` | 主脚本快捷命令 |
+| `/usr/local/bin/sing-box` | sing-box 核心 |
+| `/usr/local/bin/xray` | Xray 核心 |
+| `/usr/local/etc/sing-box/config.json` | sing-box 主节点配置 |
+| `/usr/local/etc/sing-box/relay.json` | 中转和用户态端口转发配置 |
+| `/usr/local/etc/sing-box/clash.yaml` | sing-box/Xray 共享客户端配置 |
+| `/usr/local/etc/sing-box/metadata.json` | 主节点元数据和分享链接 |
+| `/usr/local/etc/sing-box/relay.d/` | 中转、端口转发和辅助状态 |
+| `/usr/local/etc/xray/config.json` | Xray 服务端配置 |
+| `/var/log/sing-box.log` | sing-box 日志 |
+| `/var/log/singbox_argo.log` | Argo 日志 |
 
-通过主菜单 **[18] Xray 核心管理** 进入。
+状态文件可能包含 UUID、密码、私钥和分享链接，请不要公开上传服务器上的配置目录。
 
-**功能列表：**
+## 安全与可靠性机制
 
-| 分类 | 编号 | 功能 |
-|------|------|------|
-| **核心管理** | [1] | 安装/更新 Xray-core |
-| | [2] | 启动 Xray |
-| | [3] | 停止 Xray |
-| | [4] | 重启 Xray |
-| | [5] | 查看 Xray 状态 |
-| | [6] | 查看 Xray 日志 |
-| **节点管理** | [7] | 添加节点（8种协议） |
-| | [8] | 查看所有节点 |
-| | [9] | 删除节点（单个/全部） |
-| | [10] | 修改端口 |
-| | [99] | 卸载 Xray |
+- 所有脚本共享同一把状态锁，避免主脚本、中转脚本和 Xray 脚本并发写配置。
+- JSON/YAML 使用同目录临时文件、格式校验和原子替换。
+- 节点创建、删除、端口修改和核心更新在关键失败时执行回滚。
+- sing-box、Xray 和 yq 下载执行来源约束、SHA-256 校验和可执行性检查。
+- 新核心替换前后会检查版本；已有配置存在时还会执行组合配置校验。
+- 敏感配置默认按 root-only 权限保存，临时文件和运行目录会限制权限并清理。
+- 第三方解析器只输出最小允许 schema，中转脚本会再次校验字段和值。
 
-> Xray 节点与 Sing-box 节点共享 `clash.yaml` 配置文件，可在同一订阅中使用。
-> 卸载主脚本时会同步清理 Xray 所有相关文件和服务。
+## 更新日志
 
----
-
-## 🌐 IPv6 支持
-
-脚本完美支持 IPv6 地址：
-
-### 自动处理
-- **YAML 配置**: IPv6 原始格式 (`2001:db8::1`)
-- **节点链接**: IPv6 括号格式 (`[2001:db8::1]`)
-
-### 兼容性
-- ✅ v2rayN
-- ✅ Clash Verge (mihomo)
-- ✅ Shadowrocket
-- ✅ 所有标准客户端
-
-
----
-
-## 📝 更新日志
+以下记录保留项目历次主要修改。早期条目描述的是当时实现；如果与当前功能不同，应以前文的当前支持范围为准。
 
 ### 2025.12.14
-- **更新加入AnyTLS协议，同时支持AnyTLS作为中转入口协议的支持**
-- **修复了一个BUG：生成落地Token时使用搭建节点协议时的IP，不再重新获取**
+
+- 新增 AnyTLS 节点及 AnyTLS 中转入口；修复生成落地 Token 时重新获取 IP，改为保留节点创建时使用的地址。
 
 ### 2026.01.09
-- **对VLESS-WS-TLS和Trojan-WS-TLS节点协议新增了自签证书的搭建，不需要上传域名证书，默认会跳过证书验证，适合快速搭建优选回源节点，具体操作方法相同，都需要去CF绑定域名指向IP**
-- **新增了Argo临时隧道节点的搭建，目前通过128M内存的Debian和Alpine系统测试，能实现singbox和Argo同时运行，仅为测试场景，实际使用预计占用会更高，尽量不要在≤128M内存的机器上使用Argo隧道。**
+
+- VLESS-WS-TLS、Trojan-WS-TLS 新增自签证书部署；加入 Argo 临时隧道，并针对 128 MB Debian/Alpine 做初步低内存适配。
 
 ### 2026.01.13
-- **增加 Hysteria2 端口跳跃功能**：引入应用层多端口监听模式，彻底解决 LXC/NAT 机器无法使用端口跳跃的问题，同时保留对大端口段的 iptables 支持。
-- **优化主脚本&子脚本**：优化交互流程和界面。
+
+- 加入 Hysteria2 端口跳跃和应用层多端口监听，改善 LXC/NAT 环境兼容性；同步优化主脚本与子脚本交互。
 
 ### 2026.01.19
-- **加入定时重启功能**：自动获取服务器当前时间和时区，并显示与北京时间的时差，方便设置定时重启，适合一些需要定时重启singbox的用户
-- ~~**加入快速部署三节点模式**：快速部署三节点适合给一些实例的初始化、新开实例、重装实例使用，会自动部署本脚本，并在SSH登录的时候自动显示三节点的节点链接，端口为随机端口（NAT机器需要自行映射端口）~~
+
+- 加入定时重启和时区提示；曾加入快速三节点部署，后续已于 2026.03.08 移除。
 
 ### 2026.01.25
-- **新增Argo固定隧道**：新加入Argo固定隧道的部署，由于CF在创建固定隧道的时候，所跟随出现的token是显示不完全的，通常需要复制后进行token提取。新增的Argo固定隧道则不需要提取，只需要完整复制粘贴CF创建固定隧道时所给出的任意带有Token的命令即可（不管是Windows或者是debian等），脚本会自动识别隧道Token并自动填入。关于如何创建固定隧道节点，需要自行YouTuBe搜索，部署搭建方式都大同小异。
+
+- 加入 Argo 固定隧道，可直接从 Cloudflare 提供的 Windows/Linux 命令中提取完整 Tunnel Token。
 
 ### 2026.01.27
-- **优化内存回收机制**：优化了跑测速时会出现singbox进程被杀死，目前测试下来内存回收机制还算不错，起码能够顺利跑完测速。
-- **hy2节点协议优化**：hy2节点协议不再需要手动输入上下行的限制，目前写死了10Gbps（也就是10000M），会自动根据机器的带宽进行调整。
-- **AnyTLS协议优化**：优化了AnyTLS协议的填充机制，保证AnyTLS协议的强伪装前提下，降低了不少延迟，提高了不少速度。
+
+- 优化测速时的内存回收，降低 sing-box 被杀死的概率；简化 Hysteria2 带宽参数；调整 AnyTLS Padding 以兼顾伪装和性能。
 
 ### 2026.02.02
-- **节点部署优化**：新增节点部署成功后自动显示节点链接，单节点部署的时候则无需返回主菜单查看节点链接了。
-- **SS节点协议增强**：新增了一个2022-blake3-aes-128-gcm+Padding(数据填充)的部署。
-- **默认伪装域名变更**：由之前的微软域名变更为苹果域名，虽然这两个域名都是很多人在用的，综合下来发现苹果域名要比较实用一些。
+
+- 节点创建成功后直接显示分享链接；当时新增 SS2022 AES-128-GCM + Padding；默认伪装域名由微软域名调整为苹果域名。
 
 ### 2026.02.06
-- **脚本结构重构**：重构之后，目前分为三个脚本，主脚本singbox负责日常搭建节点和singbox底层的运作以及一些基础功能。中转脚本advanced_relay主要负责中转落地节点落地节点Token的生成、第三方节点导入中转等。解析脚本parser主要负责第三方节点链接的解析。
-- **中转脚本优化**：旧中转脚本只支持了Vless+TCP或者Shadowsocks (aes-256-gcm)这两种节点协议，目前新版中转脚本支持了主脚本所搭建的全部节点协议，应对一些特殊场景。**注意**：落地节点仍旧推荐Vless+TCP或者Shadowsocks (aes-256-gcm)这两种，Shadowsocks-2022 (2022-blake3-aes-128-gcm)不建议做落地节点的中转，因为测试过程中发现，落地机使用Shadowsocks-2022 (2022-blake3-aes-128-gcm)需要中转机与落地机之间的时间差，不能超过30秒，也就意味着落地、中转两台机器的时间要一致，故此不推荐使用Shadowsocks-2022 (2022-blake3-aes-128-gcm)作为落地节点。
-- **新增Argo服务状态检测及自定义端口**：主菜单会出现Argo服务状态是否运行中，以便观察Argo节点是否因为服务停止而断连。Argo隧道设置新增自定义端口，回车为随机端口。
+
+- 项目拆分为 `singbox.sh`、`advanced_relay.sh`、`parser.sh`；扩展落地 Token 和第三方节点中转流程；主菜单加入 Argo 状态，Argo 端口支持自定义。
 
 ### 2026.02.15
-- **脚本全面重构**：继上次结构的重构之后，发现脚本还是过于臃肿了一些，现在完成了全面的重构分离，重构版测试了几轮，目前尚未发现BUG，可能还存在深层的BUG或者一些不合理的地方，如有发现可以直接提lssues给我。
-- **新增批量节点部署**：新增加了批量节点协议部署，可自由选择需要批量创建的节点协议，会自动算出所需要的端口数量，端口数量可填写单个、连续的端口。
-- **优化诸多细节**：全新重构版理论上占用会降低了不少，操作上更加顺畅。
+
+- 完成主脚本、中转脚本和解析器的进一步重构；加入批量节点部署、端口数量计算、连续端口输入及冲突检查。
 
 ### 2026.02.21
-- **新增 Xray-core 管理**：新增 `xray_manager.sh` 脚本，通过主菜单 [16] 进入。支持 Xray-core 的一键安装/更新/卸载，以及 8 种 Xray 节点协议的部署管理，Xray 与 Sing-box 双核心共存互不干扰，共享 `clash.yaml` 输出。
-- **主菜单新增服务监控**：主菜单状态栏新增 Xray 服务运行状态和节点数量显示，与 Sing-box 和 Argo 状态并列展示。
-- **新增 CF CDN 回源协议**：新增 VLESS+XHTTP+TLS (H2回源)、VLESS+gRPC+TLS、Trojan+gRPC+TLS 三种支持 Cloudflare CDN 端口回源加速的节点协议，使用自签证书，CF开启gRPC功能及SSL模式设为 Full（完全） 即可。
+
+- 新增 `xray_manager.sh` 和 Xray-core 双核心管理，支持 8 种 Xray 节点；主菜单加入 Xray 状态；增加 XHTTP/gRPC TLS 等 Cloudflare 回源协议。
 
 ### 2026.02.24
-- **中转脚本新增端口转发**：主脚本菜单选择15，进入中转脚本选择8，即可进入端口转发，利用singbox进行端口转发。可选TCP、UDP进行端口转发，落地节点若使用端口转发，建议落地节点为加密节点协议（如：VLESS-Reality、AnyTLS等）。
-- **修复了致命BUG**：先前加入的解析脚本，为了更好的解析导入的第三方节点链接当中的域名类服务器地址，加入了阿里云和CF的DNS，因为默认使用的是阿里云DNS，会导致某些节点协议在singbox核心下，创建后无法连通。现已改用CF的DNS。
+
+- 中转脚本加入 sing-box 用户态端口转发；修复第三方域名节点因默认 DNS 选择造成的连通问题，解析 DNS 改用 Cloudflare。
 
 ### 2026.03.01
-- **singbox核心1.13版本修复**：singbox官方更新了最新版1.13核心，脚本出现了DNS层不匹配的错误，目前已修复DNS层不匹配，做了逃生环境变量。
-- **Alpine系统兼容性修改**：Alpine系统会使用singbox的musl版本，就目前更新来看比较适合Alpine系统。Debian系统则不改变。
-- **版本号的显示**：主菜单会显示singbox和xray两种核心所使用的版本号，更清晰看到目前所使用的版本号，便于排查问题。
-- **端口转发的命名**：现已支持端口转发的规则命名，以便更好做区分。
+
+- 适配 sing-box 1.13 DNS 结构并保留逃生环境变量；Alpine 改用 musl 核心；显示 sing-box/Xray 版本；端口转发规则支持命名。
 
 ### 2026.03.04
-- **Hysteria2节点协议端口跳跃**：此前版本的Hysteria2端口跳跃功能依旧存在问题，本次更新顺带修复了。兼容Docker虚拟化的LXC小鸡以及拥有较为完整权限的LXC使用。
-- **修复转发逻辑**：此前的转发逻辑是只监听IPV4，当IPV4遭到封锁之后，如果本机拥有IPV6的情况下，无法使用IPV6做为入口连接。目前已修复，会默认监听双栈。
-- **Shadowsocks节点协议变动**：singbox和xray同步支持经典SS（aes-256-gcm、chacha20-ietf-poly1305）和SS2022（2022-blake3-aes-256-gcm、2022-blake3-aes-256-gcm (带 Padding)）。singbox核心加入了时间不同步的补丁，如有想使用SS2022节点协议的，建议使用singbox搭建。SS节点的节点链接生成改为Base64编码，兼容性更强一些。
+
+- 修复 Hysteria2 端口跳跃和中转仅监听 IPv4 的问题；sing-box/Xray 统一补充经典 SS、SS2022、Padding 及 Base64 分享链接处理。
 
 ### 2026.03.08
-- **移除快速部署**：快速部署功能已移除，用不上的功能。
-- **核心安装逻辑改动**：此前版本的核心安装逻辑是加载脚本的同时去下载，目前已经改为手动下载，目的是脚本存在双核心管理，如果只是想单独使用其中一个的话，就可以单独安装所需要使用的核心，算是节省一些资源占用。
-- **Argo隧道问题**：此前发现小概率下Argo隧道会出现未触发进程守护机制，目前已修复。
+
+- 移除快速三节点部署；核心改为按需手动安装；修复 Argo 隧道小概率未触发进程守护的问题。
 
 ### 2026.03.24
-- **端口转发紧急修复**：目前端口转发加入了当前系统环境的检测，会自动判定当前系统环境是否为LXC或者KVM。LXC环境下只允许使用TCP转发，原因主要有：1、singbox原生的转发操作，就目前来说还不支持UDP转发，只能使用TCP转发。KVM环境下会使用iptables内核级进行TCP+UDP的转发。有部分LXC机器其实是会检测到iptables存在的，但经过反复测试下来发现，并不能完好的实现TCP或者UDP转发，所以加入了系统环境的检测，待后续研究清楚了，或许会改用iptables。
-- **优化交互操作**：精简了一些没必要的交互操作。
+
+- 当时加入 LXC/KVM 环境识别：LXC 使用 sing-box TCP 转发，KVM 使用 iptables TCP+UDP 转发；同时精简交互流程。该引擎策略后续已被 nftables 能力探测替代。
 
 ### 2026.04.07
-- **iptables端口转发修复**：新增域名类地址的导入，加入了自动巡查转发规则，域名类转发规则多数属于动态IP，每5分钟自动巡查一遍域名类的转发规则，自动同步IP地址给iptables。
-- **新增SS2022+ShadowTLS v3组合协议**：此协议目前无节点链接，故不能生成，但做了引导至clash.yaml配置文件查看。clash类通用，其余客户端需要自行转换。
+
+- iptables 转发加入域名目标和定时解析刷新；新增 SS2022 + ShadowTLS v3 组合，并通过 `clash.yaml` 提供客户端配置。
 
 ### 2026.04.26
-- **端口转发优化**：端口转发已完美实现iptables内核转发和singbox用户态转发，LXC容器、KVM VPS的TCP和UDP转发。
-- **hy2节点协议的端口跳跃**：修复了之前遗留的BUG，现在支持了LXC容器的端口跳跃。
+
+- 完善当时的 iptables 内核转发与 sing-box 用户态转发组合；修复 LXC 环境的 Hysteria2 端口跳跃遗留问题。
 
 ### 2026.05.04
-- **针对Docker/Podman优化**：优化了Podman容器的Alpine、Debian系统的安装流程，自动识别低内存压缩，保证安装顺利。
-- **singbox、Xray安装流程简化**：简化了安装流程，将时间同步拆分到主菜单独立选项[11] 同步系统时间，如果需要使用SS2022节点协议，如果发现搭建出来的节点不通，可以使用此功能进行时间同步。
+
+- 优化 Docker/Podman Alpine、Debian 安装流程和低内存解压；简化 sing-box/Xray 安装流程；将时间同步拆分为主菜单独立功能。
 
 ### 2026.05.24
-- **优化启动流程**：现在只会在首次安装脚本的时候，进行一次性依赖项的安装，并加入依赖项检测。后续通过快捷命令进入不需要再去执行检查，大幅增强启动速度。
-- **节点协议增加**：给Anytls节点协议增加Any-Reality的兼容，适合在v2rayN上使用，mihomo/clash官方文档尚未支持Any-Reality的写法，但自行通过节点链接转换，仍旧能使用，自行测试吧。
+
+- 依赖改为首次安装和缺失时检查，减少重复执行包管理器；AnyTLS 增加 Any-Reality 创建选项。
 
 ### 2026.05.29
-- **端口转发引擎调整**：此前版本所使用的是iptables进行端口转发，发现有时候会出现莫名丢包断流情况，已换成nftables，全面支持LXC容器的alpine和debian系统，Podman容器的Alpine、Debian系统仍然降级为singbox用户态转发。
-- **端口冲突调整**：加入了端口冲突的识别，例如机器中存在hy2协议的端口跳跃，后续任何涉及到的UDP端口都会进行冲突检测，TCP也是如此。
+
+- 端口转发由 iptables 迁移到 nftables；受限 Podman 容器继续使用 sing-box 用户态转发；补充主节点、中转和 Hysteria2 跳跃范围的端口冲突检查。
 
 ### 2026.06.11
-- **Argo隧道节点参数调整**：Argo隧道节点的参数加入了 Early Data 的相关设置
-- **VLESS+gRPC+TLS的加入**：给singbox加入了VLESS+gRPC+TLS协议的创建。
-- **节点链接的完善**：截止当前，由于Xray核心升级，诸如V2rayn等软件同步新版本Xray核心后，部分TLS类节点协议需要加入证书指纹的认证，脚本加入了自签证书的证书指纹（SHA-256）获取，并加入到节点链接中，涉及到TLS类的节点协议，会自动获取自签证书的指纹，加入到节点链接当中，导入V2rayn等软件就可以正常使用。VLESS+WS+TLS、VLESS+gRPC+TLS、Trojan+WS+TLS这三种协议采用了直连节点链接和CF优选的节点链接，根据需要选择复制即可。
+
+- Argo 加入 Early Data；sing-box 新增 VLESS + gRPC + TLS；TLS 节点链接加入自签证书 SHA-256 指纹，并分别输出直连与 Cloudflare 场景链接。
 
 ### 2026.07.27
-- **优化日志问题**：连接日志流目前已加入自动清理机制，避免NAT类机器出现磁盘吃满的情况。
-- **加入DNS设置**：主菜单加入singbox配置文件自定义DNS地址。
+
+- 连接日志加入自动清理，避免小磁盘机器日志占满空间；主菜单加入 sing-box DNS 设置。
+
+### 2026.08
+
+- 增加跨脚本共享锁、原子 JSON/YAML 写入、事务快照和失败回滚；修复 Xray 双栈监听迁移、YAML 精确删除和端口联动更新。
+- 加固核心与工具下载校验、候选配置检查、旧核心回滚，以及 PID、日志、证书、Token、元数据、临时文件和运行目录权限。
+- 完善主节点、中转、Xray、端口转发和 Hysteria2 跳跃范围之间的冲突识别；nftables 域名目标刷新调整为每分钟执行并支持 IPv4/IPv6。
+
+### 2026.08.31
+
+- 修复 128 MB Podman Alpine 安装 sing-box 时可能被 OOM Kill：跳过容器中无效的可选依赖，改为流式下载、校验和解压，并清理中断安装的临时目录。
+- 端口转发改为实际写入测试规则的 nftables 能力探测：LXC/KVM 有权限时使用 nftables，Podman 等受限容器自动降级为 sing-box 用户态转发。
+
+### 2026.09.01
+
+- sing-box 与中转入口统一明确为 `VLESS + TCP + Reality + Vision`，并保留旧内部标签以兼容已有节点。
+- 第三方导入收敛为 VLESS Reality Vision、纯 VLESS TCP、SS AES-128/256-GCM 四个链接选项，以及无认证/带认证两类手动 SOCKS5。
+- VLESS 解析结果显式写入 `network: "tcp"`；中转 schema 同步拒绝缺少 network、非 TCP 传输及不符合所选类型的节点。
