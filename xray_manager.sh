@@ -1,9 +1,10 @@
 #!/bin/bash
+umask 077
 # ============================================================
 # xray_manager.sh — Xray-core 节点管理子脚本
 # 与 singbox.sh 共存，共享 clash.yaml
 # ============================================================
-XRAY_SCRIPT_VERSION="3.0.0"
+XRAY_SCRIPT_VERSION="3.1.0"
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 # --- 路径定义 ---
@@ -11,11 +12,15 @@ XRAY_BIN="/usr/local/bin/xray"
 XRAY_DIR="/usr/local/etc/xray"
 XRAY_CONFIG="${XRAY_DIR}/config.json"
 XRAY_METADATA="${XRAY_DIR}/metadata.json"
+XRAY_RUN_DIR="/run/singboxlite"
+XRAY_PID_FILE="${XRAY_RUN_DIR}/xray.pid"
 
 # 共享路径 (继承自 singbox.sh 或使用默认值)
 SINGBOX_DIR="${SINGBOX_DIR:-/usr/local/etc/sing-box}"
 CLASH_YAML_FILE="${CLASH_YAML_FILE:-${SINGBOX_DIR}/clash.yaml}"
 YQ_BINARY="${YQ_BINARY:-/usr/local/bin/yq}"
+SINGBOXLITE_LOCK_FILE="${SINGBOX_DIR}/.singboxlite.lock"
+XRAY_STATE_LOCK_OWNED=0
 
 # --- 颜色定义 ---
 RED='\033[0;31m'
@@ -32,6 +37,60 @@ if ! declare -f _info >/dev/null 2>&1; then
     _warn()    { echo -e "${YELLOW}[注意] $1${NC}" >&2; }
     _warning() { _warn "$1"; }
 fi
+
+_xray_flock_wait() {
+    local fd="$1" timeout="${2:-30}" attempts i
+    [[ "$fd" =~ ^[0-9]+$ && "$timeout" =~ ^[0-9]+$ ]] || return 1
+    attempts=$((timeout * 10))
+    for ((i = 0; i <= attempts; i++)); do
+        flock -n "$fd" 2>/dev/null && return 0
+        ((i < attempts)) && sleep 0.1
+    done
+    return 1
+}
+
+_acquire_singboxlite_lock() {
+    [ "${SINGBOXLITE_LOCK_HELD:-0}" = "1" ] && return 0
+    mkdir -p "$SINGBOX_DIR"
+    if ! command -v flock >/dev/null 2>&1; then
+        _pkg_install util-linux >/dev/null 2>&1 || true
+    fi
+    if ! command -v flock >/dev/null 2>&1; then
+        _error "系统缺少 flock，无法安全修改共享配置。"
+        return 1
+    fi
+    exec 219>"$SINGBOXLITE_LOCK_FILE" || return 1
+    if ! _xray_flock_wait 219 30; then
+        _error "等待 singboxlite 共享状态锁超时，请稍后重试。"
+        exec 219>&-
+        return 1
+    fi
+    export SINGBOXLITE_LOCK_HELD=1
+    XRAY_STATE_LOCK_OWNED=1
+}
+
+_release_singboxlite_lock() {
+    [ "$XRAY_STATE_LOCK_OWNED" -eq 1 ] || return 0
+    flock -u 219 2>/dev/null || true
+    exec 219>&-
+    XRAY_STATE_LOCK_OWNED=0
+    unset SINGBOXLITE_LOCK_HELD
+}
+
+_with_singboxlite_lock() {
+    local release_after=0 rc
+    if [ "${SINGBOXLITE_LOCK_HELD:-0}" != "1" ]; then
+        _acquire_singboxlite_lock || return 1
+        release_after=1
+    fi
+    "$@"
+    rc=$?
+    [ "$release_after" -eq 1 ] && _release_singboxlite_lock
+    return "$rc"
+}
+
+trap '_release_singboxlite_lock' EXIT
+trap '_release_singboxlite_lock; exit 130' INT TERM
 
 # --- URL 编码 ---
 if ! declare -f _url_encode >/dev/null 2>&1; then
@@ -52,11 +111,6 @@ fi
 if ! declare -f _release_install_cache >/dev/null 2>&1; then
     _release_install_cache() {
         sync 2>/dev/null || true
-        if [ -w /proc/sys/vm/drop_caches ]; then
-            if { echo 1 > /proc/sys/vm/drop_caches; } 2>/dev/null; then
-                _info "已尝试释放安装产生的文件缓存。"
-            fi
-        fi
         return 0
     }
 fi
@@ -102,63 +156,113 @@ if ! declare -f _pkg_install >/dev/null 2>&1; then
     }
 fi
 
-# --- 原子 JSON 修改 ---
-if ! declare -f _atomic_modify_json >/dev/null 2>&1; then
-    _atomic_modify_json() {
-        local file="$1" filter="$2"
-        [ ! -f "$file" ] && return 1
-        local tmp="${file}.tmp"
-        if jq "$filter" "$file" > "$tmp"; then mv "$tmp" "$file"
-        else _error "修改JSON失败: $file"; rm -f "$tmp"; return 1; fi
-    }
-fi
-
-# --- 原子 YAML 修改 ---
-if ! declare -f _atomic_modify_yaml >/dev/null 2>&1; then
-    _atomic_modify_yaml() {
-        local file="$1" filter="$2"
-        [ ! -f "$file" ] && return 1
-        local tmp="${file}.tmp.$$"
-        cp "$file" "$tmp" || return 1
-        if ${YQ_BINARY} eval "$filter" -i "$file" 2>/dev/null; then
-            rm -f "$tmp"
-        else
-            _error "修改YAML失败: $file"
-            mv "$tmp" "$file"
+_ensure_xray_dependencies() {
+    local cmd missing="" lock_pkg="util-linux"
+    for cmd in jq openssl wget unzip flock; do
+        command -v "$cmd" >/dev/null 2>&1 || missing="${missing} ${cmd}"
+    done
+    if [ -n "$missing" ]; then
+        _info "正在补齐 Xray 管理依赖:${missing}"
+        command -v apk >/dev/null 2>&1 && lock_pkg="util-linux-misc"
+        _pkg_install jq openssl wget unzip ca-certificates "$lock_pkg" >/dev/null 2>&1 || true
+        command -v flock >/dev/null 2>&1 || _pkg_install util-linux >/dev/null 2>&1 || true
+    fi
+    for cmd in jq openssl wget unzip flock; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            _error "缺少 Xray 管理依赖: $cmd"
             return 1
         fi
-    }
-fi
+    done
+}
 
-# --- Clash YAML 节点操作 ---
-if ! declare -f _add_node_to_yaml >/dev/null 2>&1; then
-    _add_node_to_yaml() {
-        local proxy_json="$1"
-        local name=$(echo "$proxy_json" | jq -r '.name')
-        local yaml_entry=$(echo "$proxy_json" | ${YQ_BINARY} -P '.')
-        local tmp="${CLASH_YAML_FILE}.tmp.$$"
-        cp "$CLASH_YAML_FILE" "$tmp" || return 1
-        if ! echo "$yaml_entry" | ${YQ_BINARY} eval -i ".proxies += [load(\"/dev/stdin\")]" "$CLASH_YAML_FILE" 2>/dev/null; then
-            if ! ${YQ_BINARY} eval -i ".proxies += [$(echo "$proxy_json" | ${YQ_BINARY} -P '.')]" "$CLASH_YAML_FILE" 2>/dev/null; then
-                _error "添加 YAML 节点失败: $name"
-                mv "$tmp" "$CLASH_YAML_FILE"
-                return 1
-            fi
+# --- Xray 专用原子 JSON 修改 ---
+_xray_atomic_modify_json() {
+        local file="$1" filter="$2"
+        [ ! -f "$file" ] && return 1
+        local tmp
+        # Xray 新版本会按文件扩展名识别配置格式；候选配置必须保留 .json 后缀。
+        tmp=$(mktemp "${file}.tmp.XXXXXX.json") || return 1
+        if ! jq "$filter" "$file" > "$tmp" || ! jq empty "$tmp" >/dev/null 2>&1; then
+            _error "修改JSON失败: $file"
+            rm -f -- "$tmp"
+            return 1
         fi
-        rm -f "$tmp"
-        export NODE_NAME="$name"
-        _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxy-groups[] | select(.name == "节点选择") | .proxies) += [env(NODE_NAME)]'
-    }
-fi
+        if [ "$file" = "$XRAY_CONFIG" ] && [ -x "$XRAY_BIN" ] && \
+           ! "$XRAY_BIN" run -test -config "$tmp" >/dev/null 2>&1; then
+            _error "Xray 配置校验失败，原配置保持不变。"
+            rm -f -- "$tmp"
+            return 1
+        fi
+        chmod 600 "$tmp"
+        mv -f -- "$tmp" "$file"
+}
 
-if ! declare -f _remove_node_from_yaml >/dev/null 2>&1; then
-    _remove_node_from_yaml() {
-        local name="$1"
+# --- Xray 专用原子 YAML 修改 ---
+_xray_atomic_modify_yaml() {
+        local file="$1" filter="$2"
+        [ ! -f "$file" ] && return 1
+        local tmp
+        tmp=$(mktemp "${file}.tmp.XXXXXX") || return 1
+        if ${YQ_BINARY} eval "$filter" "$file" > "$tmp" 2>/dev/null; then
+            chmod 600 "$tmp"
+            mv -f -- "$tmp" "$file"
+        else
+            _error "修改YAML失败: $file"
+            rm -f -- "$tmp"
+            return 1
+        fi
+}
+
+# --- Clash YAML 节点操作（使用 Xray 专用实现，避免继承父脚本的宽泛删除） ---
+_xray_add_node_to_yaml() {
+        local proxy_json="$1"
+        local name proxy_file
+        name=$(echo "$proxy_json" | jq -er '.name | select(type == "string" and length > 0)') || return 1
+        [ -f "$CLASH_YAML_FILE" ] || { _error "共享 clash.yaml 不存在。"; return 1; }
+        export XRAY_NODE_NAME="$name"
+        if ${YQ_BINARY} eval -e '.proxies[]? | select(.name == env(XRAY_NODE_NAME))' "$CLASH_YAML_FILE" >/dev/null 2>&1; then
+            _error "节点名称 [$name] 已存在，请使用唯一名称。"
+            return 1
+        fi
+        proxy_file=$(mktemp "${XRAY_DIR}/.proxy.XXXXXX") || return 1
+        if ! printf '%s\n' "$proxy_json" | ${YQ_BINARY} -P > "$proxy_file"; then
+            rm -f -- "$proxy_file"
+            return 1
+        fi
+        export XRAY_PROXY_FILE="$proxy_file"
+        if ! ${YQ_BINARY} eval -e '.proxy-groups[]? | select(.name == "节点选择")' "$CLASH_YAML_FILE" >/dev/null 2>&1; then
+            _xray_atomic_modify_yaml "$CLASH_YAML_FILE" \
+                '.proxy-groups = ((.proxy-groups // []) + [{"name":"节点选择","type":"select","proxies":[]}])' || {
+                rm -f -- "$proxy_file"
+                return 1
+            }
+        fi
+        if ! _xray_atomic_modify_yaml "$CLASH_YAML_FILE" '
+            .proxies = ((.proxies // []) + [load(env(XRAY_PROXY_FILE))]) |
+            (.proxy-groups[] | select(.name == "节点选择") | .proxies) =
+              (((.proxy-groups[] | select(.name == "节点选择") | .proxies) // []) + [env(XRAY_NODE_NAME)] | unique)'; then
+            rm -f -- "$proxy_file"
+            return 1
+        fi
+        rm -f -- "$proxy_file"
+}
+
+_xray_remove_node_from_yaml() {
+        local name="$1" port="${2:-}"
+        [ -f "$CLASH_YAML_FILE" ] || return 0
         export DEL_NAME="$name"
-        _atomic_modify_yaml "$CLASH_YAML_FILE" 'del(.proxies[] | select(.name == env(DEL_NAME)))'
-        _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxy-groups[].proxies) -= [env(DEL_NAME)]'
-    }
-fi
+        export DEL_PORT="$port"
+        if [ -n "$port" ]; then
+            _xray_atomic_modify_yaml "$CLASH_YAML_FILE" \
+                'del(.proxies[]? | select(.name == env(DEL_NAME) and ((.port | tostring) == env(DEL_PORT))))' || return 1
+        else
+            _xray_atomic_modify_yaml "$CLASH_YAML_FILE" \
+                'del(.proxies[]? | select(.name == env(DEL_NAME)))' || return 1
+        fi
+        if ! ${YQ_BINARY} eval -e '.proxies[]? | select(.name == env(DEL_NAME))' "$CLASH_YAML_FILE" >/dev/null 2>&1; then
+            _xray_atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxy-groups[]?.proxies) -= [env(DEL_NAME)]' || return 1
+        fi
+}
 
 if ! declare -f _find_proxy_name >/dev/null 2>&1; then
     _find_proxy_name() {
@@ -168,7 +272,7 @@ if ! declare -f _find_proxy_name >/dev/null 2>&1; then
 fi
 
 # --- 端口冲突检测 (跨双核心) ---
-_check_port_occupied() {
+_xray_check_port_occupied() {
     local port="$1"
     if command -v ss &>/dev/null; then
         ss -tlnp 2>/dev/null | grep -q ":${port} " && return 0
@@ -179,7 +283,7 @@ _check_port_occupied() {
     return 1
 }
 
-_is_pid_running_cmd() {
+_xray_is_pid_running_cmd() {
     local pid="$1"
     local pattern="$2"
     [ -n "$pid" ] || return 1
@@ -191,19 +295,19 @@ _is_pid_running_cmd() {
     fi
 }
 
-_is_pid_file_running_cmd() {
+_xray_is_pid_file_running_cmd() {
     local pid_file="$1"
     local pattern="$2"
     local pid
     [ -s "$pid_file" ] || return 1
     pid=$(cat "$pid_file" 2>/dev/null)
-    _is_pid_running_cmd "$pid" "$pattern"
+    _xray_is_pid_running_cmd "$pid" "$pattern"
 }
 
 _check_xray_port_conflict() {
     local port="$1" protocol="${2:-tcp}"
     # 检查系统端口
-    if _check_port_occupied "$port"; then
+    if _xray_check_port_occupied "$port"; then
         _error "端口 $port 已被系统占用！"
         return 0
     fi
@@ -218,6 +322,25 @@ _check_xray_port_conflict() {
         _error "端口 $port 已被 sing-box 节点使用！"
         return 0
     fi
+    local relay_config="${SINGBOX_DIR}/relay.json"
+    if [ -f "$relay_config" ] && jq -e ".inbounds[]? | select(.listen_port == $port)" "$relay_config" >/dev/null 2>&1; then
+        _error "端口 $port 已被中转或 sing-box 端口转发使用！"
+        return 0
+    fi
+    local pf_meta="${SINGBOX_DIR}/relay_pf.json"
+    if [ -f "$pf_meta" ] && jq -e --arg p "$port" 'has($p)' "$pf_meta" >/dev/null 2>&1; then
+        _error "端口 $port 已被端口转发规则使用！"
+        return 0
+    fi
+    local relay_links="${SINGBOX_DIR}/relay_links.json"
+    if [ -f "$relay_links" ] && jq -e --argjson p "$port" '
+        to_entries[]? | .value.port_hopping? as $r |
+        select(($r // "") | test("^[0-9]+-[0-9]+$")) |
+        ($r | split("-") | map(tonumber)) as $b |
+        select($p >= $b[0] and $p <= $b[1])' "$relay_links" >/dev/null 2>&1; then
+        _error "端口 $port 落在已有 Hysteria2 跳跃范围内！"
+        return 0
+    fi
     return 1
 }
 
@@ -225,8 +348,8 @@ _check_xray_port_conflict() {
 if ! declare -f _get_public_ip >/dev/null 2>&1; then
     _get_public_ip() {
         [ -n "$server_ip" ] && [ "$server_ip" != "null" ] && { echo "$server_ip"; return; }
-        local ip=$(timeout 5 curl -s4 --max-time 2 icanhazip.com 2>/dev/null || timeout 5 curl -s4 --max-time 2 ipinfo.io/ip 2>/dev/null)
-        [ -z "$ip" ] && ip=$(timeout 5 curl -s6 --max-time 2 icanhazip.com 2>/dev/null)
+        local ip=$(timeout 5 curl -fsS4 --max-time 2 https://icanhazip.com 2>/dev/null || timeout 5 curl -fsS4 --max-time 2 https://ipinfo.io/ip 2>/dev/null)
+        [ -z "$ip" ] && ip=$(timeout 5 curl -fsS6 --max-time 2 https://icanhazip.com 2>/dev/null)
         server_ip="$ip"
         echo "$ip"
     }
@@ -243,7 +366,8 @@ _generate_xray_cert() {
         _error "证书生成失败！"
         return 1
     fi
-    chmod 644 "$cert_path" "$key_path"
+    chmod 644 "$cert_path"
+    chmod 600 "$key_path"
     _success "证书已生成。"
 }
 
@@ -263,13 +387,19 @@ _install_xray() {
         x86_64|amd64)  xray_arch="64" ;;
         aarch64|arm64) xray_arch="arm64-v8a" ;;
         armv7l)        xray_arch="arm32-v7a" ;;
-        *)             xray_arch="64" ;;
+        *)
+            _error "不支持的 CPU 架构: $arch"
+            return 1
+            ;;
     esac
     
     local zip_name="Xray-linux-${xray_arch}.zip"
     local download_url="https://github.com/XTLS/Xray-core/releases/latest/download/${zip_name}"
-    local tmp_dir=$(mktemp -d)
+    local tmp_dir
+    mkdir -p /var/tmp || { _error "无法创建安装临时目录。"; return 1; }
+    tmp_dir=$(mktemp -d /var/tmp/.xray-install.XXXXXX) || { _error "无法创建安装临时目录。"; return 1; }
     local tmp_zip="${tmp_dir}/xray.zip"
+    local tmp_digest="${tmp_dir}/xray.zip.dgst"
     
     _info "下载地址: ${download_url}"
     if ! wget -qO "$tmp_zip" "$download_url"; then
@@ -278,15 +408,69 @@ _install_xray() {
         return 1
     fi
 
-    if ! unzip -qo "$tmp_zip" -d "$tmp_dir"; then
+    if ! wget -qO "$tmp_digest" "${download_url}.dgst"; then
+        _error "Xray 官方摘要下载失败，拒绝安装未经校验的核心。"
+        rm -rf -- "$tmp_dir"
+        return 1
+    fi
+    local expected_sha256 actual_sha256
+    expected_sha256=$(awk 'tolower($0) ~ /sha.*256/ {print tolower($NF); exit}' "$tmp_digest" | tr -cd '0-9a-f')
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual_sha256=$(sha256sum "$tmp_zip" | awk '{print tolower($1)}')
+    else
+        actual_sha256=$(openssl dgst -sha256 "$tmp_zip" | awk '{print tolower($NF)}')
+    fi
+    if [ "${#expected_sha256}" -ne 64 ] || [ "$actual_sha256" != "$expected_sha256" ]; then
+        _error "Xray 下载包 SHA-256 校验失败，拒绝安装。"
+        rm -rf -- "$tmp_dir"
+        return 1
+    fi
+
+    # 只提取运行所需的三个文件，避免完整展开压缩包中的额外资产。
+    # 尤其在 128MB 容器中，完整解压后再复制核心会造成明显的页缓存峰值。
+    if ! unzip -tq "$tmp_zip" >/dev/null 2>&1 || ! unzip -p "$tmp_zip" xray > "${tmp_dir}/xray"; then
         _error "Xray 解压失败！"
         rm -rf "$tmp_dir"
         return 1
     fi
+    local geodata_file
+    for geodata_file in geoip.dat geosite.dat; do
+        if unzip -p "$tmp_zip" "$geodata_file" > "${tmp_dir}/${geodata_file}" 2>/dev/null; then
+            chmod 600 "${tmp_dir}/${geodata_file}" 2>/dev/null || true
+        else
+            rm -f -- "${tmp_dir}/${geodata_file}"
+        fi
+    done
     
-    # 安装二进制
-    mv "${tmp_dir}/xray" "$XRAY_BIN"
-    chmod +x "$XRAY_BIN"
+    if [ ! -f "${tmp_dir}/xray" ]; then
+        _error "下载包中缺少 Xray 二进制。"
+        rm -rf -- "$tmp_dir"
+        return 1
+    fi
+    chmod 755 "${tmp_dir}/xray"
+    if ! "${tmp_dir}/xray" version >/dev/null 2>&1; then
+        _error "下载的 Xray 二进制无法执行，拒绝替换。"
+        rm -rf -- "$tmp_dir"
+        return 1
+    fi
+
+    # 验证成功后再原子替换，并保留可回滚副本。
+    local previous_bin="${tmp_dir}/xray.previous"
+    [ -f "$XRAY_BIN" ] && cp -p "$XRAY_BIN" "$previous_bin"
+    local staged_bin="${XRAY_BIN}.new.$$"
+    rm -f -- "$staged_bin"
+    mv -f -- "${tmp_dir}/xray" "$staged_bin" && chmod 755 "$staged_bin" || { rm -f -- "$staged_bin"; rm -rf -- "$tmp_dir"; return 1; }
+    mv -f -- "$staged_bin" "$XRAY_BIN"
+    if ! "$XRAY_BIN" version >/dev/null 2>&1; then
+        _error "新核心验证失败，正在恢复旧版本。"
+        if [ -f "$previous_bin" ]; then
+            install -m 755 "$previous_bin" "$XRAY_BIN"
+        else
+            rm -f -- "$XRAY_BIN"
+        fi
+        rm -rf -- "$tmp_dir"
+        return 1
+    fi
     
     # 安装 geodata
     mkdir -p "$XRAY_DIR"
@@ -326,9 +510,13 @@ _create_xray_openrc_service() {
 description="Xray Service"
 command="${XRAY_BIN}"
 command_args="run -c ${XRAY_CONFIG}"
-pidfile="/run/xray.pid"
+pidfile="${XRAY_PID_FILE}"
 command_background=true
 supervisor=supervise-daemon
+
+start_pre() {
+    checkpath --directory --mode 0700 "${XRAY_RUN_DIR}"
+}
 EOF
     chmod +x /etc/init.d/xray
     rc-update add xray default 2>/dev/null
@@ -340,34 +528,53 @@ _create_xray_service() {
     elif [ "$INIT_SYSTEM" == "openrc" ]; then
         [ -f /etc/init.d/xray ] || _create_xray_openrc_service
     elif [ "$INIT_SYSTEM" == "direct" ]; then
+        mkdir -p "$XRAY_RUN_DIR"
+        chmod 700 "$XRAY_RUN_DIR"
         touch /var/log/xray.log 2>/dev/null || true
+        chmod 600 /var/log/xray.log 2>/dev/null || true
     fi
+}
+
+_validate_xray_config() {
+    [ -f "$XRAY_CONFIG" ] || { _error "Xray 配置不存在。"; return 1; }
+    jq empty "$XRAY_CONFIG" >/dev/null 2>&1 || { _error "Xray 配置不是有效 JSON。"; return 1; }
+    [ -x "$XRAY_BIN" ] || return 0
+    "$XRAY_BIN" run -test -config "$XRAY_CONFIG" >/dev/null 2>&1 || {
+        _error "Xray 配置校验失败。"
+        return 1
+    }
 }
 
 _manage_xray_service() {
     local action="$1"
+    if [[ "$action" == "start" || "$action" == "restart" ]]; then
+        _validate_xray_config || return 1
+    fi
+    local rc=0
     if [ "$INIT_SYSTEM" == "systemd" ]; then
-        systemctl "$action" xray 2>/dev/null
+        systemctl "$action" xray 2>/dev/null || rc=$?
     elif [ "$INIT_SYSTEM" == "openrc" ]; then
-        rc-service xray "$action" 2>/dev/null
+        rc-service xray "$action" 2>/dev/null || rc=$?
     elif [ "$INIT_SYSTEM" == "direct" ]; then
-        local pid_file="/tmp/xray.pid"
+        local pid_file="$XRAY_PID_FILE"
         local log_file="/var/log/xray.log"
         case "$action" in
             start)
-                if _is_pid_file_running_cmd "$pid_file" "$XRAY_BIN"; then
+                if _xray_is_pid_file_running_cmd "$pid_file" "$XRAY_BIN"; then
                     :
                 else
                     rm -f "$pid_file"
                     nohup "$XRAY_BIN" run -c "$XRAY_CONFIG" >> "$log_file" 2>&1 &
                     echo $! > "$pid_file"
+                    sleep 1
+                    _xray_is_pid_file_running_cmd "$pid_file" "$XRAY_BIN" || rc=1
                 fi
                 ;;
             stop)
                 if [ -s "$pid_file" ]; then
                     local pid
                     pid=$(cat "$pid_file" 2>/dev/null)
-                    if _is_pid_running_cmd "$pid" "$XRAY_BIN"; then
+                    if _xray_is_pid_running_cmd "$pid" "$XRAY_BIN"; then
                         kill "$pid" 2>/dev/null
                     fi
                 fi
@@ -376,10 +583,10 @@ _manage_xray_service() {
             restart)
                 _manage_xray_service stop
                 sleep 1
-                _manage_xray_service start
+                _manage_xray_service start || rc=$?
                 ;;
             status)
-                if _is_pid_file_running_cmd "$pid_file" "$XRAY_BIN"; then
+                if _xray_is_pid_file_running_cmd "$pid_file" "$XRAY_BIN"; then
                     _success "Xray direct 后台模式运行中 (PID: $(cat "$pid_file"))"
                     return 0
                 fi
@@ -388,6 +595,10 @@ _manage_xray_service() {
                 return 1
                 ;;
         esac
+    fi
+    if [ "$rc" -ne 0 ]; then
+        _error "Xray 服务操作失败: $action"
+        return "$rc"
     fi
     case "$action" in
         start)   _success "Xray 服务已启动。" ;;
@@ -430,25 +641,87 @@ EOF
         _success "Xray 配置文件已初始化。"
     fi
     [ -f "$XRAY_METADATA" ] || echo '{}' > "$XRAY_METADATA"
+    chmod 700 "$XRAY_DIR"
+    chmod 600 "$XRAY_CONFIG" "$XRAY_METADATA" 2>/dev/null || true
+    local sensitive_file
+    for sensitive_file in "$XRAY_DIR"/*.key; do [ -f "$sensitive_file" ] && chmod 600 "$sensitive_file"; done
+    for sensitive_file in "$XRAY_DIR"/*.pem; do [ -f "$sensitive_file" ] && chmod 644 "$sensitive_file"; done
+    return 0
 }
 
 _check_and_fix_xray_listen() {
     [ -f "$XRAY_CONFIG" ] || return 1
     if jq -e '.inbounds[]? | select(.listen == "0.0.0.0")' "$XRAY_CONFIG" >/dev/null 2>&1; then
-        if _atomic_modify_json "$XRAY_CONFIG" '(.inbounds[]? | select(.listen == "0.0.0.0") | .listen) = "::"'; then
+        if _xray_atomic_modify_json "$XRAY_CONFIG" '(.inbounds[]? | select(.listen == "0.0.0.0") | .listen) = "::"'; then
             _success "已将既有 Xray 入站监听从 0.0.0.0 升级为 ::，支持 IPv4/IPv6 双栈。"
             return 0
         fi
+        return 2
     fi
+    return 1
+}
+
+XRAY_TX_DIR=""
+_xray_snapshot_state() {
+    XRAY_TX_DIR=$(mktemp -d "${TMPDIR:-/tmp}/singboxlite-xray.XXXXXX") || return 1
+    mkdir -p "$XRAY_TX_DIR/certs"
+    if [ -f "$XRAY_CONFIG" ]; then cp -p "$XRAY_CONFIG" "$XRAY_TX_DIR/config.json" && : > "$XRAY_TX_DIR/config.present"; fi
+    if [ -f "$XRAY_METADATA" ]; then cp -p "$XRAY_METADATA" "$XRAY_TX_DIR/metadata.json" && : > "$XRAY_TX_DIR/metadata.present"; fi
+    if [ -f "$CLASH_YAML_FILE" ]; then cp -p "$CLASH_YAML_FILE" "$XRAY_TX_DIR/clash.yaml" && : > "$XRAY_TX_DIR/clash.present"; fi
+    local file
+    for file in "$XRAY_DIR"/*.pem "$XRAY_DIR"/*.key; do
+        [ -f "$file" ] && cp -p "$file" "$XRAY_TX_DIR/certs/"
+    done
+    return 0
+}
+
+_xray_restore_state() {
+    local snapshot="$1" file
+    [ -d "$snapshot" ] || return 1
+    if [ -f "$snapshot/config.present" ]; then cp -p "$snapshot/config.json" "$XRAY_CONFIG"; else rm -f -- "$XRAY_CONFIG"; fi
+    if [ -f "$snapshot/metadata.present" ]; then cp -p "$snapshot/metadata.json" "$XRAY_METADATA"; else rm -f -- "$XRAY_METADATA"; fi
+    if [ -f "$snapshot/clash.present" ]; then cp -p "$snapshot/clash.yaml" "$CLASH_YAML_FILE"; fi
+    for file in "$XRAY_DIR"/*.pem "$XRAY_DIR"/*.key; do
+        [ -f "$file" ] && rm -f -- "$file"
+    done
+    for file in "$snapshot/certs"/*.pem "$snapshot/certs"/*.key; do
+        [ -f "$file" ] && cp -p "$file" "$XRAY_DIR/"
+    done
+    chmod 600 "$XRAY_CONFIG" "$XRAY_METADATA" "$CLASH_YAML_FILE" 2>/dev/null || true
+    return 0
+}
+
+_xray_drop_snapshot() {
+    local snapshot="$1"
+    case "$snapshot" in
+        "${TMPDIR:-/tmp}"/singboxlite-xray.*) [ -d "$snapshot" ] && rm -rf -- "$snapshot" ;;
+    esac
+}
+
+_run_xray_transaction() {
+    local operation="$1"
+    shift
+    _xray_snapshot_state || { _error "无法创建变更快照。"; return 1; }
+    local snapshot="$XRAY_TX_DIR"
+    if "$operation" "$@" && _validate_xray_config && _manage_xray_service restart; then
+        _xray_drop_snapshot "$snapshot"
+        return 0
+    fi
+    _error "Xray 变更失败，正在恢复配置、元数据、证书和 Clash 条目。"
+    _xray_restore_state "$snapshot"
+    _manage_xray_service restart >/dev/null 2>&1 || true
+    _xray_drop_snapshot "$snapshot"
     return 1
 }
 
 _view_xray_log() {
     if [ "$INIT_SYSTEM" == "systemd" ]; then
         journalctl -u xray -n 50 --no-pager -f
-    else
+    elif [ "$INIT_SYSTEM" == "openrc" ]; then
         _warn "OpenRC 环境下请查看 /var/log/messages"
         tail -f /var/log/messages 2>/dev/null | grep -i xray
+    else
+        tail -n 50 -f /var/log/xray.log 2>/dev/null
     fi
 }
 
@@ -469,7 +742,8 @@ _uninstall_xray() {
         local tags=$(jq -r 'keys[]' "$XRAY_METADATA" 2>/dev/null)
         for tag in $tags; do
             local node_name=$(jq -r ".\"$tag\".name // empty" "$XRAY_METADATA" 2>/dev/null)
-            [ -n "$node_name" ] && [ "$node_name" != "null" ] && _remove_node_from_yaml "$node_name"
+            local node_port=$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag == $t) | .port' "$XRAY_CONFIG" 2>/dev/null)
+            [ -n "$node_name" ] && [ "$node_name" != "null" ] && _xray_remove_node_from_yaml "$node_name" "$node_port"
         done
     fi
     
@@ -551,20 +825,31 @@ _save_xray_meta() {
     shift 3
     
     # 先构建基础 JSON
-    local tmp="${XRAY_METADATA}.tmp.$$"
-    jq --arg t "$tag" --arg n "$name" --arg l "$link" \
-        '. + {($t): {name: $n, share_link: $l}}' "$XRAY_METADATA" > "$tmp" 2>/dev/null && \
-        mv "$tmp" "$XRAY_METADATA" || { rm -f "$tmp"; return 1; }
+    local tmp
+    tmp=$(mktemp "${XRAY_METADATA}.tmp.XXXXXX") || return 1
+    if ! jq --arg t "$tag" --arg n "$name" --arg l "$link" \
+        '. + {($t): {name: $n, share_link: $l}}' "$XRAY_METADATA" > "$tmp" 2>/dev/null; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    chmod 600 "$tmp"
+    mv -f -- "$tmp" "$XRAY_METADATA"
     
     # 追加额外的键值对
     for pair in "$@"; do
         local key="${pair%%=*}"
         local val="${pair#*=}"
         if [ -n "$key" ] && [ -n "$val" ]; then
-            local tmp2="${XRAY_METADATA}.tmp.$$"
-            jq --arg t "$tag" --arg k "$key" --arg v "$val" \
-                '.[$t][$k] = $v' "$XRAY_METADATA" > "$tmp2" 2>/dev/null && \
-                mv "$tmp2" "$XRAY_METADATA" || rm -f "$tmp2"
+            local tmp2
+            tmp2=$(mktemp "${XRAY_METADATA}.tmp.XXXXXX") || return 1
+            if jq --arg t "$tag" --arg k "$key" --arg v "$val" \
+                '.[$t][$k] = $v' "$XRAY_METADATA" > "$tmp2" 2>/dev/null; then
+                chmod 600 "$tmp2"
+                mv -f -- "$tmp2" "$XRAY_METADATA"
+            else
+                rm -f -- "$tmp2"
+                return 1
+            fi
         fi
     done
 }
@@ -614,19 +899,19 @@ _add_vless_reality_vision() {
             "streamSettings": $stream
         }')
     
-    _atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
+    _xray_atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
     
     # Clash YAML
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --argjson p "$port" --arg u "$uuid" \
         --arg sn "$sni" --arg pk "$REALITY_PUBLIC_KEY" --arg sid "$REALITY_SHORT_ID" --arg f "$flow" \
         '{name:$n, type:"vless", server:$s, port:$p, uuid:$u, flow:$f, tls:true, servername:$sn,
           "reality-opts":{"public-key":$pk, "short-id":$sid}, "client-fingerprint":"chrome", network:"tcp"}')
-    _add_node_to_yaml "$proxy_json"
+    _xray_add_node_to_yaml "$proxy_json" || return 1
     
     # 分享链接
     local link="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=none&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&fp=chrome&type=tcp&flow=${flow}&sni=${sni}&sid=${REALITY_SHORT_ID}#$(_url_encode "$name")"
     
-    _save_xray_meta "$tag" "$name" "$link" "publicKey=$REALITY_PUBLIC_KEY" "shortId=$REALITY_SHORT_ID"
+    _save_xray_meta "$tag" "$name" "$link" "publicKey=$REALITY_PUBLIC_KEY" "shortId=$REALITY_SHORT_ID" || return 1
     
     _success "VLESS+Reality+Vision 节点 [${name}] 添加成功！"
     echo -e "  ${YELLOW}分享链接:${NC} ${link}"
@@ -671,18 +956,18 @@ _add_vless_grpc_reality() {
           settings:{clients:[{id:$uuid, flow:""}], decryption:"none"},
           streamSettings:$stream}')
     
-    _atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
+    _xray_atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
     
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --argjson p "$port" --arg u "$uuid" \
         --arg sn "$sni" --arg pk "$REALITY_PUBLIC_KEY" --arg sid "$REALITY_SHORT_ID" --arg svc "$service_name" \
         '{name:$n, type:"vless", server:$s, port:$p, uuid:$u, tls:true, servername:$sn,
           "reality-opts":{"public-key":$pk, "short-id":$sid}, "client-fingerprint":"chrome",
           network:"grpc", "grpc-opts":{"grpc-service-name":$svc}}')
-    _add_node_to_yaml "$proxy_json"
+    _xray_add_node_to_yaml "$proxy_json" || return 1
     
     local link="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=none&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&fp=chrome&type=grpc&serviceName=${service_name}&authority=${sni}&sni=${sni}&sid=${REALITY_SHORT_ID}#$(_url_encode "$name")"
     
-    _save_xray_meta "$tag" "$name" "$link" "publicKey=$REALITY_PUBLIC_KEY" "shortId=$REALITY_SHORT_ID"
+    _save_xray_meta "$tag" "$name" "$link" "publicKey=$REALITY_PUBLIC_KEY" "shortId=$REALITY_SHORT_ID" || return 1
     
     _success "VLESS+gRPC+Reality 节点 [${name}] 添加成功！"
     echo -e "  ${YELLOW}分享链接:${NC} ${link}"
@@ -726,14 +1011,14 @@ _add_trojan_xhttp_reality() {
           settings:{clients:[{password:$pw}]},
           streamSettings:$stream}')
     
-    _atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
+    _xray_atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
     
     # Clash YAML - mihomo 不支持 xhttp 传输层，跳过写入
     _warn "mihomo/Clash 不支持 XHTTP 传输层，此节点仅支持 V2rayN/Xray 客户端"
     
     local link="trojan://${password}@${link_ip}:${port}?security=reality&type=xhttp&path=$(_url_encode "$path")&sni=${sni}&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&fp=chrome&sid=${REALITY_SHORT_ID}#$(_url_encode "$name")"
     
-    _save_xray_meta "$tag" "$name" "$link" "publicKey=$REALITY_PUBLIC_KEY" "shortId=$REALITY_SHORT_ID"
+    _save_xray_meta "$tag" "$name" "$link" "publicKey=$REALITY_PUBLIC_KEY" "shortId=$REALITY_SHORT_ID" || return 1
     
     _success "Trojan+XHTTP+Reality 节点 [${name}] 添加成功！"
     echo -e "  ${YELLOW}分享链接:${NC} ${link}"
@@ -777,7 +1062,7 @@ _add_trojan_grpc_reality() {
           settings:{clients:[{password:$pw}]},
           streamSettings:$stream}')
     
-    _atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
+    _xray_atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
     
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --argjson p "$port" --arg pw "$password" \
         --arg sn "$sni" --arg pk "$REALITY_PUBLIC_KEY" --arg sid "$REALITY_SHORT_ID" --arg svc "$service_name" \
@@ -785,11 +1070,11 @@ _add_trojan_grpc_reality() {
           sni:$sn, "skip-cert-verify":false,
           "reality-opts":{"public-key":$pk, "short-id":$sid}, "client-fingerprint":"chrome",
           network:"grpc", "grpc-opts":{"grpc-service-name":$svc}}')
-    _add_node_to_yaml "$proxy_json"
+    _xray_add_node_to_yaml "$proxy_json" || return 1
     
     local link="trojan://${password}@${link_ip}:${port}?security=reality&type=grpc&serviceName=${service_name}&authority=${sni}&sni=${sni}&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&fp=chrome&sid=${REALITY_SHORT_ID}#$(_url_encode "$name")"
     
-    _save_xray_meta "$tag" "$name" "$link" "publicKey=$REALITY_PUBLIC_KEY" "shortId=$REALITY_SHORT_ID"
+    _save_xray_meta "$tag" "$name" "$link" "publicKey=$REALITY_PUBLIC_KEY" "shortId=$REALITY_SHORT_ID" || return 1
     
     _success "Trojan+gRPC+Reality 节点 [${name}] 添加成功！"
     echo -e "  ${YELLOW}分享链接:${NC} ${link}"
@@ -872,7 +1157,7 @@ _add_shadowsocks_xray() {
             }
         }')
     
-    _atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
+    _xray_atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
     
     local proxy_json=""
     if [ "$use_multiplex" == "true" ]; then
@@ -882,12 +1167,12 @@ _add_shadowsocks_xray() {
         proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --argjson p "$port" --arg m "$method" --arg pw "$password" \
             '{name:$n, type:"ss", server:$s, port:$p, cipher:$m, password:$pw}')
     fi
-    _add_node_to_yaml "$proxy_json"
+    _xray_add_node_to_yaml "$proxy_json" || return 1
     
     local ss_user_info=$(_ss_base64_encode "${method}:${password}")
     local link="ss://${ss_user_info}@${link_ip}:${port}#$(_url_encode "$name")"
     
-    _save_xray_meta "$tag" "$name" "$link"
+    _save_xray_meta "$tag" "$name" "$link" || return 1
     
     _success "Shadowsocks (${method}) 节点 [${name}] 添加成功！"
     echo -e "  ${YELLOW}分享链接:${NC} ${link}"
@@ -959,7 +1244,7 @@ _add_vless_h2_tls() {
             }
         }')
     
-    _atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
+    _xray_atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
     
     # Clash YAML - mihomo 不支持 XHTTP，跳过写入
     _warn "mihomo/Clash 不支持 XHTTP 传输层，此节点仅支持 V2rayN/Xray 客户端"
@@ -969,7 +1254,7 @@ _add_vless_h2_tls() {
     [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
     local link="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&sni=${sni}&alpn=h2&type=xhttp&mode=stream-one&path=$(_url_encode "$path")&host=${sni}${insecure_param}#$(_url_encode "$name")"
     
-    _save_xray_meta "$tag" "$name" "$link"
+    _save_xray_meta "$tag" "$name" "$link" || return 1
     
     _info "此节点支持 CF CDN 回源 (SSL模式设为 Full)"
     _success "VLESS+H2+TLS 节点 [${name}] 添加成功！"
@@ -986,7 +1271,7 @@ _add_vless_h2_tls() {
 #         7. VLESS + gRPC + TLS (支持CF回源)
 # ============================================================
 
-_add_vless_grpc_tls() {
+_add_xray_vless_grpc_tls() {
     [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
     local node_ip="$server_ip"
     
@@ -1039,21 +1324,21 @@ _add_vless_grpc_tls() {
             }
         }')
     
-    _atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
+    _xray_atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
     
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --argjson p "$port" --arg u "$uuid" \
         --arg sn "$sni" --arg svc "$service_name" \
         '{name:$n, type:"vless", server:$s, port:$p, uuid:$u, tls:true, servername:$sn,
           "skip-cert-verify":true, network:"grpc",
           "grpc-opts":{"grpc-service-name":$svc}}')
-    _add_node_to_yaml "$proxy_json"
+    _xray_add_node_to_yaml "$proxy_json" || return 1
     
     local cert_pcs=$(_cert_sha256_hex "$cert_path")
     local insecure_param="&insecure=1"
     [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
     local link="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&sni=${sni}&type=grpc&serviceName=${service_name}&authority=${sni}${insecure_param}#$(_url_encode "$name")"
     
-    _save_xray_meta "$tag" "$name" "$link"
+    _save_xray_meta "$tag" "$name" "$link" || return 1
     
     _info "此节点支持 CF CDN 回源 (需在CF开启gRPC支持, SSL模式设为 Full)"
     _success "VLESS+gRPC+TLS 节点 [${name}] 添加成功！"
@@ -1122,21 +1407,21 @@ _add_trojan_grpc_tls() {
             }
         }')
     
-    _atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
+    _xray_atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
     
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --argjson p "$port" --arg pw "$password" \
         --arg sn "$sni" --arg svc "$service_name" \
         '{name:$n, type:"trojan", server:$s, port:$p, password:$pw, udp:true,
           sni:$sn, "skip-cert-verify":true, network:"grpc",
           "grpc-opts":{"grpc-service-name":$svc}}')
-    _add_node_to_yaml "$proxy_json"
+    _xray_add_node_to_yaml "$proxy_json" || return 1
     
     local cert_pcs=$(_cert_sha256_hex "$cert_path")
     local insecure_param="&insecure=1"
     [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
     local link="trojan://${password}@${link_ip}:${port}?security=tls&type=grpc&serviceName=${service_name}&authority=${sni}&sni=${sni}${insecure_param}#$(_url_encode "$name")"
     
-    _save_xray_meta "$tag" "$name" "$link"
+    _save_xray_meta "$tag" "$name" "$link" || return 1
     
     _info "此节点支持 CF CDN 回源 (需在CF开启gRPC支持, SSL模式设为 Full)"
     _success "Trojan+gRPC+TLS 节点 [${name}] 添加成功！"
@@ -1225,13 +1510,24 @@ _delete_xray_node() {
     fi
     local target_tag="${tags[$((choice-1))]}"
     local target_name="${names[$((choice-1))]}"
+    local target_port="${ports[$((choice-1))]}"
     read -p "$(echo -e ${RED}"确定删除 [$target_name]? (y/N): "${NC})" confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { _info "已取消。"; return; }
-    [ -n "$target_name" ] && [ "$target_name" != "null" ] && _remove_node_from_yaml "$target_name"
-    rm -f "${XRAY_DIR}/${target_tag}.pem" "${XRAY_DIR}/${target_tag}.key" 2>/dev/null
-    _atomic_modify_json "$XRAY_CONFIG" "del(.inbounds[] | select(.tag == \"$target_tag\"))"
-    _atomic_modify_json "$XRAY_METADATA" "del(.\"$target_tag\")" 2>/dev/null
-    _manage_xray_service "restart"
+    _xray_snapshot_state || { _error "无法创建变更快照。"; return 1; }
+    local snapshot="$XRAY_TX_DIR"
+    if { [ -z "$target_name" ] || [ "$target_name" = "null" ] || _xray_remove_node_from_yaml "$target_name" "$target_port"; } && \
+       _xray_atomic_modify_json "$XRAY_CONFIG" "del(.inbounds[] | select(.tag == \"$target_tag\"))" && \
+       _xray_atomic_modify_json "$XRAY_METADATA" "del(.\"$target_tag\")" && \
+       _manage_xray_service restart; then
+        rm -f -- "${XRAY_DIR}/${target_tag}.pem" "${XRAY_DIR}/${target_tag}.key"
+        _xray_drop_snapshot "$snapshot"
+    else
+        _error "删除失败，正在恢复原状态。"
+        _xray_restore_state "$snapshot"
+        _manage_xray_service restart >/dev/null 2>&1 || true
+        _xray_drop_snapshot "$snapshot"
+        return 1
+    fi
     _success "节点 [$target_name] 已删除！"
 }
 
@@ -1242,16 +1538,27 @@ _delete_all_xray_nodes() {
     local count=$(jq '.inbounds | length' "$XRAY_CONFIG")
     read -p "$(echo -e ${RED}"确定删除全部 ${count} 个节点? (y/N): "${NC})" confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { _info "已取消。"; return; }
-    # 从 clash.yaml 中移除所有节点
-    local tags=$(jq -r '.inbounds[].tag' "$XRAY_CONFIG" 2>/dev/null)
-    for tag in $tags; do
-        local name=$(jq -r ".\"$tag\".name // empty" "$XRAY_METADATA" 2>/dev/null)
-        [ -n "$name" ] && _remove_node_from_yaml "$name"
-        rm -f "${XRAY_DIR}/${tag}.pem" "${XRAY_DIR}/${tag}.key" 2>/dev/null
-    done
-    _atomic_modify_json "$XRAY_CONFIG" '.inbounds = []'
-    echo '{}' > "$XRAY_METADATA"
-    _manage_xray_service "restart"
+    _xray_snapshot_state || { _error "无法创建变更快照。"; return 1; }
+    local snapshot="$XRAY_TX_DIR" cleanup_ok=1 tag name port
+    while IFS=$'\t' read -r tag port name; do
+        if [ -n "$name" ] && ! _xray_remove_node_from_yaml "$name" "$port"; then cleanup_ok=0; fi
+    done < <(jq -r --slurpfile meta "$XRAY_METADATA" '
+        .inbounds[] | [.tag, (.port|tostring), ($meta[0][.tag].name // .tag)] | @tsv' "$XRAY_CONFIG" 2>/dev/null)
+    if [ "$cleanup_ok" -eq 1 ] && \
+       _xray_atomic_modify_json "$XRAY_CONFIG" '.inbounds = []' && \
+       _xray_atomic_modify_json "$XRAY_METADATA" '{} ' && \
+       _manage_xray_service restart; then
+        for tag in $(jq -r '.inbounds[].tag' "$snapshot/config.json" 2>/dev/null); do
+            rm -f -- "${XRAY_DIR}/${tag}.pem" "${XRAY_DIR}/${tag}.key"
+        done
+        _xray_drop_snapshot "$snapshot"
+    else
+        _error "批量删除失败，正在恢复原状态。"
+        _xray_restore_state "$snapshot"
+        _manage_xray_service restart >/dev/null 2>&1 || true
+        _xray_drop_snapshot "$snapshot"
+        return 1
+    fi
     _success "全部 ${count} 个节点已删除！"
 }
 
@@ -1291,44 +1598,41 @@ _modify_xray_port() {
     _info "当前端口: ${old_port}"
     local new_port=$(_input_port)
     
-    # 计算新的 tag 和名称
-    local new_tag=$(echo "$target_tag" | sed "s/${old_port}/${new_port}/g")
+    # tag 保持稳定，避免证书路径与元数据键随端口改名后失配。
     local new_name=$(echo "$target_name" | sed "s/${old_port}/${new_port}/g")
-    
-    # 1. 更新 config.json: 端口 + tag
-    _atomic_modify_json "$XRAY_CONFIG" "(.inbounds[] | select(.tag == \"$target_tag\") | .port) = $new_port"
-    _atomic_modify_json "$XRAY_CONFIG" "(.inbounds[] | select(.tag == \"$target_tag\") | .tag) = \"$new_tag\""
-    
-    # 2. 更新 clash.yaml: 端口 + 名称
-    if [ -n "$target_name" ] && [ "$target_name" != "null" ]; then
-        export MOD_NAME="$target_name"
-        _atomic_modify_yaml "$CLASH_YAML_FILE" "(.proxies[] | select(.name == env(MOD_NAME)) | .port) = $new_port"
-        if [ "$new_name" != "$target_name" ]; then
-            export NEW_NAME="$new_name"
-            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(MOD_NAME)) | .name) = env(NEW_NAME)'
-            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxy-groups[].proxies[] | select(. == env(MOD_NAME))) = env(NEW_NAME)'
-        fi
-    fi
-    
-    # 3. 更新 metadata: tag键名 + 名称 + 分享链接
-    local old_link=$(jq -r ".\"$target_tag\".share_link // empty" "$XRAY_METADATA" 2>/dev/null)
+    local old_link=$(jq -r --arg t "$target_tag" '.[$t].share_link // empty' "$XRAY_METADATA" 2>/dev/null)
     local new_link=""
     if [ -n "$old_link" ]; then
         new_link=$(echo "$old_link" | sed -E "s/(:${old_port})([?&#\/]|$)/:${new_port}\2/g; s/(-${old_port})([?&#\/]|$)/-${new_port}\2/g; s/#[^#]*$/#$(_url_encode "$new_name")/g")
     fi
-    # 用新 tag 作为 key，删除旧 key
-    local tmp="${XRAY_METADATA}.tmp.$$"
-    if [ -n "$new_link" ]; then
-        jq --arg ot "$target_tag" --arg nt "$new_tag" --arg n "$new_name" --arg l "$new_link" \
-            '. + {($nt): (.[$ot] + {name: $n, share_link: $l})} | del(.[$ot])' "$XRAY_METADATA" > "$tmp" 2>/dev/null && \
-            mv "$tmp" "$XRAY_METADATA" || rm -f "$tmp"
-    else
-        jq --arg ot "$target_tag" --arg nt "$new_tag" --arg n "$new_name" \
-            '. + {($nt): (.[$ot] + {name: $n})} | del(.[$ot])' "$XRAY_METADATA" > "$tmp" 2>/dev/null && \
-            mv "$tmp" "$XRAY_METADATA" || rm -f "$tmp"
+    _xray_snapshot_state || { _error "无法创建变更快照。"; return 1; }
+    local snapshot="$XRAY_TX_DIR" change_ok=1
+    _xray_atomic_modify_json "$XRAY_CONFIG" "(.inbounds[] | select(.tag == \"$target_tag\") | .port) = $new_port" || change_ok=0
+    if [ "$change_ok" -eq 1 ] && [ -n "$target_name" ] && [ "$target_name" != "null" ] && [ -f "$CLASH_YAML_FILE" ]; then
+        export MOD_NAME="$target_name" MOD_PORT="$old_port" NEW_NAME="$new_name" NEW_PORT="$new_port"
+        _xray_atomic_modify_yaml "$CLASH_YAML_FILE" '
+            (.proxies[]? | select(.name == env(MOD_NAME) and ((.port | tostring) == env(MOD_PORT))) | .port) = (env(NEW_PORT) | tonumber) |
+            (.proxies[]? | select(.name == env(MOD_NAME) and ((.port | tostring) == env(NEW_PORT))) | .name) = env(NEW_NAME) |
+            (.proxy-groups[]?.proxies[] | select(. == env(MOD_NAME))) = env(NEW_NAME)' || change_ok=0
     fi
-    
-    _manage_xray_service "restart"
+    if [ "$change_ok" -eq 1 ]; then
+        local meta_tmp
+        meta_tmp=$(mktemp "${XRAY_METADATA}.tmp.XXXXXX") || change_ok=0
+        if [ "$change_ok" -eq 1 ]; then
+            jq --arg t "$target_tag" --arg n "$new_name" --arg l "$new_link" \
+                '.[$t].name = $n | if $l != "" then .[$t].share_link = $l else . end' \
+                "$XRAY_METADATA" > "$meta_tmp" 2>/dev/null || change_ok=0
+            if [ "$change_ok" -eq 1 ]; then chmod 600 "$meta_tmp"; mv -f -- "$meta_tmp" "$XRAY_METADATA"; else rm -f -- "$meta_tmp"; fi
+        fi
+    fi
+    if [ "$change_ok" -ne 1 ] || ! _manage_xray_service restart; then
+        _error "修改端口失败，正在恢复原状态。"
+        _xray_restore_state "$snapshot"
+        _manage_xray_service restart >/dev/null 2>&1 || true
+        _xray_drop_snapshot "$snapshot"
+        return 1
+    fi
+    _xray_drop_snapshot "$snapshot"
     _success "节点 [$new_name] 端口已改为 ${new_port}！"
 }
 
@@ -1361,14 +1665,14 @@ _xray_add_node_menu() {
             read -p "按回车键返回..."; continue
         fi
         case $choice in
-            1) _add_vless_reality_vision && _manage_xray_service "restart" ;;
-            2) _add_vless_grpc_reality && _manage_xray_service "restart" ;;
-            3) _add_trojan_xhttp_reality && _manage_xray_service "restart" ;;
-            4) _add_trojan_grpc_reality && _manage_xray_service "restart" ;;
-            5) _add_vless_h2_tls && _manage_xray_service "restart" ;;
-            6) _add_vless_grpc_tls && _manage_xray_service "restart" ;;
-            7) _add_trojan_grpc_tls && _manage_xray_service "restart" ;;
-            8) _add_shadowsocks_xray && _manage_xray_service "restart" ;;
+            1) _with_singboxlite_lock _run_xray_transaction _add_vless_reality_vision ;;
+            2) _with_singboxlite_lock _run_xray_transaction _add_vless_grpc_reality ;;
+            3) _with_singboxlite_lock _run_xray_transaction _add_trojan_xhttp_reality ;;
+            4) _with_singboxlite_lock _run_xray_transaction _add_trojan_grpc_reality ;;
+            5) _with_singboxlite_lock _run_xray_transaction _add_vless_h2_tls ;;
+            6) _with_singboxlite_lock _run_xray_transaction _add_xray_vless_grpc_tls ;;
+            7) _with_singboxlite_lock _run_xray_transaction _add_trojan_grpc_tls ;;
+            8) _with_singboxlite_lock _run_xray_transaction _add_shadowsocks_xray ;;
             0) return ;;
             *) _error "无效输入" ;;
         esac
@@ -1376,17 +1680,36 @@ _xray_add_node_menu() {
     done
 }
 
+_initialize_xray_runtime() {
+    local listen_fix_status
+    _init_xray_config || return 1
+    _create_xray_service || return 1
+    _check_and_fix_xray_listen
+    listen_fix_status=$?
+    if [ "$listen_fix_status" -eq 0 ]; then
+        _manage_xray_service "restart" || return 1
+    elif [ "$listen_fix_status" -gt 1 ]; then
+        return 1
+    fi
+    return 0
+}
+
 _xray_menu() {
-    # 全局前置检查：Xray 核心必须已安装
+    if [ "$(id -u)" -ne 0 ]; then
+        _error "Xray 管理需要 root 权限。"
+        return 1
+    fi
+    _ensure_xray_dependencies || return 1
+    # 独立运行时也允许安装核心，不再依赖主脚本的隐藏入口。
     if [ ! -f "$XRAY_BIN" ]; then
-        _error "Xray 核心未安装！请返回主菜单，通过【核心管理】-> [14] 进行安装。"
-        read -p "按回车键返回..."
-        return
+        _warn "Xray 核心尚未安装。"
+        read -p "是否现在安装? (y/N): " install_choice
+        if [[ "$install_choice" != "y" && "$install_choice" != "Y" ]]; then
+            return
+        fi
+        _with_singboxlite_lock _install_xray || return 1
     fi
-    _init_xray_config
-    if _check_and_fix_xray_listen; then
-        _manage_xray_service "restart"
-    fi
+    _with_singboxlite_lock _initialize_xray_runtime || return 1
 
     while true; do
         clear
@@ -1401,7 +1724,7 @@ _xray_menu() {
             elif [ "$INIT_SYSTEM" == "openrc" ]; then
                 rc-service xray status >/dev/null 2>&1 && xray_status="${GREEN}运行中${NC} (v${xray_ver})" || xray_status="${YELLOW}已停止${NC} (v${xray_ver})"
             else
-                _is_pid_file_running_cmd /tmp/xray.pid "$XRAY_BIN" && xray_status="${GREEN}运行中${NC} (v${xray_ver})" || xray_status="${YELLOW}已停止${NC} (v${xray_ver})"
+                _xray_is_pid_file_running_cmd "$XRAY_PID_FILE" "$XRAY_BIN" && xray_status="${GREEN}运行中${NC} (v${xray_ver})" || xray_status="${YELLOW}已停止${NC} (v${xray_ver})"
             fi
         fi
         local node_count=$(jq '.inbounds | length' "$XRAY_CONFIG" 2>/dev/null || echo "0")
@@ -1432,9 +1755,9 @@ _xray_menu() {
             5) _view_xray_log ;;
             6) _xray_add_node_menu ;;
             7) _view_xray_nodes; read -p "按回车键继续..." ;;
-            8) _delete_xray_node; read -p "按回车键继续..." ;;
-            9) _modify_xray_port; read -p "按回车键继续..." ;;
-            99) _uninstall_xray; read -p "按回车键继续..." ;;
+            8) _with_singboxlite_lock _delete_xray_node; read -p "按回车键继续..." ;;
+            9) _with_singboxlite_lock _modify_xray_port; read -p "按回车键继续..." ;;
+            99) _with_singboxlite_lock _uninstall_xray; read -p "按回车键继续..." ;;
             0) return ;;
             *) _error "无效输入"; read -p "按回车键继续..." ;;
         esac

@@ -1,337 +1,486 @@
 #!/bin/bash
 
-# 核心环境定义
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-SINGBOX_DIR="/usr/local/etc/sing-box"
+# 第三方落地节点的严格解析器。
+# 正常调用方式：printf '%s\n' "$link" | bash parser.sh MODE
+# 第二个参数仅保留给测试使用，生产调用不要把凭据放入进程参数。
 
-# [整合方案] 解析器核心解码函数 (独立实现，不依赖外部)
-_url_decode() {
-    local data="${1//+/ }"
-    printf '%b' "${data//%/\\x}"
+umask 077
+export LC_ALL=C
+
+DECODED_VALUE=""
+NORMALIZED_PORT=""
+GROUP_COUNT=0
+PARSED_SERVER=""
+PARSED_PORT=""
+VLESS_UUID=""
+VLESS_SERVER=""
+VLESS_PORT=""
+LINK_INPUT=""
+
+declare -A QUERY_PARAMS=()
+declare -A QUERY_PRESENT=()
+
+_json_escape() {
+    local escaped
+    escaped="$1"
+    escaped="${escaped//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+    escaped="${escaped//$'\r'/\\r}"
+    escaped="${escaped//$'\n'/\\n}"
+    escaped="${escaped//$'\t'/\\t}"
+    printf '%s' "$escaped"
 }
 
-if ! command -v jq &>/dev/null; then
-    echo '{"error": "缺少 jq 依赖"}'
+_fatal() {
+    local message escaped
+    message="$1"
+    escaped=$(_json_escape "$message")
+    printf '{"error":"%s"}\n' "$escaped"
     exit 1
-fi
+}
 
-# 解析器使用的 URL 解码统一由主脚本或独立实现提供
-_decode() { _url_decode "$1"; }
+_url_decode() {
+    local input plus_as_space decoded char hex
+    input="$1"
+    plus_as_space="${2:-0}"
+    decoded=""
 
-_get_param() {
-    local params="$1"
-    local key="$2"
-    local pair
-    params="${params#\?}"
-    IFS='&' read -ra _param_pairs <<< "$params"
-    for pair in "${_param_pairs[@]}"; do
-        if [[ "$pair" == "$key="* ]]; then
-            _url_decode "${pair#*=}"
-            return
-        fi
+    while [[ -n "$input" ]]; do
+        char="${input:0:1}"
+        case "$char" in
+            '%')
+                (( ${#input} >= 3 )) || return 1
+                hex="${input:1:2}"
+                [[ "$hex" =~ ^[0-9A-Fa-f]{2}$ ]] || return 1
+                [[ "$hex" != "00" ]] || return 1
+                printf -v char '%b' "\\x${hex}"
+                decoded+="$char"
+                input="${input:3}"
+                ;;
+            '+')
+                if [[ "$plus_as_space" == "1" ]]; then
+                    decoded+=' '
+                else
+                    decoded+='+'
+                fi
+                input="${input:1}"
+                ;;
+            *)
+                decoded+="$char"
+                input="${input:1}"
+                ;;
+        esac
+    done
+
+    DECODED_VALUE="$decoded"
+}
+
+_decode_base64_urlsafe() {
+    local input normalized core padding existing_padding needed_padding decoded
+    input="$1"
+    [[ -n "$input" ]] || return 1
+    [[ "$input" =~ ^[A-Za-z0-9+/_-]+={0,2}$ ]] || return 1
+
+    normalized="${input//-/+}"
+    normalized="${normalized//_/\/}"
+    core="${normalized%%=*}"
+    padding="${normalized:${#core}}"
+    existing_padding=${#padding}
+
+    case $(( ${#core} % 4 )) in
+        0) needed_padding=0 ;;
+        2) needed_padding=2 ;;
+        3) needed_padding=1 ;;
+        *) return 1 ;;
+    esac
+
+    if (( existing_padding != 0 && existing_padding != needed_padding )); then
+        return 1
+    fi
+
+    normalized="$core"
+    while (( ${#normalized} % 4 != 0 )); do
+        normalized+='='
+    done
+
+    if ! decoded=$(printf '%s' "$normalized" | base64 -d 2>/dev/null); then
+        return 1
+    fi
+    [[ -n "$decoded" ]] || return 1
+    [[ "$decoded" != *$'\r'* && "$decoded" != *$'\n'* ]] || return 1
+    DECODED_VALUE="$decoded"
+}
+
+_normalize_port() {
+    local raw value
+    raw="$1"
+    [[ "$raw" =~ ^[0-9]+$ ]] || return 1
+    (( ${#raw} <= 5 )) || return 1
+    value=$((10#$raw))
+    (( value >= 1 && value <= 65535 )) || return 1
+    NORMALIZED_PORT="$value"
+}
+
+_validate_ipv4() {
+    local address octet value
+    local -a octets
+    address="$1"
+    [[ "$address" != .* && "$address" != *. && "$address" != *..* ]] || return 1
+    IFS='.' read -r -a octets <<< "$address"
+    (( ${#octets[@]} == 4 )) || return 1
+
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+        value=$((10#$octet))
+        (( value <= 255 )) || return 1
     done
 }
 
-_strip_ipv6_brackets() {
-    local host="$1"
-    if [[ "$host" =~ ^\[(.*)\]$ ]]; then
-        host="${BASH_REMATCH[1]}"
+_count_ipv6_groups() {
+    local part group
+    local -a groups
+    part="$1"
+    GROUP_COUNT=0
+    [[ -n "$part" ]] || return 0
+    [[ "$part" != :* && "$part" != *: ]] || return 1
+    IFS=':' read -r -a groups <<< "$part"
+    for group in "${groups[@]}"; do
+        [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    done
+    GROUP_COUNT=${#groups[@]}
+}
+
+_validate_ipv6() {
+    local address ipv4_tail prefix left right after_first
+    local left_count right_count
+    address="$1"
+    [[ "$address" == *:* ]] || return 1
+    [[ "$address" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+
+    if [[ "$address" == *.* ]]; then
+        ipv4_tail="${address##*:}"
+        _validate_ipv4 "$ipv4_tail" || return 1
+        prefix="${address%:*}"
+        address="${prefix}:0:0"
     fi
-    echo "$host"
+
+    if [[ "$address" == *::* ]]; then
+        after_first="${address#*::}"
+        [[ "$after_first" != *::* ]] || return 1
+        left="${address%%::*}"
+        right="$after_first"
+        _count_ipv6_groups "$left" || return 1
+        left_count=$GROUP_COUNT
+        _count_ipv6_groups "$right" || return 1
+        right_count=$GROUP_COUNT
+        (( left_count + right_count < 8 )) || return 1
+    else
+        [[ "$address" != :* && "$address" != *: ]] || return 1
+        _count_ipv6_groups "$address" || return 1
+        (( GROUP_COUNT == 8 )) || return 1
+    fi
+}
+
+_validate_hostname() {
+    local hostname label
+    local -a labels
+    hostname="$1"
+    (( ${#hostname} >= 1 && ${#hostname} <= 253 )) || return 1
+    [[ "$hostname" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    [[ "$hostname" != .* && "$hostname" != *. && "$hostname" != *..* ]] || return 1
+
+    IFS='.' read -r -a labels <<< "$hostname"
+    for label in "${labels[@]}"; do
+        (( ${#label} >= 1 && ${#label} <= 63 )) || return 1
+        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+}
+
+_validate_server() {
+    local server
+    server="$1"
+    [[ -n "$server" ]] || return 1
+    [[ "$server" != *[$'\t\r\n /?#@']* ]] || return 1
+
+    if [[ "$server" == *:* ]]; then
+        _validate_ipv6 "$server"
+    elif [[ "$server" =~ ^[0-9.]+$ && "$server" == *.* ]]; then
+        _validate_ipv4 "$server"
+    else
+        _validate_hostname "$server"
+    fi
 }
 
 _split_host_port() {
-    local input="$1"
-    local host=""
-    local port=""
+    local endpoint
+    endpoint="$1"
+    PARSED_SERVER=""
+    PARSED_PORT=""
 
-    input="${input%%\?*}"
-
-    if [[ "$input" =~ ^(\[[^]]+\]):([0-9]+)$ ]]; then
-        host="${BASH_REMATCH[1]}"
-        port="${BASH_REMATCH[2]}"
-    elif [[ "$input" =~ ^([^:]+):([0-9]+)$ ]]; then
-        host="${BASH_REMATCH[1]}"
-        port="${BASH_REMATCH[2]}"
+    if [[ "$endpoint" =~ ^\[([^][]+)\]:([0-9]+)$ ]]; then
+        PARSED_SERVER="${BASH_REMATCH[1]}"
+        PARSED_PORT="${BASH_REMATCH[2]}"
+    elif [[ "$endpoint" =~ ^([^:]+):([0-9]+)$ ]]; then
+        PARSED_SERVER="${BASH_REMATCH[1]}"
+        PARSED_PORT="${BASH_REMATCH[2]}"
     else
         return 1
     fi
 
-    host=$(_strip_ipv6_brackets "$host")
-    printf '%s\t%s\n' "$host" "$port"
+    _validate_server "$PARSED_SERVER" || return 1
+    _normalize_port "$PARSED_PORT" || return 1
+    PARSED_PORT="$NORMALIZED_PORT"
 }
 
-# 安全、无依赖地解码 URL Safe Base64 并且自动补齐 Padding
-_decode_base64_urlsafe() {
-    local input="$1"
-    # 去除多余的换行符和无效空格
-    input=$(echo -n "$input" | tr -d ' \n\r')
-    
-    # 纯 Shell 环境下将 URL-Safe 字符 (- 和 _) 转为标准 Base64 字符 (+ 和 /)
-    local safe_str=$(echo -n "$input" | tr -- '-_' '+/')
-    
-    # 智能探测和补全丢失的等于号 (Padding)
-    local pad=$(( 4 - (${#safe_str} % 4) ))
-    if [ "$pad" -ne 4 ]; then
-        local _i=0
-        while [ $_i -lt $pad ]; do safe_str+="="; _i=$((_i+1)); done
-    fi
-    
-    # 交给原生系统做安全的标准解码
-    echo -n "$safe_str" | base64 -d 2>/dev/null
-}
+_parse_query() {
+    local query pair raw_key raw_value key value
+    local -a pairs
+    query="$1"
+    QUERY_PARAMS=()
+    QUERY_PRESENT=()
+    [[ -n "$query" ]] || return 0
 
-
-# 解析 VLESS
-_parse_vless() {
-    local link="$1"
-    local host_regex='(\[[^]]+\]|[^:/?#]+)'
-    local regex="vless://([^@]+)@${host_regex}:([0-9]+)\??([^#]*)#?(.*)"
-    if [[ $link =~ $regex ]]; then
-        local uuid="${BASH_REMATCH[1]}"
-        local server=$(_strip_ipv6_brackets "${BASH_REMATCH[2]}")
-        local port="${BASH_REMATCH[3]}"
-        local params="${BASH_REMATCH[4]}"
-        local name=$(_decode "${BASH_REMATCH[5]}")
-
-        local flow=$(_get_param "$params" "flow")
-        local security=$(_get_param "$params" "security")
-        local sni=$(_get_param "$params" "sni")
-        [ -z "$sni" ] && sni=$(_get_param "$params" "servername")
-        local pbk=$(_get_param "$params" "pbk")
-        local sid=$(_get_param "$params" "sid")
-        local fp=$(_get_param "$params" "fp")
-        local type=$(_get_param "$params" "type")
-        local path=$(_get_param "$params" "path")
-        local host=$(_get_param "$params" "host")
-        local insecure=$(_get_param "$params" "insecure")
-        [ -z "$insecure" ] && insecure=$(_get_param "$params" "allowInsecure")
-
-        local outbound=$(jq -n \
-            --arg type "vless" \
-            --arg tag "proxy" \
-            --arg server "$server" \
-            --argjson port "$port" \
-            --arg uuid "$uuid" \
-            --arg flow "${flow:-""}" \
-            '{type:$type, tag:$tag, server:$server, server_port:$port, uuid:$uuid, flow:$flow}')
-
-        [ "$type" == "ws" ] && outbound=$(echo "$outbound" | jq --arg path "${path:-"/"}" --arg host "$host" '.transport = {type:"ws", path:$path, headers:{Host:$host}}')
-        
-        local target_sni="${sni:-$host}"
-        target_sni="${target_sni:-$server}"
-        
-        if [ "$security" == "reality" ]; then
-            outbound=$(echo "$outbound" | jq --arg sni "$target_sni" --arg pbk "$pbk" --arg sid "$sid" --arg fp "${fp:-"chrome"}" \
-                '.tls = {enabled:true, server_name:$sni, reality:{enabled:true, public_key:$pbk, short_id:$sid}, utls:{enabled:true, fingerprint:$fp}}')
-        elif [ "$security" == "tls" ]; then
-            local is_insecure="false"
-            [[ "$insecure" == "1" || "$insecure" == "true" ]] && is_insecure="true"
-            outbound=$(echo "$outbound" | jq --arg sni "$target_sni" --arg fp "${fp:-"chrome"}" --argjson ins "$is_insecure" \
-                '.tls = {enabled:true, server_name:$sni, utls:{enabled:true, fingerprint:$fp}, insecure:$ins}')
-        fi
-        echo "$outbound"
-    fi
-}
-
-# 解析 VMess
-_parse_vmess() {
-    local link="${1#vmess://}"
-    local decoded=$(_decode_base64_urlsafe "$link")
-    [ -z "$decoded" ] && { echo '{"error": "Base64解码失败"}'; return; }
-    
-    local server=$(echo "$decoded" | jq -r '.add')
-    server=$(_strip_ipv6_brackets "$server")
-    local port=$(echo "$decoded" | jq -r '.port')
-    local uuid=$(echo "$decoded" | jq -r '.id')
-    local net=$(echo "$decoded" | jq -r '.net // "tcp"')
-    local tls=$(echo "$decoded" | jq -r '.tls // ""')
-    local path=$(echo "$decoded" | jq -r '.path // "/"')
-    local host=$(echo "$decoded" | jq -r '.host // ""')
-    local sni=$(echo "$decoded" | jq -r '.sni // ""')
-
-    local outbound=$(jq -n --arg s "$server" --argjson p "$port" --arg u "$uuid" \
-        '{type:"vmess", tag:"proxy", server:$s, server_port:$p, uuid:$u, security:"auto"}')
-
-    local target_sni="${sni:-$host}"
-    target_sni="${target_sni:-$server}"
-
-    [ "$tls" == "tls" ] && outbound=$(echo "$outbound" | jq --arg sni "$target_sni" '.tls = {enabled:true, server_name:$sni}')
-    [ "$net" == "ws" ] && outbound=$(echo "$outbound" | jq --arg path "$path" --arg host "$host" '.transport = {type:"ws", path:$path, headers:{Host:$host}}')
-    
-    echo "$outbound"
-}
-
-# 解析 Trojan
-_parse_trojan() {
-    local link="$1"
-    local host_regex='(\[[^]]+\]|[^:/?#]+)'
-    local regex="trojan://([^@]+)@${host_regex}:([0-9]+)\??([^#]*)#?(.*)"
-    if [[ $link =~ $regex ]]; then
-        local password="${BASH_REMATCH[1]}"
-        local server=$(_strip_ipv6_brackets "${BASH_REMATCH[2]}")
-        local port="${BASH_REMATCH[3]}"
-        local params="${BASH_REMATCH[4]}"
-        local name=$(_decode "${BASH_REMATCH[5]}")
-
-        local sni=$(_get_param "$params" "sni")
-        local type=$(_get_param "$params" "type")
-        local path=$(_get_param "$params" "path")
-        local host=$(_get_param "$params" "host")
-        local insecure=$(_get_param "$params" "insecure")
-        [ -z "$insecure" ] && insecure=$(_get_param "$params" "allowInsecure")
-
-        local outbound=$(jq -n --arg s "$server" --argjson p "$port" --arg pw "$password" \
-            '{type:"trojan", tag:"proxy", server:$s, server_port:$p, password:$pw}')
-
-        [ "$type" == "ws" ] && outbound=$(echo "$outbound" | jq --arg path "${path:-"/"}" --arg host "$host" '.transport = {type:"ws", path:$path, headers:{Host:$host}}')
-        
-        local target_sni="${sni:-$host}"
-        target_sni="${target_sni:-$server}"
-        
-        local is_insecure="false"
-        [[ "$insecure" == "1" || "$insecure" == "true" ]] && is_insecure="true"
-        outbound=$(echo "$outbound" | jq --arg sni "$target_sni" --argjson ins "$is_insecure" '.tls = {enabled:true, server_name:$sni, insecure:$ins}')
-        
-        echo "$outbound"
-    fi
-}
-
-# 解析 Shadowsocks
-_parse_ss() {
-    local link="$1"
-    local body="${link#ss://}"
-    [[ "$body" == *"#"* ]] && body="${body%#*}"
-    
-    local method_pass server_port
-    if [[ "$body" == *"@"* ]]; then
-        local userinfo="${body%@*}"
-        server_port="${body#*@}"
-        # 先 URL 解码 userinfo（处理 %3A 等编码字符）
-        local decoded_userinfo=$(_url_decode "$userinfo")
-        if [[ "$decoded_userinfo" == *":"* ]]; then
-            # 已经是明文 method:password 格式（或 URL 编码后的明文）
-            method_pass="$decoded_userinfo"
+    IFS='&' read -r -a pairs <<< "$query"
+    for pair in "${pairs[@]}"; do
+        [[ -n "$pair" ]] || return 1
+        raw_key="${pair%%=*}"
+        if [[ "$pair" == *=* ]]; then
+            raw_value="${pair#*=}"
         else
-            # 没有冒号，可能是 base64 编码
-            method_pass=$(_decode_base64_urlsafe "$userinfo")
+            raw_value=""
+        fi
+
+        _url_decode "$raw_key" 1 || return 1
+        key="$DECODED_VALUE"
+        _url_decode "$raw_value" 1 || return 1
+        value="$DECODED_VALUE"
+        [[ "$key" =~ ^[A-Za-z0-9._~-]+$ ]] || return 1
+        [[ -z "${QUERY_PRESENT[$key]+x}" ]] || return 1
+        QUERY_PRESENT["$key"]=1
+        QUERY_PARAMS["$key"]="$value"
+    done
+}
+
+_require_query_keys() {
+    local allowed key
+    allowed=" $* "
+    for key in "${!QUERY_PRESENT[@]}"; do
+        [[ "$allowed" == *" $key "* ]] || _fatal "节点链接包含当前模式不支持的查询参数"
+    done
+}
+
+_parse_vless_uri() {
+    local link body authority query raw_uuid endpoint
+    link="$1"
+    [[ "$link" == vless://* ]] || _fatal "链接必须以 vless:// 开头"
+    body="${link#vless://}"
+    body="${body%%#*}"
+    [[ -n "$body" ]] || _fatal "VLESS 链接为空"
+
+    if [[ "$body" == *\?* ]]; then
+        authority="${body%%\?*}"
+        query="${body#*\?}"
+    else
+        authority="$body"
+        query=""
+    fi
+
+    [[ "$authority" == *@* ]] || _fatal "VLESS 链接缺少 UUID 或服务器地址"
+    raw_uuid="${authority%%@*}"
+    endpoint="${authority#*@}"
+    [[ "$endpoint" != *@* ]] || _fatal "VLESS 链接的服务器地址格式错误"
+    _url_decode "$raw_uuid" 0 || _fatal "VLESS UUID 包含无效 URL 编码"
+    VLESS_UUID="$DECODED_VALUE"
+    [[ "$VLESS_UUID" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] || _fatal "VLESS UUID 格式无效"
+
+    _split_host_port "$endpoint" || _fatal "VLESS 服务器地址或端口无效"
+    VLESS_SERVER="$PARSED_SERVER"
+    VLESS_PORT="$PARSED_PORT"
+    _parse_query "$query" || _fatal "VLESS 查询参数格式无效或包含重复参数"
+}
+
+_require_tcp_transport() {
+    local transport header_type encryption
+    transport="${QUERY_PARAMS[type]-}"
+    header_type="${QUERY_PARAMS[headerType]-}"
+    encryption="${QUERY_PARAMS[encryption]-}"
+    [[ -z "$transport" || "$transport" == "tcp" ]] || _fatal "仅支持 VLESS TCP 节点"
+    [[ -z "$header_type" || "$header_type" == "none" ]] || _fatal "VLESS TCP 不支持额外头部伪装"
+    [[ -z "$encryption" || "$encryption" == "none" ]] || _fatal "VLESS encryption 必须为 none"
+}
+
+_parse_vless_reality_vision() {
+    local link security flow sni public_key short_id fingerprint output
+    link="$1"
+    _parse_vless_uri "$link"
+    _require_query_keys encryption flow security sni servername fp pbk sid type headerType
+    _require_tcp_transport
+
+    security="${QUERY_PARAMS[security]-}"
+    flow="${QUERY_PARAMS[flow]-}"
+    sni="${QUERY_PARAMS[sni]-}"
+    [[ -n "$sni" ]] || sni="${QUERY_PARAMS[servername]-}"
+    public_key="${QUERY_PARAMS[pbk]-}"
+    short_id="${QUERY_PARAMS[sid]-}"
+    fingerprint="${QUERY_PARAMS[fp]-chrome}"
+
+    [[ "$security" == "reality" ]] || _fatal "Reality 节点的 security 必须为 reality"
+    [[ "$flow" == "xtls-rprx-vision" ]] || _fatal "Reality 节点的 flow 必须为 xtls-rprx-vision"
+    _validate_server "$sni" || _fatal "Reality 节点缺少有效的 SNI"
+    [[ "$public_key" =~ ^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$ ]] || _fatal "Reality 公钥 pbk 格式无效"
+    [[ "$short_id" =~ ^[0-9A-Fa-f]{0,16}$ && $(( ${#short_id} % 2 )) -eq 0 ]] || _fatal "Reality short id 必须是长度不超过 16 的偶数位十六进制字符串"
+    case "$fingerprint" in
+        chrome|firefox|edge|safari|360|qq|ios|android|random|randomized) ;;
+        *) _fatal "Reality uTLS 指纹不在 sing-box 支持列表中" ;;
+    esac
+
+    if ! output=$(jq -n \
+        --arg server "$VLESS_SERVER" \
+        --argjson port "$VLESS_PORT" \
+        --arg uuid "$VLESS_UUID" \
+        --arg sni "$sni" \
+        --arg public_key "$public_key" \
+        --arg short_id "$short_id" \
+        --arg fingerprint "$fingerprint" \
+        '{type:"vless",tag:"proxy",server:$server,server_port:$port,uuid:$uuid,flow:"xtls-rprx-vision",tls:{enabled:true,server_name:$sni,reality:{enabled:true,public_key:$public_key,short_id:$short_id},utls:{enabled:true,fingerprint:$fingerprint}}}'); then
+        _fatal "生成 VLESS Reality outbound 失败"
+    fi
+    printf '%s\n' "$output"
+}
+
+_parse_vless_tcp() {
+    local link security output
+    link="$1"
+    _parse_vless_uri "$link"
+    _require_query_keys encryption security type headerType
+    _require_tcp_transport
+
+    security="${QUERY_PARAMS[security]-}"
+    [[ -z "$security" || "$security" == "none" ]] || _fatal "纯 VLESS TCP 节点不能启用 TLS 或 Reality"
+
+    if ! output=$(jq -n \
+        --arg server "$VLESS_SERVER" \
+        --argjson port "$VLESS_PORT" \
+        --arg uuid "$VLESS_UUID" \
+        '{type:"vless",tag:"proxy",server:$server,server_port:$port,uuid:$uuid}'); then
+        _fatal "生成纯 VLESS TCP outbound 失败"
+    fi
+    printf '%s\n' "$output"
+}
+
+_parse_ss_uri() {
+    local link expected_method body main query raw_userinfo endpoint decoded method_password
+    local method password output key
+    link="$1"
+    expected_method="$2"
+    [[ "$link" == ss://* ]] || _fatal "链接必须以 ss:// 开头"
+    body="${link#ss://}"
+    body="${body%%#*}"
+    [[ -n "$body" ]] || _fatal "Shadowsocks 链接为空"
+
+    if [[ "$body" == *\?* ]]; then
+        main="${body%%\?*}"
+        query="${body#*\?}"
+    else
+        main="$body"
+        query=""
+    fi
+
+    if [[ -n "$query" ]]; then
+        _parse_query "$query" || _fatal "Shadowsocks 查询参数格式无效"
+        for key in "${!QUERY_PRESENT[@]}"; do
+            [[ "${key,,}" != "plugin" ]] || _fatal "不支持带 plugin 的 Shadowsocks 节点"
+        done
+        _fatal "Shadowsocks 链接包含不支持的查询参数"
+    fi
+
+    if [[ "$main" == *@* ]]; then
+        raw_userinfo="${main%@*}"
+        endpoint="${main##*@}"
+        endpoint="${endpoint%/}"
+        [[ -n "$raw_userinfo" && -n "$endpoint" ]] || _fatal "Shadowsocks 链接格式无效"
+
+        _url_decode "$raw_userinfo" 0 || _fatal "Shadowsocks 凭据包含无效 URL 编码"
+        decoded="$DECODED_VALUE"
+        if [[ "$decoded" == *:* ]]; then
+            method_password="$decoded"
+        else
+            _decode_base64_urlsafe "$decoded" || _fatal "Shadowsocks SIP002 凭据 Base64 解码失败"
+            method_password="$DECODED_VALUE"
         fi
     else
-        local decoded=$(_decode_base64_urlsafe "$body")
-        method_pass="${decoded%@*}"
-        server_port="${decoded#*@}"
+        _decode_base64_urlsafe "$main" || _fatal "Shadowsocks 整串 Base64 解码失败"
+        decoded="$DECODED_VALUE"
+        [[ "$decoded" == *@* ]] || _fatal "Shadowsocks 整串 Base64 内容格式无效"
+        method_password="${decoded%@*}"
+        endpoint="${decoded##*@}"
     fi
 
-    local split_result
-    split_result=$(_split_host_port "$server_port") || { echo '{"error": "服务器地址或端口格式错误"}'; return; }
-    local server port
-    IFS=$'\t' read -r server port <<< "$split_result"
+    [[ "$method_password" == *:* ]] || _fatal "Shadowsocks 链接缺少加密方法或密码"
+    method="${method_password%%:*}"
+    password="${method_password#*:}"
+    [[ "$method" == "$expected_method" ]] || _fatal "Shadowsocks 链接的加密方法与所选类型不一致"
+    [[ -n "$password" ]] || _fatal "Shadowsocks 密码不能为空"
+    [[ "$password" != *$'\r'* && "$password" != *$'\n'* ]] || _fatal "Shadowsocks 密码包含无效控制字符"
 
-    jq -n --arg s "$server" --argjson p "$port" --arg m "${method_pass%%:*}" --arg pw "${method_pass#*:}" \
-        '{type:"shadowsocks", tag:"proxy", server:$s, server_port:$p, method:$m, password:$pw}'
-}
-
-# 解析 Hysteria2
-_parse_hy2() {
-    local link="$1"
-    local host_regex='(\[[^]]+\]|[^:/?#]+)'
-    local regex="(hysteria2|hy2)://([^@]+)@${host_regex}:([0-9]+)\??([^#]*)#?(.*)"
-    if [[ $link =~ $regex ]]; then
-        local password=$(_decode "${BASH_REMATCH[2]}")
-        local server=$(_strip_ipv6_brackets "${BASH_REMATCH[3]}")
-        local port="${BASH_REMATCH[4]}"
-        local params="${BASH_REMATCH[5]}"
-        local sni=$(_get_param "$params" "sni")
-        local obfs=$(_get_param "$params" "obfs")
-        local opw=$(_get_param "$params" "obfs-password")
-
-        local outbound=$(jq -n --arg s "$server" --argjson p "$port" --arg pw "$password" --arg sni "${sni:-$server}" \
-            '{type:"hysteria2", tag:"proxy", server:$s, server_port:$p, password:$pw, tls:{enabled:true, server_name:$sni, insecure:true, alpn:["h3"]}}')
-        [ -n "$obfs" ] && outbound=$(echo "$outbound" | jq --arg ot "$obfs" --arg op "$opw" '.obfs = {type:$ot, password:$op}')
-        echo "$outbound"
+    _split_host_port "$endpoint" || _fatal "Shadowsocks 服务器地址或端口无效"
+    if ! output=$(jq -n \
+        --arg server "$PARSED_SERVER" \
+        --argjson port "$PARSED_PORT" \
+        --arg method "$method" \
+        --arg password "$password" \
+        '{type:"shadowsocks",tag:"proxy",server:$server,server_port:$port,method:$method,password:$password}'); then
+        _fatal "生成 Shadowsocks outbound 失败"
     fi
+    printf '%s\n' "$output"
 }
 
-# 解析 TUIC
-_parse_tuic() {
-    local link="$1"
-    local host_regex='(\[[^]]+\]|[^:/?#]+)'
-    local regex="tuic://([^:]+):([^@]+)@${host_regex}:([0-9]+)\??([^#]*)#?(.*)"
-    if [[ $link =~ $regex ]]; then
-        local uuid="${BASH_REMATCH[1]}"
-        local password=$(_decode "${BASH_REMATCH[2]}")
-        local server=$(_strip_ipv6_brackets "${BASH_REMATCH[3]}")
-        local port="${BASH_REMATCH[4]}"
-        local params="${BASH_REMATCH[5]}"
-        local sni=$(_get_param "$params" "sni")
-        local cc=$(_get_param "$params" "congestion_control")
-        [ -z "$cc" ] && cc="bbr"
-
-        jq -n --arg s "$server" --argjson p "$port" --arg u "$uuid" --arg pw "$password" --arg sni "${sni:-$server}" --arg cc "$cc" \
-            '{type:"tuic", tag:"proxy", server:$s, server_port:$p, uuid:$u, password:$pw, congestion_control:$cc, tls:{enabled:true, server_name:$sni, insecure:true, alpn:["h3"]}}'
-    fi
-}
-
-# 解析 AnyTLS
-_parse_anytls() {
-    local link="$1"
-    local host_regex='(\[[^]]+\]|[^:/?#]+)'
-    local regex="anytls://([^@]+)@${host_regex}:([0-9]+)\??([^#]*)#?(.*)"
-    if [[ $link =~ $regex ]]; then
-        local password=$(_decode "${BASH_REMATCH[1]}")
-        local server=$(_strip_ipv6_brackets "${BASH_REMATCH[2]}")
-        local port="${BASH_REMATCH[3]}"
-        local params="${BASH_REMATCH[4]}"
-        local security=$(_get_param "$params" "security")
-        local sni=$(_get_param "$params" "sni")
-        local pbk=$(_get_param "$params" "pbk")
-        local sid=$(_get_param "$params" "sid")
-        local fp=$(_get_param "$params" "fp")
-
-        if [ "$security" == "reality" ]; then
-            jq -n --arg s "$server" --argjson p "$port" --arg pw "$password" --arg sni "${sni:-$server}" --arg pbk "$pbk" --arg sid "$sid" --arg fp "${fp:-chrome}" \
-                '{type:"anytls", tag:"proxy", server:$s, server_port:$p, password:$pw, tls:{enabled:true, server_name:$sni, utls:{enabled:true, fingerprint:$fp}, reality:{enabled:true, public_key:$pbk, short_id:$sid}}}'
-        else
-            jq -n --arg s "$server" --argjson p "$port" --arg pw "$password" --arg sni "${sni:-$server}" \
-                '{type:"anytls", tag:"proxy", server:$s, server_port:$p, password:$pw, tls:{enabled:true, server_name:$sni, insecure:true}}'
+_read_link() {
+    local argument_count extra read_status
+    argument_count="$1"
+    if (( argument_count == 2 )); then
+        LINK_INPUT="$2"
+    else
+        LINK_INPUT=""
+        if ! IFS= read -r LINK_INPUT; then
+            [[ -n "$LINK_INPUT" ]] || _fatal "未从标准输入读取到节点链接"
         fi
+
+        while true; do
+            extra=""
+            IFS= read -r extra
+            read_status=$?
+            extra="${extra%$'\r'}"
+            [[ -z "$extra" ]] || _fatal "标准输入只能包含一条节点链接"
+            (( read_status == 0 )) || break
+        done
     fi
+
+    LINK_INPUT="${LINK_INPUT%$'\r'}"
+    [[ -n "$LINK_INPUT" ]] || _fatal "节点链接不能为空"
+    [[ "$LINK_INPUT" != *$'\r'* && "$LINK_INPUT" != *$'\n'* ]] || _fatal "节点链接不能包含换行符"
 }
 
-# 解析 SOCKS5 (支持有认证和无认证两种格式)
-_parse_socks() {
-    local link="$1"
-    local host_regex='(\[[^]]+\]|[^:/?#]+)'
-    # 有认证格式: socks5://user:pass@host:port#name
-    local regex_auth="socks5://([^:]+):([^@]+)@${host_regex}:([0-9]+)#?(.*)"
-    # 无认证格式: socks5://host:port#name
-    local regex_noauth="socks5://${host_regex}:([0-9]+)#?(.*)"
-    
-    if [[ $link =~ $regex_auth ]]; then
-        local user="${BASH_REMATCH[1]}"
-        local pass="${BASH_REMATCH[2]}"
-        local server=$(_strip_ipv6_brackets "${BASH_REMATCH[3]}")
-        local port="${BASH_REMATCH[4]}"
-        
-        jq -n --arg s "$server" --argjson p "$port" --arg u "$user" --arg pw "$pass" \
-            '{type:"socks", tag:"proxy", server:$s, server_port:$p, version:"5", users:[{username:$u, password:$pw}]}'
-    elif [[ $link =~ $regex_noauth ]]; then
-        local server=$(_strip_ipv6_brackets "${BASH_REMATCH[1]}")
-        local port="${BASH_REMATCH[2]}"
-        
-        jq -n --arg s "$server" --argjson p "$port" \
-            '{type:"socks", tag:"proxy", server:$s, server_port:$p, version:"5"}'
-    fi
-}
+(( $# == 1 || $# == 2 )) || _fatal "用法：bash parser.sh MODE（节点链接从标准输入传入）"
 
-case "$1" in
-    vless://*) _parse_vless "$1" ;;
-    vmess://*) _parse_vmess "$1" ;;
-    trojan://*) _parse_trojan "$1" ;;
-    ss://*) _parse_ss "$1" ;;
-    hysteria2://*|hy2://*) _parse_hy2 "$1" ;;
-    tuic://*) _parse_tuic "$1" ;;
-    anytls://*) _parse_anytls "$1" ;;
-    socks5://*) _parse_socks "$1" ;;
-    *) echo "{\"error\": \"不支持的协议\"}"; exit 1 ;;
+MODE="$1"
+case "$MODE" in
+    vless-reality-vision|vless-tcp|ss-aes-128-gcm|ss-aes-256-gcm) ;;
+    *) _fatal "不支持的解析模式" ;;
+esac
+
+command -v jq >/dev/null 2>&1 || _fatal "缺少 jq 依赖"
+case "$MODE" in
+    ss-aes-128-gcm|ss-aes-256-gcm)
+        command -v base64 >/dev/null 2>&1 || _fatal "缺少 base64 依赖"
+        ;;
+esac
+
+_read_link "$#" "${2-}"
+
+case "$MODE" in
+    vless-reality-vision) _parse_vless_reality_vision "$LINK_INPUT" ;;
+    vless-tcp) _parse_vless_tcp "$LINK_INPUT" ;;
+    ss-aes-128-gcm) _parse_ss_uri "$LINK_INPUT" "aes-128-gcm" ;;
+    ss-aes-256-gcm) _parse_ss_uri "$LINK_INPUT" "aes-256-gcm" ;;
 esac
