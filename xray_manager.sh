@@ -870,7 +870,7 @@ _add_vless_reality_vision() {
     read -p "请输入伪装域名 SNI (默认: www.amd.com): " custom_sni
     sni=${custom_sni:-www.amd.com}
     
-    local default_name="X-Reality-${port}"
+    local default_name="X-VLESS-TCP-REALITY-VISION-${port}"
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
     local name=${custom_name:-$default_name}
     
@@ -913,7 +913,7 @@ _add_vless_reality_vision() {
     
     _save_xray_meta "$tag" "$name" "$link" "publicKey=$REALITY_PUBLIC_KEY" "shortId=$REALITY_SHORT_ID" || return 1
     
-    _success "VLESS+Reality+Vision 节点 [${name}] 添加成功！"
+    _success "VLESS+TCP+Reality+Vision 节点 [${name}] 添加成功！"
     echo -e "  ${YELLOW}分享链接:${NC} ${link}"
 }
 

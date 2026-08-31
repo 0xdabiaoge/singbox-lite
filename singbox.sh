@@ -4182,7 +4182,7 @@ _add_vless_reality() {
         # 批量模式变量预加载，增加多层保底，防止变量泄露
         server_name=$(echo "${BATCH_SNI}" | xargs)
         [[ -z "$server_name" ]] && server_name="$DEFAULT_SNI"
-        name="Batch-Reality-${port}"
+        name="Batch-VLESS-TCP-Reality-Vision-${port}"
         # 批量模式下如果不显式指定，可能丢失 IP，此处进行双重保险
         [ -z "$node_ip" ] && node_ip="$server_ip"
     else
@@ -4196,7 +4196,7 @@ _add_vless_reality() {
             _check_port_conflict "$port" "tcp" && continue
             break
         done
-        local default_name="VLESS-REALITY-${port}"
+        local default_name="VLESS-TCP-REALITY-VISION-${port}"
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
@@ -4219,7 +4219,7 @@ _add_vless_reality() {
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" --arg sn "$server_name" --arg pbk "$public_key" --arg sid "$short_id" \
         '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":true,"network":"tcp","flow":"xtls-rprx-vision","servername":$sn,"client-fingerprint":"chrome","reality-opts":{"public-key":$pbk,"short-id":$sid}}')
     _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
-    _success "VLESS (REALITY) 节点 [${name}] 添加成功!"
+    _success "VLESS + TCP + Reality + Vision 节点 [${name}] 添加成功!"
     _show_node_link "vless-reality" "$name" "$link_ip" "$port" "$tag" "$uuid" "$server_name" "$public_key" "$short_id" || return 1
 }
 
@@ -7299,7 +7299,7 @@ _show_add_node_menu() {
     echo ""
     
     echo -e "  ${CYAN}【协议选择】${NC}"
-    echo -e "    ${GREEN}[1]${NC} VLESS (Vision+REALITY)"
+    echo -e "    ${GREEN}[1]${NC} VLESS + TCP + Reality + Vision"
     echo -e "    ${GREEN}[2]${NC} VLESS (WebSocket+TLS)"
     echo -e "    ${GREEN}[3]${NC} Trojan (WebSocket+TLS)"
     echo -e "    ${GREEN}[4]${NC} VLESS (gRPC+TLS)"

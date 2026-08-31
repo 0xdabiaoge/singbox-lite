@@ -342,8 +342,8 @@ _parse_vless_reality_vision() {
         --arg public_key "$public_key" \
         --arg short_id "$short_id" \
         --arg fingerprint "$fingerprint" \
-        '{type:"vless",tag:"proxy",server:$server,server_port:$port,uuid:$uuid,flow:"xtls-rprx-vision",tls:{enabled:true,server_name:$sni,reality:{enabled:true,public_key:$public_key,short_id:$short_id},utls:{enabled:true,fingerprint:$fingerprint}}}'); then
-        _fatal "生成 VLESS Reality outbound 失败"
+        '{type:"vless",tag:"proxy",server:$server,server_port:$port,uuid:$uuid,network:"tcp",flow:"xtls-rprx-vision",tls:{enabled:true,server_name:$sni,reality:{enabled:true,public_key:$public_key,short_id:$short_id},utls:{enabled:true,fingerprint:$fingerprint}}}'); then
+        _fatal "生成 VLESS + TCP + Reality + Vision outbound 失败"
     fi
     printf '%s\n' "$output"
 }
@@ -362,7 +362,7 @@ _parse_vless_tcp() {
         --arg server "$VLESS_SERVER" \
         --argjson port "$VLESS_PORT" \
         --arg uuid "$VLESS_UUID" \
-        '{type:"vless",tag:"proxy",server:$server,server_port:$port,uuid:$uuid}'); then
+        '{type:"vless",tag:"proxy",server:$server,server_port:$port,uuid:$uuid,network:"tcp"}'); then
         _fatal "生成纯 VLESS TCP outbound 失败"
     fi
     printf '%s\n' "$output"

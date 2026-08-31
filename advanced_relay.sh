@@ -928,9 +928,10 @@ _validate_imported_outbound() {
             and (.tag? == null or (.tag | type == "string"));
         base and
         if $mode == "vless-reality-vision" then
-            only_keys(["type","tag","server","server_port","uuid","flow","tls"])
+            only_keys(["type","tag","server","server_port","uuid","network","flow","tls"])
             and .type == "vless"
             and (.uuid | type == "string" and test("^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"))
+            and .network == "tcp"
             and .flow == "xtls-rprx-vision"
             and (.tls | only_keys(["enabled","server_name","reality","utls"]))
             and (.tls.enabled == true)
@@ -944,9 +945,10 @@ _validate_imported_outbound() {
             and (.tls.reality.short_id | type == "string" and test("^([0-9A-Fa-f]{2}){0,8}$"))
             and (.transport? == null)
         elif $mode == "vless-tcp" then
-            only_keys(["type","tag","server","server_port","uuid"])
+            only_keys(["type","tag","server","server_port","uuid","network"])
             and .type == "vless"
             and (.uuid | type == "string" and test("^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"))
+            and .network == "tcp"
             and ((.flow? // "") == "")
             and ((.tls.enabled? // false) == false)
             and (.transport? == null)
@@ -1011,7 +1013,7 @@ _import_link_config() {
     echo '  ╚═══════════════════════════════════════╝'
     echo -e "${NC}"
     echo -e "    ${YELLOW}[0]${NC} 返回"
-    echo -e "    ${GREEN}[1]${NC} VLESS + TCP + Vision + Reality（链接）"
+    echo -e "    ${GREEN}[1]${NC} VLESS + TCP + Reality + Vision（链接）"
     echo -e "    ${GREEN}[2]${NC} 纯 VLESS + TCP（链接）"
     echo -e "    ${GREEN}[3]${NC} Shadowsocks aes-128-gcm（链接）"
     echo -e "    ${GREEN}[4]${NC} Shadowsocks aes-256-gcm（链接）"
@@ -1408,7 +1410,7 @@ _finalize_relay_setup() {
     
     # --- 选择中转入口协议 ---
     echo -e "\n  ${CYAN}【请选择本机的 [中转入口] 协议】${NC}"
-    echo -e "    ${GREEN}[1]${NC} VLESS-Reality"
+    echo -e "    ${GREEN}[1]${NC} VLESS + TCP + Reality + Vision"
     echo -e "    ${GREEN}[2]${NC} Hysteria2"
     echo -e "    ${GREEN}[3]${NC} TUICv5"
     echo -e "    ${GREEN}[4]${NC} AnyTLS"
