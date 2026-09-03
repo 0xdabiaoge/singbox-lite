@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v24`、`advanced_relay.sh v18`、`xray_manager.sh v3.1.2`。
+当前文档按以下脚本版本整理：`singbox.sh v25`、`advanced_relay.sh v18`、`xray_manager.sh v3.1.2`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -364,6 +364,7 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 
 ### 2026.09.04
 
+- 修复 sing-box 1.14 在部分 Linux/systemd-resolved 环境中使用 local DNS 时查询可能阻塞 10 秒的问题；新配置默认启用 `prefer_go`，旧配置启动时自动迁移并保留原 DNS 地址与解析策略。
 - 继续收紧 128 MB 容器安装路径：Debian 依赖改为逐包、无 recommends、无 dpkg PTY 安装；Podman 默认配置不再启用容易因 UDP 123 受限而阻塞启动的 NTP。
 - 修复服务启动继承共享锁文件描述符、systemd 失败状态未清理，以及 Argo 临时节点空字段错位导致名称和凭据元数据串位的问题。
 - Argo 临时隧道改为结合系统解析与 Cloudflare DoH 确认域名已经完成 DNS 发布后才提交；首个域名未发布时会清理并自动重试一次，避免本机负缓存误判或生成表面成功但无法解析的节点。
