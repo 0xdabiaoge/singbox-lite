@@ -4,7 +4,7 @@
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="24"
+export SCRIPT_VERSION="25"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -772,7 +772,7 @@ _build_dns_config_json() {
     esac
 
     if [ "$address" = "local" ]; then
-        jq -cn --arg strategy "$strategy" '{servers:[{type:"local",tag:"dns-local"}],final:"dns-local",strategy:$strategy}'
+        jq -cn --arg strategy "$strategy" '{servers:[{type:"local",tag:"dns-local",prefer_go:true}],final:"dns-local",strategy:$strategy}'
         return $?
     elif [[ "$address" =~ ^https://(\[[^]]+\]|[^/:]+)(:([0-9]+))?(/.*)?$ ]]; then
         type="https"; server="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[3]:-443}"; path="${BASH_REMATCH[4]:-/dns-query}"
@@ -802,7 +802,7 @@ _build_dns_config_json() {
 
     if [ -n "$resolver" ]; then
         jq -cn --argjson server "$server_json" --arg strategy "$strategy" \
-            '{servers:[{type:"local",tag:"dns-bootstrap"},$server],final:"dns-local",strategy:$strategy}'
+            '{servers:[{type:"local",tag:"dns-bootstrap",prefer_go:true},$server],final:"dns-local",strategy:$strategy}'
     else
         jq -cn --argjson server "$server_json" --arg strategy "$strategy" \
             '{servers:[$server],final:"dns-local",strategy:$strategy}'
@@ -3130,7 +3130,8 @@ _initialize_config_files() {
     "servers": [
       {
         "type": "local",
-        "tag": "dns-local"
+        "tag": "dns-local",
+        "prefer_go": true
       }
     ],
     "final": "dns-local",
@@ -3296,18 +3297,20 @@ _cleanup_legacy_config() {
 
 _check_and_fix_dns() {
     # 热修复：1.补充缺失的 DNS 模块，2.将容易引起出站路由绑定死循环（连接被秒重置）的 auto_detect_interface 清除
-    # 3. 为未设置策略的旧配置补充 prefer_ipv4；保留用户在 DNS 菜单中明确选择的策略
+    # 3. 为未设置策略的旧配置补充 prefer_ipv4，4.让 local DNS 避开 Linux 上可能阻塞的 systemd-resolved D-Bus 路径
+    # 保留用户在 DNS 菜单中明确选择的地址和解析策略。
     if [ ! -f "$CONFIG_FILE" ]; then return; fi
     
-    local has_dns legacy_dns has_auto_detect dns_strategy has_default_resolver
+    local has_dns legacy_dns has_auto_detect dns_strategy has_default_resolver local_dns_needs_prefer_go
     has_dns=$(jq 'has("dns")' "$CONFIG_FILE" 2>/dev/null)
     legacy_dns=$(jq 'any(.dns.servers[]?; has("address") or ((.type // "") == "")) or any(.dns.rules[]?; has("outbound"))' "$CONFIG_FILE" 2>/dev/null)
     has_auto_detect=$(jq 'try .route.auto_detect_interface catch false' "$CONFIG_FILE" 2>/dev/null)
     dns_strategy=$(jq -r '.dns.strategy // ""' "$CONFIG_FILE" 2>/dev/null)
     has_default_resolver=$(jq '(.route.default_domain_resolver // null) != null' "$CONFIG_FILE" 2>/dev/null)
+    local_dns_needs_prefer_go=$(jq 'any(.dns.servers[]?; ((.type // "") == "local") and ((.prefer_go // false) != true))' "$CONFIG_FILE" 2>/dev/null)
     local needs_restart=false
     
-    if [ "$has_dns" == "false" ] || [ "$legacy_dns" == "true" ] || [ "$has_auto_detect" == "true" ] || [ -z "$dns_strategy" ] || [ "$has_default_resolver" != "true" ]; then
+    if [ "$has_dns" == "false" ] || [ "$legacy_dns" == "true" ] || [ "$has_auto_detect" == "true" ] || [ -z "$dns_strategy" ] || [ "$has_default_resolver" != "true" ] || [ "$local_dns_needs_prefer_go" == "true" ]; then
         _warn "检测到 DNS/路由配置需要兼容性修复，正在自动处理..."
         
         local backup_file
@@ -3328,6 +3331,7 @@ _check_and_fix_dns() {
         }
         if _atomic_modify_json "$CONFIG_FILE" '
             if $replace_dns then .dns = $dns else . end
+            | .dns.servers |= map(if ((.type // "") == "local") then . + {prefer_go:true} else . end)
             | .route = (.route // {"rules":[]})
             | .route.default_domain_resolver = {"server":"dns-local","strategy":$strategy}
             | del(.route.auto_detect_interface)
