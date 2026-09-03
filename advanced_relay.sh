@@ -600,10 +600,7 @@ _check_combined_config() {
         _error "主配置或中转配置不存在，无法执行组合校验"
         return 1
     fi
-    ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true \
-    ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true \
-    ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true \
-        "$SINGBOX_BIN" check -c "$MAIN_CONFIG_FILE" -c "$RELAY_CONFIG_FILE" >/dev/null
+    "$SINGBOX_BIN" check -c "$MAIN_CONFIG_FILE" -c "$RELAY_CONFIG_FILE" >/dev/null
 }
 
 _txn_begin() {
@@ -664,8 +661,23 @@ _manage_service() {
 
     _info "执行服务操作: $action ($service_pkg)..."
     case "$INIT_SYSTEM" in
-        systemd) systemctl "$action" "$service_pkg" ;;
-        openrc) rc-service "$service_pkg" "$action" ;;
+        systemd)
+            if [ "$action" = "start" ] || [ "$action" = "restart" ]; then
+                systemctl reset-failed "$service_pkg" >/dev/null 2>&1 || true
+            fi
+            if [ "$STATE_LOCK_OWNED" = "true" ] && [[ "$STATE_LOCK_FD" =~ ^[0-9]+$ ]]; then
+                systemctl "$action" "$service_pkg" 8>&- 9>&- 219>&- {STATE_LOCK_FD}>&-
+            else
+                systemctl "$action" "$service_pkg" 8>&- 9>&- 219>&-
+            fi
+            ;;
+        openrc)
+            if [ "$STATE_LOCK_OWNED" = "true" ] && [[ "$STATE_LOCK_FD" =~ ^[0-9]+$ ]]; then
+                rc-service "$service_pkg" "$action" 8>&- 9>&- 219>&- {STATE_LOCK_FD}>&-
+            else
+                rc-service "$service_pkg" "$action" 8>&- 9>&- 219>&-
+            fi
+            ;;
         direct)
             _prepare_run_dir || return 1
             local pid_file="$SINGBOX_PID_FILE"
@@ -679,11 +691,13 @@ _manage_service() {
                     if [ ! -s "$RELAY_CONFIG_FILE" ]; then
                         _atomic_write_json "$RELAY_CONFIG_FILE" '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' || return 1
                     fi
-                    nohup env ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true \
-                        ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true \
-                        ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true \
-                        "$SINGBOX_BIN" run -c "$MAIN_CONFIG_FILE" -c "$RELAY_CONFIG_FILE" \
-                        >> "$log_file" 2>&1 &
+                    if [ "$STATE_LOCK_OWNED" = "true" ] && [[ "$STATE_LOCK_FD" =~ ^[0-9]+$ ]]; then
+                        nohup "$SINGBOX_BIN" run -c "$MAIN_CONFIG_FILE" -c "$RELAY_CONFIG_FILE" \
+                            >> "$log_file" 2>&1 8>&- 9>&- 219>&- {STATE_LOCK_FD}>&- &
+                    else
+                        nohup "$SINGBOX_BIN" run -c "$MAIN_CONFIG_FILE" -c "$RELAY_CONFIG_FILE" \
+                            >> "$log_file" 2>&1 8>&- 9>&- 219>&- &
+                    fi
                     printf '%s\n' "$!" > "$pid_file"
                     chmod 600 "$pid_file" 2>/dev/null || true
                     sleep 1
@@ -1884,8 +1898,8 @@ _clear_all_relays() {
         | .key as $tag
         | [
             $tag,
-            (.value.node_name // ""),
-            (.value.port_hopping // ""),
+            (.value.node_name // "__SINGBOXLITE_EMPTY__"),
+            (.value.port_hopping // "__SINGBOXLITE_EMPTY__"),
             ((.value.listen_port // ([ $config[0].inbounds[]? | select(.tag == $tag) | .listen_port ][0] // "")) | tostring)
           ]
         | @tsv
@@ -1893,6 +1907,8 @@ _clear_all_relays() {
 
     while IFS=$'\t' read -r tag node_name hop port; do
         [ -z "$tag" ] && continue
+        [ "$node_name" = "__SINGBOXLITE_EMPTY__" ] && node_name=""
+        [ "$hop" = "__SINGBOXLITE_EMPTY__" ] && hop=""
         if [ -n "$node_name" ] && ! _remove_node_from_relay_yaml "$node_name" "$port"; then
             failed="true"
             break
@@ -1926,6 +1942,8 @@ _clear_all_relays() {
     # 服务已接受新配置后，再精确删除中转自己的证书与 HY2 跳跃规则。
     while IFS=$'\t' read -r tag node_name hop port; do
         [ -z "$tag" ] && continue
+        [ "$node_name" = "__SINGBOXLITE_EMPTY__" ] && node_name=""
+        [ "$hop" = "__SINGBOXLITE_EMPTY__" ] && hop=""
         rm -f -- "${RELAY_AUX_DIR}/${tag}.pem" "${RELAY_AUX_DIR}/${tag}.key"
         if [[ "$hop" =~ ^([0-9]+)-([0-9]+)$ ]]; then
             _nft_apply_redirect_rule delete "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$port" "singboxlite-relay-hop-${tag}"
@@ -3506,7 +3524,7 @@ _menu() {
         echo -e "${CYAN}"
         echo "  ╔═══════════════════════════════════════╗"
         echo "  ║       singbox-lite 进阶转发管理       ║"
-        echo "  ║                (v17)                  ║"
+        echo "  ║                (v18)                  ║"
         echo "  ╚═══════════════════════════════════════╝"
         echo -e "${NC}"
 

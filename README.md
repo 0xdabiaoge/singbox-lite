@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v20`、`advanced_relay.sh v17`、`xray_manager.sh v3.1.0`。
+当前文档按以下脚本版本整理：`singbox.sh v24`、`advanced_relay.sh v18`、`xray_manager.sh v3.1.2`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -43,7 +43,7 @@
 - KVM、具备 `NET_ADMIN` 的 LXC：优先使用 nftables。
 - 无特权 LXC、Docker、Podman：nftables 探测失败时自动降级为 sing-box 用户态转发。
 - Docker/Podman 如果不是 host 网络，必须在宿主机预先发布对应的 TCP/UDP 端口；容器内创建监听并不等于宿主机端口已经开放。
-- 128 MB Podman Alpine/Debian 的核心安装路径已做低内存优化，但实际可用内存仍受宿主机、页缓存和同时运行的服务影响。Argo、测速和多核心并发运行需要预留更多内存。
+- 128 MB Podman Alpine/Debian 的核心安装路径已做低内存优化；sing-box 与 Xray 会按物理内存及 cgroup 上限设置 Go 运行时软内存限制，128 MB 档约为 `40MiB`。实际可用内存仍受宿主机、页缓存和同时运行的服务影响。
 
 ## 安装与启动
 
@@ -58,6 +58,13 @@ sb
 ```
 
 首次启动会安装基础依赖并初始化状态文件，但不会强制同时安装两个核心。请按需要使用主菜单 `[15]` 安装/更新 sing-box，使用 `[16]` 安装/更新 Xray。
+
+`[15]` 进入后可选择：
+
+1. 安装/更新 sing-box 最新稳定版。
+2. 安装固定版 `1.13.21`。安装成功后会写入持久版本锁，后续不能再通过脚本升级核心，只能重新安装同一固定版本。
+
+固定版锁定状态会显示在主菜单的 sing-box 版本旁。固定版和最新版都会校验官方发布标签、资产名称、SHA-256 摘要、二进制实际版本以及现有 `config.json + relay.json` 组合配置；任一步失败都不会提交新核心。
 
 子脚本缺失时，主脚本会从同一仓库下载，并在覆盖或执行前检查 HTTPS 来源、非空内容、Bash shebang 和语法。
 
@@ -221,6 +228,7 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 | `/usr/local/etc/sing-box/relay.json` | 中转和用户态端口转发配置 |
 | `/usr/local/etc/sing-box/clash.yaml` | sing-box/Xray 共享客户端配置 |
 | `/usr/local/etc/sing-box/metadata.json` | 主节点元数据和分享链接 |
+| `/usr/local/etc/sing-box/core-version.lock` | 固定版 `1.13.21` 的持久升级锁 |
 | `/usr/local/etc/sing-box/relay.d/` | 中转、端口转发和辅助状态 |
 | `/usr/local/etc/xray/config.json` | Xray 服务端配置 |
 | `/var/log/sing-box.log` | sing-box 日志 |
@@ -236,6 +244,7 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - sing-box、Xray 和 yq 下载执行来源约束、SHA-256 校验和可执行性检查。
 - 新核心替换前后会检查版本；已有配置存在时还会执行组合配置校验。
 - 敏感配置默认按 root-only 权限保存，临时文件和运行目录会限制权限并清理。
+- 自签 TLS 分享链接在可取得证书指纹时只输出 `pcs` 固定证书，不再同时输出新版 Xray 已拒绝的 `insecure` 参数。
 - 第三方解析器只输出最小允许 schema，中转脚本会再次校验字段和值。
 
 ## 更新日志
@@ -346,3 +355,21 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - sing-box 与中转入口统一明确为 `VLESS + TCP + Reality + Vision`，并保留旧内部标签以兼容已有节点。
 - 第三方导入收敛为 VLESS Reality Vision、纯 VLESS TCP、SS AES-128/256-GCM 四个链接选项，以及无认证/带认证两类手动 SOCKS5。
 - VLESS 解析结果显式写入 `network: "tcp"`；中转 schema 同步拒绝缺少 network、非 TCP 传输及不符合所选类型的节点。
+
+### 2026.09.03
+
+- sing-box 核心安装加入二级选择：可跟随最新稳定版，或安装并永久锁定 `1.13.21` 固定版；锁定后拒绝后续核心升级。
+- 固定版与最新版统一校验官方发布状态、精确资产名称、SHA-256 和二进制实际版本，并继续保留组合配置检查、服务启动验证及失败回滚。
+- 按 sing-box 1.14 移除项复核配置：保留 1.12+ typed DNS 和 `default_domain_resolver`，清理已失效的旧版 DNS 兼容环境变量。
+
+### 2026.09.04
+
+- 继续收紧 128 MB 容器安装路径：Debian 依赖改为逐包、无 recommends、无 dpkg PTY 安装；Podman 默认配置不再启用容易因 UDP 123 受限而阻塞启动的 NTP。
+- 修复服务启动继承共享锁文件描述符、systemd 失败状态未清理，以及 Argo 临时节点空字段错位导致名称和凭据元数据串位的问题。
+- Argo 临时隧道改为结合系统解析与 Cloudflare DoH 确认域名已经完成 DNS 发布后才提交；首个域名未发布时会清理并自动重试一次，避免本机负缓存误判或生成表面成功但无法解析的节点。
+- 修复主卸载先删元数据后停 Argo、遗留 sing-box/Xray 服务与定时器、以及误删用户 MOTD 分隔行的问题；卸载现在按进程、规则、服务、状态的依赖顺序清理。
+- 批量创建进一步校验单一端口范围和 Shadowsocks 选项，避免畸形范围或 Shell 通配符参与拆词；任何非法输入都会在写配置前拒绝。
+- 管理脚本更新改为四个组件全部预下载、校验后再统一提交；任一组件失败会保持整组旧文件，并拒绝把较新的本地版本自动降级。
+- 修复 Alpine/BusyBox 下 Xray 原子 JSON 临时文件模板不兼容；自签 TLS 链接优先使用证书指纹，兼容已移除 `allowInsecure` 的新版 Xray。
+- 修复 Podman 低内存安装跳过 `cron` 后 Argo 节点缺少自动守护的问题：仅在使用 Argo 时按需安装并启动 cron；守护创建失败会回滚节点，避免留下无法自愈的半成品配置。
+- sing-box 与 Xray 统一加入基于物理内存、cgroup `memory.max`/`memory.high` 的 `GOMEMLIMIT`；128 MB 档由 `48MiB` 收紧到约 `40MiB`，并覆盖 systemd、OpenRC、direct 三种启动方式。

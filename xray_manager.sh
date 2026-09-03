@@ -4,7 +4,7 @@ umask 077
 # xray_manager.sh — Xray-core 节点管理子脚本
 # 与 singbox.sh 共存，共享 clash.yaml
 # ============================================================
-XRAY_SCRIPT_VERSION="3.1.0"
+XRAY_SCRIPT_VERSION="3.1.2"
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 # --- 路径定义 ---
@@ -135,6 +135,54 @@ if ! declare -f _detect_init_system >/dev/null 2>&1; then
 fi
 [ -z "$INIT_SYSTEM" ] && _detect_init_system
 
+# 与主脚本使用相同的 Go 运行时软内存限制。独立运行 Xray 管理器时，
+# 本地计算有效内存；由 singbox.sh 调用时直接复用主脚本实现。
+_xray_get_mem_limit() {
+    if declare -f _get_mem_limit >/dev/null 2>&1; then
+        _get_mem_limit
+        return $?
+    fi
+
+    local total_mem_mb=0 cgroup_limit="" candidate_mb=0
+    local limit limit_file
+    total_mem_mb=$(awk '/^MemTotal:/{print int($2 / 1024); exit}' /proc/meminfo 2>/dev/null)
+    [[ "$total_mem_mb" =~ ^[0-9]+$ ]] || total_mem_mb=0
+
+    if [ -r /sys/fs/cgroup/memory.max ]; then
+        for limit_file in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.high; do
+            [ -r "$limit_file" ] || continue
+            cgroup_limit=$(cat "$limit_file" 2>/dev/null)
+            if [[ "$cgroup_limit" =~ ^[0-9]+$ ]] && [ "$cgroup_limit" -lt 9223372036854771712 ] 2>/dev/null; then
+                candidate_mb=$((cgroup_limit / 1024 / 1024))
+                if [ "$candidate_mb" -gt 0 ] && { [ "$total_mem_mb" -eq 0 ] || [ "$candidate_mb" -lt "$total_mem_mb" ]; }; then
+                    total_mem_mb=$candidate_mb
+                fi
+            fi
+        done
+    elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+        cgroup_limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)
+        if [[ "$cgroup_limit" =~ ^[0-9]+$ ]] && [ "$cgroup_limit" -lt 9223372036854771712 ] 2>/dev/null; then
+            candidate_mb=$((cgroup_limit / 1024 / 1024))
+            if [ "$candidate_mb" -gt 0 ] && { [ "$total_mem_mb" -eq 0 ] || [ "$candidate_mb" -lt "$total_mem_mb" ]; }; then
+                total_mem_mb=$candidate_mb
+            fi
+        fi
+    fi
+
+    [ "$total_mem_mb" -gt 0 ] || total_mem_mb=128
+    if [ "$total_mem_mb" -le 128 ]; then
+        limit=$((total_mem_mb * 5 / 16))
+    elif [ "$total_mem_mb" -le 256 ]; then
+        limit=$((total_mem_mb * 50 / 100))
+    elif [ "$total_mem_mb" -le 512 ]; then
+        limit=$((total_mem_mb * 65 / 100))
+    else
+        limit=$((total_mem_mb * 80 / 100))
+    fi
+    [ "$limit" -lt 32 ] && limit=32
+    echo "$limit"
+}
+
 # --- 包管理 ---
 if ! declare -f _pkg_install >/dev/null 2>&1; then
     _pkg_install() {
@@ -146,10 +194,25 @@ if ! declare -f _pkg_install >/dev/null 2>&1; then
             if [ ! -d "/var/lib/apt/lists" ] || [ "$(ls -A /var/lib/apt/lists/ 2>/dev/null | wc -l)" -le 1 ]; then
                 apt-get update -qq >/dev/null 2>&1
             fi
-            DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || {
-                apt-get update -qq >/dev/null 2>&1
-                DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1
-            }
+            if [ -f /run/.containerenv ] || grep -qaE 'libpod|podman' /proc/1/cgroup /proc/1/environ 2>/dev/null; then
+                local pkg
+                for pkg in $pkgs; do
+                    if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed'; then
+                        continue
+                    fi
+                    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                        -o Dpkg::Use-Pty=0 -o Acquire::Languages=none "$pkg" >/dev/null 2>&1; then
+                        apt-get update -qq -o Acquire::Languages=none >/dev/null 2>&1 || return 1
+                        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                            -o Dpkg::Use-Pty=0 -o Acquire::Languages=none "$pkg" >/dev/null 2>&1 || return 1
+                    fi
+                done
+            else
+                DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || {
+                    apt-get update -qq >/dev/null 2>&1
+                    DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1
+                }
+            fi
         elif command -v yum >/dev/null; then yum install -y $pkgs >/dev/null 2>&1
         elif command -v dnf >/dev/null; then dnf install -y $pkgs >/dev/null 2>&1
         fi
@@ -179,9 +242,17 @@ _ensure_xray_dependencies() {
 _xray_atomic_modify_json() {
         local file="$1" filter="$2"
         [ ! -f "$file" ] && return 1
-        local tmp
-        # Xray 新版本会按文件扩展名识别配置格式；候选配置必须保留 .json 后缀。
-        tmp=$(mktemp "${file}.tmp.XXXXXX.json") || return 1
+        local tmp tmp_stub
+        # Xray 新版本会按文件扩展名识别配置格式；候选配置必须保留 .json
+        # 后缀。但 BusyBox mktemp 要求模板以 XXXXXX 结尾，不支持 GNU
+        # mktemp 的任意后缀写法。先在同一受保护目录中占用随机文件名，
+        # 再原子改名为 .json，兼顾 Alpine 与 Debian。
+        tmp_stub=$(mktemp "${file}.tmp.XXXXXX") || return 1
+        tmp="${tmp_stub}.json"
+        if ! mv -f -- "$tmp_stub" "$tmp"; then
+            rm -f -- "$tmp_stub"
+            return 1
+        fi
         if ! jq "$filter" "$file" > "$tmp" || ! jq empty "$tmp" >/dev/null 2>&1; then
             _error "修改JSON失败: $file"
             rm -f -- "$tmp"
@@ -485,6 +556,8 @@ _install_xray() {
 }
 
 _create_xray_systemd_service() {
+    local mem_limit_mb
+    mem_limit_mb=$(_xray_get_mem_limit) || return 1
     cat > /etc/systemd/system/xray.service <<EOF
 [Unit]
 Description=Xray Service
@@ -492,6 +565,7 @@ After=network.target
 
 [Service]
 Type=simple
+Environment="GOMEMLIMIT=${mem_limit_mb}MiB"
 ExecStart=${XRAY_BIN} run -c ${XRAY_CONFIG}
 Restart=on-failure
 RestartSec=3
@@ -505,9 +579,12 @@ EOF
 }
 
 _create_xray_openrc_service() {
+    local mem_limit_mb
+    mem_limit_mb=$(_xray_get_mem_limit) || return 1
     cat > /etc/init.d/xray <<EOF
 #!/sbin/openrc-run
 description="Xray Service"
+export GOMEMLIMIT="${mem_limit_mb}MiB"
 command="${XRAY_BIN}"
 command_args="run -c ${XRAY_CONFIG}"
 pidfile="${XRAY_PID_FILE}"
@@ -524,9 +601,9 @@ EOF
 
 _create_xray_service() {
     if [ "$INIT_SYSTEM" == "systemd" ]; then
-        [ -f /etc/systemd/system/xray.service ] || _create_xray_systemd_service
+        _create_xray_systemd_service
     elif [ "$INIT_SYSTEM" == "openrc" ]; then
-        [ -f /etc/init.d/xray ] || _create_xray_openrc_service
+        _create_xray_openrc_service
     elif [ "$INIT_SYSTEM" == "direct" ]; then
         mkdir -p "$XRAY_RUN_DIR"
         chmod 700 "$XRAY_RUN_DIR"
@@ -552,9 +629,12 @@ _manage_xray_service() {
     fi
     local rc=0
     if [ "$INIT_SYSTEM" == "systemd" ]; then
-        systemctl "$action" xray 2>/dev/null || rc=$?
+        if [[ "$action" == "start" || "$action" == "restart" ]]; then
+            systemctl reset-failed xray >/dev/null 2>&1 || true
+        fi
+        systemctl "$action" xray 2>/dev/null 8>&- 9>&- 219>&- || rc=$?
     elif [ "$INIT_SYSTEM" == "openrc" ]; then
-        rc-service xray "$action" 2>/dev/null || rc=$?
+        rc-service xray "$action" 2>/dev/null 8>&- 9>&- 219>&- || rc=$?
     elif [ "$INIT_SYSTEM" == "direct" ]; then
         local pid_file="$XRAY_PID_FILE"
         local log_file="/var/log/xray.log"
@@ -564,7 +644,8 @@ _manage_xray_service() {
                     :
                 else
                     rm -f "$pid_file"
-                    nohup "$XRAY_BIN" run -c "$XRAY_CONFIG" >> "$log_file" 2>&1 &
+                    nohup env GOMEMLIMIT="$(_xray_get_mem_limit)MiB" \
+                        "$XRAY_BIN" run -c "$XRAY_CONFIG" >> "$log_file" 2>&1 8>&- 9>&- 219>&- &
                     echo $! > "$pid_file"
                     sleep 1
                     _xray_is_pid_file_running_cmd "$pid_file" "$XRAY_BIN" || rc=1
@@ -1251,7 +1332,9 @@ _add_vless_h2_tls() {
     
     local cert_pcs=$(_cert_sha256_hex "$cert_path")
     local insecure_param="&insecure=1"
-    [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
+    # Xray 2026-06-01 起移除了 allowInsecure；同时输出 insecure=1 与
+    # pcs 会令新核心拒绝客户端配置。可固定证书时只输出 pcs。
+    [ -n "$cert_pcs" ] && insecure_param="&pcs=${cert_pcs}"
     local link="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&sni=${sni}&alpn=h2&type=xhttp&mode=stream-one&path=$(_url_encode "$path")&host=${sni}${insecure_param}#$(_url_encode "$name")"
     
     _save_xray_meta "$tag" "$name" "$link" || return 1
@@ -1335,7 +1418,7 @@ _add_xray_vless_grpc_tls() {
     
     local cert_pcs=$(_cert_sha256_hex "$cert_path")
     local insecure_param="&insecure=1"
-    [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
+    [ -n "$cert_pcs" ] && insecure_param="&pcs=${cert_pcs}"
     local link="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&sni=${sni}&type=grpc&serviceName=${service_name}&authority=${sni}${insecure_param}#$(_url_encode "$name")"
     
     _save_xray_meta "$tag" "$name" "$link" || return 1
@@ -1418,7 +1501,7 @@ _add_trojan_grpc_tls() {
     
     local cert_pcs=$(_cert_sha256_hex "$cert_path")
     local insecure_param="&insecure=1"
-    [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
+    [ -n "$cert_pcs" ] && insecure_param="&pcs=${cert_pcs}"
     local link="trojan://${password}@${link_ip}:${port}?security=tls&type=grpc&serviceName=${service_name}&authority=${sni}&sni=${sni}${insecure_param}#$(_url_encode "$name")"
     
     _save_xray_meta "$tag" "$name" "$link" || return 1

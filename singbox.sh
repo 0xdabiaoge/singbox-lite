@@ -4,20 +4,17 @@
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20"
+export SCRIPT_VERSION="24"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
+SINGBOX_FIXED_VERSION="1.13.21"
+SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
-
-# 注入 sing-box 1.12+ 废弃配置兼容环境变量 (用于脚本内嵌的前台命令调用，如 check/generate)
-export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS="true"
-export ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM="true"
-export ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER="true"
 
 # --- 核心工具函数 ---
 
@@ -87,7 +84,7 @@ _secure_state_permissions() {
     for path in \
         "$CONFIG_FILE" "$CLASH_YAML_FILE" "$METADATA_FILE" "$ARGO_METADATA_FILE" \
         "${SINGBOX_DIR}/relay.json" "${SINGBOX_DIR}/relay_links.json" \
-        "${SINGBOX_DIR}/relay_pf.json" "/usr/local/etc/xray/config.json" \
+        "${SINGBOX_DIR}/relay_pf.json" "$SINGBOX_CORE_LOCK_FILE" "/usr/local/etc/xray/config.json" \
         "/usr/local/etc/xray/metadata.json"; do
         [ -f "$path" ] && chmod 600 "$path" 2>/dev/null || true
     done
@@ -140,9 +137,15 @@ _tls_insecure_params() {
     local cert_path="$2"
     local insecure_param=""
     if [[ "$skip_verify" == "true" ]]; then
-        insecure_param="&insecure=1"
         local cert_pcs=$(_cert_sha256_hex "$cert_path")
-        [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
+        # Xray 已在 2026-06-01 后移除 allowInsecure；同时携带
+        # insecure=1 与 pcs 会让新核心直接拒绝配置。能固定自签叶证书
+        # 时只使用证书指纹，无法计算时才保留旧参数作为兼容兜底。
+        if [ -n "$cert_pcs" ]; then
+            insecure_param="&pcs=${cert_pcs}"
+        else
+            insecure_param="&insecure=1"
+        fi
     fi
     printf '%s' "$insecure_param"
 }
@@ -553,10 +556,15 @@ _init_server_ip() {
 _manage_service() {
     local action="$1"
 
-    # [关键核心修复] 动态注入内置 NTP 时间同步模块
-    # 解决部分廉价 LXC/Docker 容器无法修改母机系统时间，导致 SS-2022 触发 30s 重放保护直接爆 bad timestamp 拒连的断流问题
+    # 容器时间通常继承宿主机；但部分 Podman 服务商会封锁 UDP/123。
+    # sing-box 的内置 NTP 初始化失败属于致命错误，因此 Podman 仅移除本脚本
+    # 曾自动写入的默认项，用户自行配置的 NTP 则保留不动。
     if [[ "$action" == "restart" || "$action" == "start" ]]; then
-        if [ -s "$CONFIG_FILE" ] && ! jq -e '.ntp' "$CONFIG_FILE" >/dev/null 2>&1; then
+        if _is_podman_environment; then
+            if [ -s "$CONFIG_FILE" ] && jq -e '.ntp == {"enabled":true,"server":"time.apple.com","server_port":123,"interval":"30m"}' "$CONFIG_FILE" >/dev/null 2>&1; then
+                _atomic_modify_json "$CONFIG_FILE" 'del(.ntp)' 2>/dev/null || return 1
+            fi
+        elif [ -s "$CONFIG_FILE" ] && ! jq -e '.ntp' "$CONFIG_FILE" >/dev/null 2>&1; then
             _info "检测到内核配置缺失内置时间同步(NTP)模块，正在自动注入防重放保护补丁..."
             _atomic_modify_json "$CONFIG_FILE" '.ntp = {"enabled": true, "server": "time.apple.com", "server_port": 123, "interval": "30m"}' 2>/dev/null
         fi
@@ -575,10 +583,16 @@ _manage_service() {
     case "$INIT_SYSTEM" in
         systemd)
             if [ "$action" == "status" ]; then systemctl status sing-box --no-pager -l; return; fi
-            systemctl "$action" sing-box ;;
+            # Containers and rapid successive management operations can exhaust
+            # systemd's start-rate counter even when the configuration is valid.
+            # Clear the counter before an explicit operator start/restart.
+            if [ "$action" == "start" ] || [ "$action" == "restart" ]; then
+                systemctl reset-failed sing-box >/dev/null 2>&1 || true
+            fi
+            systemctl "$action" sing-box 8>&- 9>&- 219>&- ;;
         openrc)
             if [ "$action" == "status" ]; then rc-service sing-box status; return; fi
-            rc-service sing-box "$action" ;;
+            rc-service sing-box "$action" 8>&- 9>&- 219>&- ;;
         direct)
             if ! _prepare_singbox_runtime_pid; then
                 _error "无法准备受保护的运行目录: ${RUNTIME_DIR}"
@@ -593,11 +607,8 @@ _manage_service() {
                     rm -f "$PID_FILE"
                     [ -s "${SINGBOX_DIR}/relay.json" ] || echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "${SINGBOX_DIR}/relay.json"
                     nohup env GOMEMLIMIT="$(_get_mem_limit)MiB" \
-                        ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true \
-                        ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true \
-                        ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true \
                         "$SINGBOX_BIN" run -c "$CONFIG_FILE" -c "${SINGBOX_DIR}/relay.json" \
-                        >> "$LOG_FILE" 2>&1 &
+                        >> "$LOG_FILE" 2>&1 8>&- 9>&- 219>&- &
                     echo $! > "$PID_FILE"
                     chmod 600 "$PID_FILE" 2>/dev/null || true
                     sleep 1
@@ -651,11 +662,29 @@ _pkg_install() {
         if [ ! -d "/var/lib/apt/lists" ] || [ "$(ls -A /var/lib/apt/lists/ 2>/dev/null | wc -l)" -le 1 ]; then
             apt-get update -qq >/dev/null 2>&1
         fi
-        DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || {
-            # 兜底：如果安装失败，强制刷新索引后重试
-            apt-get update -qq >/dev/null 2>&1
-            DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1
-        }
+        # 128M Podman 中一次解析/解包整批依赖会把 apt 推到 cgroup 上限，常见结果是
+        # 第一次 apt-get 被 OOM kill、第二次依靠部分安装状态侥幸成功。容器内改为逐包、
+        # 禁用 recommends 和 dpkg PTY，主动压低峰值内存；普通 LXC/KVM 仍保留批量安装。
+        if _is_podman_environment; then
+            local pkg
+            for pkg in $pkgs; do
+                if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed'; then
+                    continue
+                fi
+                if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                    -o Dpkg::Use-Pty=0 -o Acquire::Languages=none "$pkg" >/dev/null 2>&1; then
+                    apt-get update -qq -o Acquire::Languages=none >/dev/null 2>&1 || return 1
+                    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                        -o Dpkg::Use-Pty=0 -o Acquire::Languages=none "$pkg" >/dev/null 2>&1 || return 1
+                fi
+            done
+        else
+            DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || {
+                # 兜底：如果安装失败，强制刷新索引后重试
+                apt-get update -qq >/dev/null 2>&1
+                DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1
+            }
+        fi
     elif command -v yum &>/dev/null; then yum install -y $pkgs >/dev/null 2>&1
     elif command -v dnf &>/dev/null; then dnf install -y $pkgs >/dev/null 2>&1
     else
@@ -993,26 +1022,40 @@ _rollback_main_node_creation() {
 
 # 内存限额计算
 _get_mem_limit() {
-    local total_mem_mb=$(free -m | awk '/^Mem:/{print $2}')
-    local cgroup_limit=""
-    local limit
+    local total_mem_mb=0 cgroup_limit="" candidate_mb=0
+    local limit limit_file
 
-    [ -z "$total_mem_mb" ] && total_mem_mb=128
+    total_mem_mb=$(awk '/^MemTotal:/{print int($2 / 1024); exit}' /proc/meminfo 2>/dev/null)
+    [[ "$total_mem_mb" =~ ^[0-9]+$ ]] || total_mem_mb=0
 
+    # cgroup v2 的 memory.high 也可能比 memory.max 更早触发回收；取系统
+    # 可见内存、memory.max 和 memory.high 中最小的有效值，兼容嵌套容器。
     if [ -r /sys/fs/cgroup/memory.max ]; then
-        cgroup_limit=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
-        if [ "$cgroup_limit" != "max" ] && [ -n "$cgroup_limit" ]; then
-            total_mem_mb=$((cgroup_limit / 1024 / 1024))
-        fi
+        for limit_file in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.high; do
+            [ -r "$limit_file" ] || continue
+            cgroup_limit=$(cat "$limit_file" 2>/dev/null)
+            if [[ "$cgroup_limit" =~ ^[0-9]+$ ]] && [ "$cgroup_limit" -lt 9223372036854771712 ] 2>/dev/null; then
+                candidate_mb=$((cgroup_limit / 1024 / 1024))
+                if [ "$candidate_mb" -gt 0 ] && { [ "$total_mem_mb" -eq 0 ] || [ "$candidate_mb" -lt "$total_mem_mb" ]; }; then
+                    total_mem_mb=$candidate_mb
+                fi
+            fi
+        done
     elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
         cgroup_limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)
-        if [ -n "$cgroup_limit" ] && [ "$cgroup_limit" -lt 9223372036854771712 ] 2>/dev/null; then
-            total_mem_mb=$((cgroup_limit / 1024 / 1024))
+        if [[ "$cgroup_limit" =~ ^[0-9]+$ ]] && [ "$cgroup_limit" -lt 9223372036854771712 ] 2>/dev/null; then
+            candidate_mb=$((cgroup_limit / 1024 / 1024))
+            if [ "$candidate_mb" -gt 0 ] && { [ "$total_mem_mb" -eq 0 ] || [ "$candidate_mb" -lt "$total_mem_mb" ]; }; then
+                total_mem_mb=$candidate_mb
+            fi
         fi
     fi
 
+    [ "$total_mem_mb" -gt 0 ] || total_mem_mb=128
+
     if [ "$total_mem_mb" -le 128 ]; then
-        limit=48
+        # 128MB 机器保留更多空间给内核、TLS、socket 缓冲和测速客户端。
+        limit=$((total_mem_mb * 5 / 16))
     elif [ "$total_mem_mb" -le 256 ]; then
         limit=$((total_mem_mb * 50 / 100))
     elif [ "$total_mem_mb" -le 512 ]; then
@@ -1098,6 +1141,8 @@ _install_yq() {
 # --- 核心变量定义 ---
 export SINGBOX_DIR="/usr/local/etc/sing-box"
 export SINGBOX_BIN="/usr/local/bin/sing-box"
+export SINGBOX_FIXED_VERSION="1.13.21"
+export SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
 export YQ_BINARY="/usr/local/bin/yq"
 export CONFIG_FILE="${SINGBOX_DIR}/config.json"
 export RELAY_CONFIG_FILE="${SINGBOX_DIR}/relay.json"
@@ -1239,8 +1284,40 @@ _ensure_nftables() {
     return 0
 }
 
+_singbox_core_is_locked() {
+    [ -s "$SINGBOX_CORE_LOCK_FILE" ]
+}
+
+_write_singbox_core_lock() {
+    local tmp
+    mkdir -p "$SINGBOX_DIR" || return 1
+    tmp=$(mktemp "${SINGBOX_CORE_LOCK_FILE}.tmp.XXXXXX") || return 1
+    if ! printf '%s\n' "$SINGBOX_FIXED_VERSION" > "$tmp" \
+        || ! chmod 600 "$tmp" \
+        || ! mv -f "$tmp" "$SINGBOX_CORE_LOCK_FILE"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
 _install_sing_box() {
-    _info "正在安装最新稳定版 sing-box..."
+    local requested_version="${1:-latest}"
+    local api_url requested_label
+    case "$requested_version" in
+        latest)
+            api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+            requested_label="最新稳定版"
+            ;;
+        "$SINGBOX_FIXED_VERSION")
+            api_url="https://api.github.com/repos/SagerNet/sing-box/releases/tags/v${SINGBOX_FIXED_VERSION}"
+            requested_label="固定版 v${SINGBOX_FIXED_VERSION}"
+            ;;
+        *)
+            _error "不允许安装未授权的 sing-box 版本: ${requested_version}"
+            return 1
+            ;;
+    esac
+    _info "正在安装 ${requested_label} sing-box..."
     local arch=$(uname -m)
     local arch_tag
     case $arch in
@@ -1257,23 +1334,39 @@ _install_sing_box() {
         libc_suffix="-musl"
     fi
     
-    local api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
     local search_pattern="linux-${arch_tag}${libc_suffix}.tar.gz"
-    local asset_info asset_count asset_name download_url asset_digest
+    local asset_info release_tag release_draft release_prerelease
+    local asset_count asset_name download_url asset_digest release_version expected_asset_name
     if ! asset_info=$(curl -fsSL --retry 3 --connect-timeout 10 "$api_url" | jq -r --arg pattern "$search_pattern" '
         [.assets[] | select(.name | endswith($pattern))] as $matches
-        | [($matches | length), ($matches[0].name // ""), ($matches[0].browser_download_url // ""), ($matches[0].digest // "")]
+        | [(.tag_name // ""),
+           (if (.draft | type) == "boolean" then .draft else true end),
+           (if (.prerelease | type) == "boolean" then .prerelease else true end),
+           ($matches | length), ($matches[0].name // ""),
+           ($matches[0].browser_download_url // ""), ($matches[0].digest // "")]
         | @tsv
     '); then
         _error "无法读取 sing-box 官方发布信息。"
         return 1
     fi
-    IFS=$'\t' read -r asset_count asset_name download_url asset_digest <<< "$asset_info"
+    IFS=$'\t' read -r release_tag release_draft release_prerelease asset_count asset_name download_url asset_digest <<< "$asset_info"
+    if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+        || [ "$release_draft" != "false" ] || [ "$release_prerelease" != "false" ]; then
+        _error "sing-box 官方发布元数据无效或不是稳定版，已拒绝安装。"
+        return 1
+    fi
+    release_version="${release_tag#v}"
+    if [ "$requested_version" != "latest" ] && [ "$release_version" != "$requested_version" ]; then
+        _error "固定版响应不匹配：请求 v${requested_version}，实际为 ${release_tag}。"
+        return 1
+    fi
     if [ "$asset_count" != "1" ]; then
         _error "sing-box 官方发布中目标资产数量异常 (${asset_count:-无法解析})，已拒绝安装。"
         return 1
     fi
-    if [ -z "$asset_name" ] || [ -z "$download_url" ] || [[ "$download_url" != https://github.com/SagerNet/sing-box/releases/download/* ]]; then
+    expected_asset_name="sing-box-${release_version}-linux-${arch_tag}${libc_suffix}.tar.gz"
+    if [ "$asset_name" != "$expected_asset_name" ] || [ -z "$download_url" ] \
+        || [[ "$download_url" != "https://github.com/SagerNet/sing-box/releases/download/${release_tag}/${expected_asset_name}" ]]; then
         _error "无法获取可信的 sing-box 下载链接 (搜索: ${search_pattern})。"
         return 1
     fi
@@ -1282,7 +1375,7 @@ _install_sing_box() {
         return 1
     fi
 
-    local temp_dir extracted_bin expected actual staged_bin digest_file
+    local temp_dir extracted_bin expected actual staged_bin digest_file extracted_version
     mkdir -p /var/tmp || { _error "创建安装临时目录失败。"; return 1; }
     # 上一次安装若被 OOM/SIGKILL 终止，退出清理不会执行。只清理本脚本
     # 使用的精确目录，避免残留的 90MB 二进制继续挤占容器内存配额。
@@ -1341,6 +1434,12 @@ _install_sing_box() {
         rm -rf "$temp_dir"
         return 1
     fi
+    extracted_version=$("$extracted_bin" version 2>/dev/null | sed -n 's/^sing-box version \([^[:space:]]*\).*/\1/p' | head -n 1)
+    if [ "$extracted_version" != "$release_version" ]; then
+        _error "下载核心版本与官方发布不匹配：期望 v${release_version}，实际 v${extracted_version:-未知}。"
+        rm -rf "$temp_dir"
+        return 1
+    fi
 
     # 在触碰旧核心之前，用新核心校验真实的双配置组合。
     if [ -s "$CONFIG_FILE" ]; then
@@ -1387,7 +1486,8 @@ _install_sing_box() {
 
     rm -rf "$temp_dir"
     _release_install_cache
-    _success "sing-box 安装成功: ${SINGBOX_BIN}"
+    SINGBOX_STAGED_VERSION="$release_version"
+    _success "sing-box v${release_version} 已安全暂存: ${SINGBOX_BIN}"
 }
 
 _rollback_singbox_binary() {
@@ -1521,10 +1621,42 @@ _migrate_legacy_argo_state() {
     rm -f -- "$legacy_pid_file" "$legacy_log_file"
 }
 
+_argo_domain_resolves() {
+    local domain="$1" remote_ip="" dns_json=""
+    [[ "$domain" =~ ^[A-Za-z0-9-]+\.trycloudflare\.com$ ]] || return 1
+
+    if command -v getent >/dev/null 2>&1; then
+        getent ahostsv4 "$domain" >/dev/null 2>&1 && return 0
+        getent hosts "$domain" >/dev/null 2>&1 && return 0
+    fi
+    if command -v nslookup >/dev/null 2>&1; then
+        nslookup "$domain" >/dev/null 2>&1 && return 0
+    fi
+
+    # 系统递归解析器可能缓存刚创建域名的 NXDOMAIN。Quick Tunnel 属于
+    # Cloudflare 服务，额外用其 DoH 端点核验公开记录，避免本机负缓存误判。
+    if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        dns_json=$(curl -fsS --connect-timeout 5 --max-time 10 \
+            -H 'accept: application/dns-json' --get \
+            --data-urlencode "name=${domain}" --data-urlencode 'type=A' \
+            'https://1.1.1.1/dns-query' 2>/dev/null || true)
+        printf '%s' "$dns_json" | jq -e '
+            (.Status == 0) and any(.Answer[]?; (.type == 1 or .type == 28) and ((.data // "") | length > 0))
+        ' >/dev/null 2>&1 && return 0
+    fi
+
+    # 精简容器可能同时缺少 getent/nslookup。curl 即使收到后端协议错误，
+    # 只要已经解析并连接到边缘节点，也会填充 remote_ip。
+    remote_ip=$(curl -ksS --connect-timeout 5 --max-time 8 -o /dev/null \
+        -w '%{remote_ip}' "https://${domain}/" 2>/dev/null || true)
+    [ -n "$remote_ip" ]
+}
+
 _start_argo_tunnel() {
     local target_port="$1"
     local protocol="$2"
     local token="$3" # 可选，用于固定隧道
+    local retry_count="${4:-0}"
     
     # 基于端口生成独立的受保护 PID 和日志路径，并迁移旧 /tmp 状态。
     local pid_file log_file
@@ -1618,7 +1750,35 @@ _start_argo_tunnel() {
         echo "" >&2
         
         if [ -n "$tunnel_domain" ]; then
-            _info "域名已获取，正在进行稳定性测试 (5秒)..." >&2
+            _info "域名已获取，正在等待 DNS 发布 (最多90秒)..." >&2
+            local dns_wait=0 dns_ready=false
+            while [ "$dns_wait" -lt 90 ]; do
+                if _argo_domain_resolves "$tunnel_domain"; then
+                    dns_ready=true
+                    break
+                fi
+                if ! _is_pid_running_cmd "$cf_pid" "$CLOUDFLARED_BIN"; then
+                    break
+                fi
+                sleep 5
+                dns_wait=$((dns_wait + 5))
+            done
+
+            if [ "$dns_ready" != true ]; then
+                _warn "Cloudflare 已分配临时域名，但 DNS 尚未发布，正在清理本次隧道。" >&2
+                _is_pid_running_cmd "$cf_pid" "$CLOUDFLARED_BIN" && kill "$cf_pid" 2>/dev/null
+                wait "$cf_pid" 2>/dev/null || true
+                rm -f -- "$pid_file" "$log_file"
+                if [ "$retry_count" -lt 1 ]; then
+                    _warn "正在自动重新申请一次临时域名..." >&2
+                    _start_argo_tunnel "$target_port" "$protocol" "" "$((retry_count + 1))"
+                    return $?
+                fi
+                _error "Cloudflare 临时域名连续两次未完成 DNS 发布，请稍后重试。" >&2
+                return 1
+            fi
+
+            _info "域名已发布，正在进行稳定性测试 (5秒)..." >&2
             sleep 5
             if ! _is_pid_running_cmd "$cf_pid" "$CLOUDFLARED_BIN"; then
                  _error "稳定性测试失败：cloudflared 进程异常退出。" >&2
@@ -1975,7 +2135,16 @@ _add_argo_node() {
     fi
 
     # === [公共] 启用守护 + 显示结果 ===
-    _enable_argo_watchdog
+    # 守护是 Argo 节点的完整性条件；失败时回滚本次节点，避免产生
+    # 表面创建成功但重启后无法自愈的半成品状态。
+    if ! _enable_argo_watchdog; then
+        _stop_argo_tunnel "$port"
+        _atomic_modify_json "$CONFIG_FILE" 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$tag" >/dev/null 2>&1 || true
+        _atomic_modify_json "$ARGO_METADATA_FILE" 'del(.[$tag])' --arg tag "$tag" >/dev/null 2>&1 || true
+        _remove_node_from_yaml "$name" >/dev/null 2>&1 || true
+        _manage_service "restart" >/dev/null 2>&1 || true
+        return 1
+    fi
 
     echo ""
     _success "${protocol_label} + Argo 节点创建成功!"
@@ -2213,7 +2382,7 @@ _restart_argo_tunnel_menu() {
     local selected_indices=()
     if [ "$choice" == "a" ]; then
         # 生成所有索引
-        for ((j=0; j<${#keys[@]}; j++)); do selected_indices+=($j); done
+        for ((j=0; j<${#keys[@]}; j++)); do selected_indices+=("$j"); done
     elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -gt 0 ] && [ "$choice" -le "${#keys[@]}" ]; then
         selected_indices+=($((choice - 1)))
     else
@@ -2261,14 +2430,15 @@ _restart_argo_tunnel_menu() {
         local new_domain=""
         if [ "$type" == "fixed" ]; then
             if _start_argo_tunnel "$port" "$proto_short-ws" "$token"; then
-                 new_domain=$(jq -r ".\"$tag\".domain" "$ARGO_METADATA_FILE")
+                 new_domain=$(jq -r --arg tag "$tag" '.[$tag].domain // empty' "$ARGO_METADATA_FILE")
             else
                  _error "固定隧道重启失败: $name"
             fi
         else
             new_domain=$(_start_argo_tunnel "$port" "$proto_short-ws")
             if [ -n "$new_domain" ]; then
-                 _atomic_modify_json "$ARGO_METADATA_FILE" ".\"$tag\".domain = \"$new_domain\""
+                 _atomic_modify_json "$ARGO_METADATA_FILE" '.[$tag].domain = $domain' \
+                     --arg tag "$tag" --arg domain "$new_domain"
                  _success "更新临时域名: $new_domain"
                  
                  # [同步链接] 临时域名变动，立即重新持久化链接
@@ -2296,8 +2466,11 @@ _argo_keepalive() {
 
     # --- 性能优化: 日志轮转 (10MB) ---
     local max_size=$((10 * 1024 * 1024))
+    local log_size
     for log in "$LOG_FILE" "$ARGO_LOG_FILE"; do
-        if [ -f "$log" ] && [ $(wc -c < "$log" 2>/dev/null || echo 0) -ge $max_size ]; then
+        log_size=0
+        [ -f "$log" ] && log_size=$(wc -c < "$log" 2>/dev/null || echo 0)
+        if [[ "$log_size" =~ ^[0-9]+$ ]] && [ "$log_size" -ge "$max_size" ]; then
             local log_tmp
             log_tmp=$(mktemp "${log}.tmp.XXXXXX") || continue
             if tail -n 1000 "$log" > "$log_tmp"; then
@@ -2316,11 +2489,27 @@ _argo_keepalive() {
         return
     fi
 
-    # 遍历所有节点
-    local i=0
-    # [资源优化] 合并提取所有必要元数据，支持域名链接同步
-    while IFS=$'\t' read -r tag port type token protocol name uuid password path; do
+    # 遍历所有节点。这里不能使用 TSV 配合 IFS=$'\t'：临时隧道的 token
+    # 必然为空，而 Bash 会折叠连续的空白 IFS 字符，导致 protocol/name/uuid
+    # 整体左移，守护重启后甚至会把 UUID 误写成节点名称。逐条读取紧凑 JSON
+    # 可同时正确保留空字段以及名称、路径中的空格和分隔符。
+    local entry tag port type token protocol name uuid password path
+    while IFS= read -r entry; do
+        [ -z "$entry" ] && continue
+        tag=$(jq -r '.key // empty' <<< "$entry")
+        port=$(jq -r '.value.local_port // empty' <<< "$entry")
+        type=$(jq -r '.value.type // ""' <<< "$entry")
+        token=$(jq -r '.value.token // ""' <<< "$entry")
+        protocol=$(jq -r '.value.protocol // "vless-ws"' <<< "$entry")
+        name=$(jq -r '.value.name // ""' <<< "$entry")
+        uuid=$(jq -r '.value.uuid // ""' <<< "$entry")
+        password=$(jq -r '.value.password // ""' <<< "$entry")
+        path=$(jq -r '.value.path // ""' <<< "$entry")
         [ -z "$tag" ] && continue
+        [[ "$port" =~ ^[0-9]+$ ]] || {
+            logger "sing-box-watchdog: Ignoring invalid Argo metadata entry: $tag"
+            continue
+        }
         
         local pid_file
         _migrate_legacy_argo_state "$port" >/dev/null 2>&1 || true
@@ -2352,7 +2541,8 @@ _argo_keepalive() {
                  local new_domain=$(_start_argo_tunnel "$port" "$proto_short-ws")
                  if [ -n "$new_domain" ]; then
                       # 更新元数据
-                      _atomic_modify_json "$ARGO_METADATA_FILE" ".\"$tag\".domain = \"$new_domain\""
+                      _atomic_modify_json "$ARGO_METADATA_FILE" '.[$tag].domain = $domain' \
+                          --arg tag "$tag" --arg domain "$new_domain"
                       logger "sing-box-watchdog: Temp tunnel $tag restarted with new domain: $new_domain"
                       
                       # [同步链接] 临时域名变动，静默更新持久化链接
@@ -2366,24 +2556,85 @@ _argo_keepalive() {
                  fi
             fi
         fi
-    done < <(jq -r 'to_entries[] | [.key, (.value.local_port|tostring), (.value.type // ""), (.value.token // ""), (.value.protocol // "vless-ws"), .value.name, (.value.uuid // ""), (.value.password // ""), (.value.path // "")] | @tsv' "$ARGO_METADATA_FILE" 2>/dev/null)
+    done < <(jq -c 'to_entries[]' "$ARGO_METADATA_FILE" 2>/dev/null)
     flock -u 7 2>/dev/null || true
     exec 7>&-
 }
 
-_enable_argo_watchdog() {
-    # 检查 crontab 是否已有任务
-    local job="* * * * * bash ${SELF_SCRIPT_PATH} keepalive >/dev/null 2>&1"
-    
-    if ! crontab -l 2>/dev/null | grep -Fq "$job"; then
-        _info "正在添加后台守护进程 (Watchdog)..."
-        (crontab -l 2>/dev/null; echo "$job") | crontab -
-        if [ $? -eq 0 ]; then
-            _success "守护进程已启用！(每分钟检查并自动修复失效隧道)"
-        else
-            _warning "添加 Crontab 失败，守护进程未生效。"
+_ensure_argo_cron() {
+    local cron_pkg="cron"
+    local services=(cron crond cronie)
+    local service_name started=false
+
+    if command -v apk &>/dev/null; then
+        cron_pkg="dcron"
+        services=(dcron crond)
+    elif ! command -v apt-get &>/dev/null; then
+        cron_pkg="cronie"
+        services=(crond cronie)
+    fi
+
+    if ! command -v crontab &>/dev/null; then
+        _info "正在按需安装 Argo 守护依赖: ${cron_pkg}..."
+        if ! _pkg_install "$cron_pkg" || ! command -v crontab &>/dev/null; then
+            _error "安装 Argo 守护依赖失败，未创建不受守护的隧道节点。"
+            return 1
         fi
     fi
+
+    case "${INIT_SYSTEM:-}" in
+        systemd)
+            for service_name in "${services[@]}"; do
+                if systemctl enable --now "${service_name}.service" >/dev/null 2>&1; then
+                    started=true
+                    break
+                fi
+            done
+            ;;
+        openrc)
+            for service_name in "${services[@]}"; do
+                if rc-service "$service_name" start >/dev/null 2>&1; then
+                    rc-update add "$service_name" default >/dev/null 2>&1 || true
+                    started=true
+                    break
+                fi
+            done
+            ;;
+        *)
+            if command -v service &>/dev/null; then
+                for service_name in "${services[@]}"; do
+                    if service "$service_name" start >/dev/null 2>&1; then
+                        started=true
+                        break
+                    fi
+                done
+            fi
+            ;;
+    esac
+
+    if [ "$started" != true ]; then
+        _error "Cron 服务启动失败，无法启用 Argo 自动守护。"
+        return 1
+    fi
+}
+
+_enable_argo_watchdog() {
+    # Podman 低内存安装会跳过可选包；仅在使用 Argo 时按需安装 cron。
+    local job="* * * * * bash ${SELF_SCRIPT_PATH} keepalive >/dev/null 2>&1"
+
+    _ensure_argo_cron || return 1
+    if crontab -l 2>/dev/null | grep -Fq "$job"; then
+        return 0
+    fi
+
+    _info "正在添加后台守护进程 (Watchdog)..."
+    if (crontab -l 2>/dev/null; echo "$job") | crontab -; then
+        _success "守护进程已启用！(每分钟检查并自动修复失效隧道)"
+        return 0
+    fi
+
+    _error "添加 Crontab 失败，未创建不受守护的隧道节点。"
+    return 1
 }
 
 _disable_argo_watchdog() {
@@ -2424,16 +2675,16 @@ _uninstall_argo() {
     
     # 2. 删除 sing-box 中的 Argo inbound 配置
     if [ -f "$ARGO_METADATA_FILE" ]; then
-         # 同样需要遍历删除逻辑，这里简化为遍历 metadata 删除
-         # 为防止 jq 读写竞争，先收集所有 tags
-        local tags=$(jq -r 'keys[]' "$ARGO_METADATA_FILE" 2>/dev/null)
-        for tag in $tags; do
+        # 先保存键数组；不要依赖空白拆词，也不要把键直接拼进 jq 程序。
+        local tags=()
+        mapfile -t tags < <(jq -r 'keys[]' "$ARGO_METADATA_FILE" 2>/dev/null)
+        local tag node_name
+        for tag in "${tags[@]}"; do
              if [ -n "$tag" ]; then
                 _info "正在删除 Argo 隧道: $tag ..."
-                # [修复] 先读取节点名，再删除元数据
-                local node_name=$(jq -r ".\"$tag\".name" "$ARGO_METADATA_FILE" 2>/dev/null)
-    _atomic_modify_json "$ARGO_METADATA_FILE" "del(.\""$tag"\")" 2>/dev/null
-    _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
+                node_name=$(jq -r --arg tag "$tag" '.[$tag].name // empty' "$ARGO_METADATA_FILE" 2>/dev/null)
+                _atomic_modify_json "$ARGO_METADATA_FILE" 'del(.[$tag])' --arg tag "$tag" 2>/dev/null
+                _atomic_modify_json "$CONFIG_FILE" 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$tag"
                 
                 if [ -n "$node_name" ] && [ "$node_name" != "null" ]; then
                     _remove_node_from_yaml "$node_name"
@@ -2475,12 +2726,14 @@ _view_argo_logs() {
     fi
 
     _info "--- 选择要查看日志的 Argo 隧道 ---"
-    local tags=$(jq -r 'keys[]' "$ARGO_METADATA_FILE")
+    local tags=()
+    mapfile -t tags < <(jq -r 'keys[]' "$ARGO_METADATA_FILE")
     local i=1
     local tag_list=()
-    for tag in $tags; do
-        local name=$(jq -r ".\"$tag\".name" "$ARGO_METADATA_FILE")
-        local port=$(jq -r ".\"$tag\".local_port" "$ARGO_METADATA_FILE")
+    local tag name port
+    for tag in "${tags[@]}"; do
+        name=$(jq -r --arg tag "$tag" '.[$tag].name // empty' "$ARGO_METADATA_FILE")
+        port=$(jq -r --arg tag "$tag" '.[$tag].local_port // empty' "$ARGO_METADATA_FILE")
         echo "  ${i}) ${name} (端口: ${port})"
         tag_list[$i]=$tag
         ((i++))
@@ -2491,7 +2744,7 @@ _view_argo_logs() {
 
     local selected_tag=${tag_list[$log_choice]}
     if [ -n "$selected_tag" ]; then
-        local port=$(jq -r ".\"$selected_tag\".local_port" "$ARGO_METADATA_FILE")
+        port=$(jq -r --arg tag "$selected_tag" '.[$tag].local_port // empty' "$ARGO_METADATA_FILE")
         local log_file
         log_file=$(_argo_log_file "$port")
         if [ -f "$log_file" ]; then
@@ -2616,9 +2869,6 @@ After=network.target nss-lookup.target
 
 [Service]
 Environment="GOMEMLIMIT=${mem_limit_mb}MiB"
-Environment="ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true"
-Environment="ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true"
-Environment="ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
 ExecStart=${SINGBOX_BIN} run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json
 Restart=on-failure
 RestartSec=3s
@@ -2638,11 +2888,11 @@ _create_openrc_service() {
 #!/sbin/openrc-run
 
 description="sing-box service"
+export GOMEMLIMIT="${mem_limit_mb}MiB"
 command="${SINGBOX_BIN}"
 command_args="run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json"
 # 使用 supervise-daemon 实现守护和重启
 supervisor="supervise-daemon"
-supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB --env ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true --env ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true --env ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
 respawn_delay=3
 respawn_max=0
 
@@ -2744,6 +2994,27 @@ _view_log() {
     fi
 }
 
+_remove_scheduled_restart_components() {
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl disable --now sing-box-restart.timer >/dev/null 2>&1 || true
+    fi
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-service sing-box-timer stop >/dev/null 2>&1 || true
+    fi
+    if command -v rc-update >/dev/null 2>&1; then
+        rc-update del sing-box-timer default >/dev/null 2>&1 || true
+    fi
+
+    rm -f /etc/systemd/system/sing-box-restart.timer \
+        /etc/systemd/system/sing-box-restart.service \
+        /etc/init.d/sing-box-timer /usr/local/bin/sb-timer.sh
+
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed sing-box-restart.service sing-box-restart.timer >/dev/null 2>&1 || true
+    fi
+}
+
 _uninstall() {
     _warning "！！！警告！！！"
     _warning "本操作将停止并禁用 [主脚本] 服务 (sing-box)，"
@@ -2763,55 +3034,63 @@ _uninstall() {
     read -p "$(echo -e ${YELLOW}"确定要执行卸载吗? (y/N): "${NC})" confirm_main
     [[ "$confirm_main" != "y" && "$confirm_main" != "Y" ]] && _info "卸载已取消。" && return
 
-    # 1. 停止服务
-    _manage_service "stop"
+    # 1. Argo 必须在删除元数据前停止，否则会失去受控 PID 到端口的映射，
+    # 留下仍在运行的 cloudflared 进程。
+    _disable_argo_watchdog 2>/dev/null || true
+    _stop_all_argo_tunnels 2>/dev/null || true
+
+    # 2. 停止主服务，并清理服务定义与定时重启组件。
+    _manage_service "stop" >/dev/null 2>&1 || true
+    _remove_scheduled_restart_components
     if [ "$INIT_SYSTEM" == "systemd" ]; then
-        systemctl disable sing-box >/dev/null 2>&1
-        systemctl daemon-reload
+        systemctl disable --now sing-box >/dev/null 2>&1 || true
     elif [ "$INIT_SYSTEM" == "openrc" ]; then
-        rc-update del sing-box default >/dev/null 2>&1
+        rc-service sing-box stop >/dev/null 2>&1 || true
+        rc-update del sing-box default >/dev/null 2>&1 || true
+    fi
+    rm -f /etc/systemd/system/sing-box.service /etc/init.d/sing-box "$PID_FILE"
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed sing-box.service >/dev/null 2>&1 || true
     fi
 
-    # 2. 清理配置与日志
-    _info "正在清理配置文件与日志..."
+    # 3. 仍在配置和元数据存在时清理 cron 与 nftables 状态。
+    _info "正在清理运行规则与配置文件..."
     _remove_log_cleanup
-    # 清理脚本创建的 nftables 规则
     local pf_meta="${SINGBOX_DIR}/relay_pf.json"
     [ ! -f "$pf_meta" ] && pf_meta="${SINGBOX_DIR}/pf_metadata.json"
     if [ -f "$pf_meta" ] && command -v jq &>/dev/null; then
-        # 清理 DNS 动态刷新的 cron 任务
         if crontab -l 2>/dev/null | grep -qF "# pf-dns-auto-refresh"; then
             crontab -l 2>/dev/null | grep -vF "# pf-dns-auto-refresh" | crontab -
         fi
     fi
     _remove_nftables_rules
-    rm -rf "${SINGBOX_DIR}" "${LOG_FILE}"
-    
-    # 3. 清理 Argo 隧道
-    if [ -f "${CLOUDFLARED_BIN}" ]; then
-        _info "正在清理 Argo 隧道..."
-        _disable_argo_watchdog 2>/dev/null
-        _stop_all_argo_tunnels 2>/dev/null
-        rm -f "${CLOUDFLARED_BIN}"
-        rm -rf "/etc/cloudflared"
+
+    rm -f "${CLOUDFLARED_BIN}" "$RUNTIME_DIR"/argo-*.pid "$RUNTIME_DIR"/argo-keepalive.lock
+    rm -f /tmp/singbox_argo_*.pid /tmp/singbox_argo_*.log
+    rm -f "${ARGO_LOG_FILE}" /var/log/singbox_argo_*.log
+    rm -rf /etc/cloudflared
+
+    # 4. 即使核心文件已部分丢失，也清理残留的 Xray 服务与状态。
+    if [ -f "/usr/local/bin/xray" ] || [ -d "/usr/local/etc/xray" ] \
+        || [ -f /etc/systemd/system/xray.service ] || [ -f /etc/init.d/xray ]; then
+        _info "正在清理 Xray 核心..."
+    fi
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl disable --now xray >/dev/null 2>&1 || true
+    fi
+    if command -v rc-service >/dev/null 2>&1; then rc-service xray stop >/dev/null 2>&1 || true; fi
+    if command -v rc-update >/dev/null 2>&1; then rc-update del xray default >/dev/null 2>&1 || true; fi
+    rm -f /etc/systemd/system/xray.service /etc/init.d/xray /usr/local/bin/xray "$XRAY_PID_FILE"
+    rm -rf /usr/local/etc/xray
+    rm -f /var/log/xray.log
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed xray.service >/dev/null 2>&1 || true
     fi
 
-    # 4. 清理 Xray 核心 (如果已安装)
-    if [ -f "/usr/local/bin/xray" ]; then
-        _info "正在清理 Xray 核心..."
-        if [ "$INIT_SYSTEM" == "systemd" ]; then
-            systemctl stop xray 2>/dev/null
-            systemctl disable xray 2>/dev/null
-            rm -f /etc/systemd/system/xray.service
-            systemctl daemon-reload
-        elif [ "$INIT_SYSTEM" == "openrc" ]; then
-            rc-service xray stop 2>/dev/null
-            rc-update del xray default 2>/dev/null
-            rm -f /etc/init.d/xray
-        fi
-        rm -f "/usr/local/bin/xray"
-        rm -rf "/usr/local/etc/xray"
-    fi
+    rm -rf "${SINGBOX_DIR}"
+    rm -f "${LOG_FILE}"
 
     # 5. 清理组件脚本与别名 (双重清理，防止目录合并后的物理残留)
     _info "正在清理周边环境..."
@@ -2819,13 +3098,6 @@ _uninstall() {
     rm -f "${SCRIPT_DIR}/parser.sh" "${SCRIPT_DIR}/advanced_relay.sh" "${SCRIPT_DIR}/xray_manager.sh"
     rm -f "/usr/local/bin/sb"
     
-    # 5. 复原 MOTD
-    if [ -f "/etc/motd" ]; then
-        sed -i '/sing-box 节点信息/d' /etc/motd 2>/dev/null
-        sed -i '/====/d' /etc/motd 2>/dev/null
-        sed -i '/Base64 订阅/d' /etc/motd 2>/dev/null
-    fi
-
     # 6. 处理主程序 (考虑与线路机共用)
     local relay_script="/root/relay-install.sh"
     if [ -f "$relay_script" ]; then
@@ -2834,6 +3106,8 @@ _uninstall() {
         _info "正在删除 sing-box 主程序..."
         rm -f "${SINGBOX_BIN}" "${YQ_BINARY}"
     fi
+
+    rmdir "$RUNTIME_DIR" >/dev/null 2>&1 || true
 
     _success "清理完成。脚本已自毁。再见！"
     [ -f "${SELF_SCRIPT_PATH}" ] && rm -f "${SELF_SCRIPT_PATH}"
@@ -4887,12 +5161,7 @@ _view_nodes() {
                     fi
                     [ -z "$svc" ] || [ "$svc" == "null" ] && svc="grpc"
                     local skip_verify=$(_get_proxy_field "$proxy_name_to_find" '.["skip-cert-verify"]')
-                    local insecure_param=""
-                    if [[ "$skip_verify" == "true" ]]; then
-                        insecure_param="&insecure=1"
-                        local cert_pcs=$(_cert_sha256_hex "$cert_path")
-                        [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
-                    fi
+                    local insecure_param=$(_tls_insecure_params "$skip_verify" "$cert_path")
                     url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&type=grpc&serviceName=$(_url_encode "$svc")&sni=${sn}${insecure_param}#$(_url_encode "$display_name")"
                 elif [ "$tls_enabled" == "true" ]; then
                     local sn="$tls_sn"
@@ -6043,76 +6312,118 @@ _download_bash_script_atomic() {
     mv -f "$tmp" "$target" || { rm -f "$tmp"; return 1; }
 }
 
-_update_script() {
+_update_script_locked() {
     _info "--- 更新脚本 ---"
-    
+
     if [ "$SCRIPT_UPDATE_URL" == "YOUR_GITHUB_RAW_URL_HERE/singbox.sh" ]; then
         _error "错误：您尚未在脚本中配置 SCRIPT_UPDATE_URL 变量。"
         _warning "请编辑此脚本，找到 SCRIPT_UPDATE_URL 并填入您正确的 GitHub raw 链接。"
         return 1
     fi
 
-    # 更新主脚本。时间戳查询参数用于绕过代理/CDN 的旧文件缓存。
-    _info "正在从 GitHub 下载最新版本..."
-    local temp_script_path
-    temp_script_path=$(mktemp "$(dirname "$SELF_SCRIPT_PATH")/.singbox.sh.new.XXXXXX") || return 1
-    local cache_bust
-    local main_script_url
-    local downloaded_version
+    local cache_bust downloaded_version script_name script_path script_url stage backup i j
+    local names=("singbox.sh" "advanced_relay.sh" "parser.sh" "xray_manager.sh")
+    local targets=("$SELF_SCRIPT_PATH")
+    local urls=()
+    local stages=() backups=() had_original=()
     cache_bust=$(date +%s)
-    main_script_url="${SCRIPT_UPDATE_URL}?v=${cache_bust}"
-    
-    if [[ "$main_script_url" == https://* ]] && wget -qO "$temp_script_path" "$main_script_url"; then
-        if [ ! -s "$temp_script_path" ]; then
-            _error "主脚本下载失败或文件为空！"
-            rm -f "$temp_script_path"
-            return 1
-        fi
+    urls+=("${SCRIPT_UPDATE_URL}?v=${cache_bust}")
 
-        downloaded_version=$(sed -n 's/^export SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$temp_script_path" | head -n 1)
-        if [ -z "$downloaded_version" ] || ! head -n 1 "$temp_script_path" | grep -q '^#!/bin/bash'; then
-            _error "下载内容不是有效的 singbox.sh，已拒绝覆盖本地脚本。"
-            rm -f "$temp_script_path"
-            return 1
-        fi
-        if ! bash -n "$temp_script_path" 2>/dev/null; then
-            _error "下载的新脚本未通过 Bash 语法检查，已拒绝覆盖本地脚本。"
-            rm -f "$temp_script_path"
-            return 1
-        fi
-        
-        chmod 755 "$temp_script_path"
-        mv -f "$temp_script_path" "$SELF_SCRIPT_PATH"
-        _success "主脚本更新成功：v${SCRIPT_VERSION} -> v${downloaded_version}"
-    else
-        _error "主脚本下载失败！请检查网络或 GitHub 链接。"
-        rm -f "$temp_script_path"
-        return 1
-    fi
-    
-    # 需要更新的子脚本列表
-    local sub_scripts=("advanced_relay.sh" "parser.sh" "xray_manager.sh")
-    
-    for script_name in "${sub_scripts[@]}"; do
-        local script_path="${SINGBOX_DIR}/${script_name}"
+    for script_name in "${names[@]:1}"; do
+        script_path="${SINGBOX_DIR}/${script_name}"
         # 与实际执行路径一致：开发/当前目录存在时优先更新它，否则更新生产副本。
         [ -f "${SCRIPT_DIR}/${script_name}" ] && script_path="${SCRIPT_DIR}/${script_name}"
-        local script_url="${GITHUB_RAW_BASE}/${script_name}?v=${cache_bust}"
-        _info "正在更新子脚本: ${script_name} -> ${script_path}..."
-        if _download_bash_script_atomic "$script_url" "$script_path" "$script_name"; then
-            _success "子脚本 (${script_name}) 更新成功并通过 bash -n。"
+        targets+=("$script_path")
+        urls+=("${GITHUB_RAW_BASE}/${script_name}?v=${cache_bust}")
+    done
+
+    _info "正在预下载并校验全部脚本组件..."
+    for i in "${!names[@]}"; do
+        script_name=${names[$i]}
+        script_path=${targets[$i]}
+        script_url=${urls[$i]}
+        mkdir -p "$(dirname "$script_path")" || return 1
+        stage=$(mktemp "$(dirname "$script_path")/.${script_name}.stage.XXXXXX") || return 1
+        rm -f -- "$stage"
+        if ! _download_bash_script_atomic "$script_url" "$stage" "$script_name"; then
+            rm -f -- "$stage" "${stages[@]}"
+            _error "脚本组件 ${script_name} 下载或校验失败；本地文件均未修改。"
+            return 1
+        fi
+        stages+=("$stage")
+    done
+
+    downloaded_version=$(sed -n 's/^export SCRIPT_VERSION="\([^"]*\)".*/\1/p' "${stages[0]}" | head -n 1)
+    if [ -z "$downloaded_version" ]; then
+        rm -f -- "${stages[@]}"
+        _error "下载的主脚本缺少 SCRIPT_VERSION，已拒绝更新。"
+        return 1
+    fi
+    if [[ "$SCRIPT_VERSION" =~ ^[0-9]+$ && "$downloaded_version" =~ ^[0-9]+$ ]] \
+        && [ "$((10#$downloaded_version))" -lt "$((10#$SCRIPT_VERSION))" ]; then
+        rm -f -- "${stages[@]}"
+        _error "仓库版本 v${downloaded_version} 低于本地 v${SCRIPT_VERSION}，已拒绝自动降级。"
+        return 1
+    fi
+
+    # 所有组件都验证成功后再建立回滚副本。任何一个替换失败都会恢复整组文件。
+    for i in "${!targets[@]}"; do
+        script_path=${targets[$i]}
+        if [ -e "$script_path" ] || [ -L "$script_path" ]; then
+            backup=$(mktemp "$(dirname "$script_path")/.${names[$i]}.rollback.XXXXXX") || {
+                rm -f -- "${stages[@]}" "${backups[@]}"
+                return 1
+            }
+            if ! cp -p -- "$script_path" "$backup"; then
+                rm -f -- "$backup" "${stages[@]}" "${backups[@]}"
+                return 1
+            fi
+            backups+=("$backup")
+            had_original+=(1)
         else
-            _warning "子脚本 ${script_name} 更新失败，原文件保持不变。"
+            backups+=("")
+            had_original+=(0)
         fi
     done
-    
-    # 更新 yq 工具（如果缺失或版本过旧）
-    _install_yq
-    
-    _success "所有脚本组件已更新至最新版 (v${downloaded_version})！"
+
+    local commit_failed=0
+    for i in "${!targets[@]}"; do
+        if ! chmod 755 "${stages[$i]}" || ! mv -f -- "${stages[$i]}" "${targets[$i]}"; then
+            commit_failed=1
+            break
+        fi
+    done
+    if [ "$commit_failed" -ne 0 ]; then
+        _error "脚本组提交失败，正在恢复更新前的全部组件。"
+        for j in "${!targets[@]}"; do
+            if [ "${had_original[$j]}" -eq 1 ] && [ -n "${backups[$j]}" ]; then
+                mv -f -- "${backups[$j]}" "${targets[$j]}" 2>/dev/null || true
+            else
+                rm -f -- "${targets[$j]}"
+            fi
+        done
+        rm -f -- "${stages[@]}" "${backups[@]}"
+        return 1
+    fi
+
+    rm -f -- "${stages[@]}" "${backups[@]}"
+    _success "脚本组件已作为一个事务完成更新：v${SCRIPT_VERSION} -> v${downloaded_version}"
+
+    # yq 是独立工具，不参与脚本文件事务；失败时明确提示，不伪报全部成功。
+    if ! _install_yq; then
+        _warning "脚本已更新，但 yq 检查/更新失败，请检查网络后重试。"
+    fi
+
     _info "请重新运行脚本以应用所有变更："
     echo -e "${YELLOW}bash ${SELF_SCRIPT_PATH}${NC}"
-    exit 0
+    return 0
+}
+
+_update_script() {
+    _with_state_lock _update_script_locked
+    local rc=$?
+    [ "$rc" -eq 0 ] && exit 0
+    return "$rc"
 }
 
 # 守卫函数：检查 sing-box 核心是否已安装
@@ -6124,24 +6435,79 @@ _require_singbox() {
     return 0
 }
 
-# [安装/更新 Sing-box 核心] — 双模态：未装就装、已装就更新
+# [安装/更新 Sing-box 核心] — 最新稳定版或永久固定 v1.13.21
 _install_or_update_singbox() {
+    local current_ver="未安装" choice confirm
     if [ -f "${SINGBOX_BIN}" ]; then
-        local current_ver=$(${SINGBOX_BIN} version 2>/dev/null | head -n1 | awk '{print $3}')
-        _info "当前 Sing-box 版本: v${current_ver}，正在检查更新..."
-    else
-        _info "Sing-box 核心未安装，正在执行首次安装..."
+        current_ver=$(${SINGBOX_BIN} version 2>/dev/null | head -n1 | awk '{print $3}')
+        [ -n "$current_ver" ] || current_ver="未知"
     fi
-    _do_update_singbox
+
+    clear
+    echo -e "${CYAN}"
+    echo '  ╔═══════════════════════════════════════╗'
+    echo '  ║       安装/更新 Sing-box 核心         ║'
+    echo '  ╚═══════════════════════════════════════╝'
+    echo -e "${NC}"
+    if [ "$current_ver" = "未安装" ]; then
+        echo -e "  当前版本: ${YELLOW}未安装${NC}"
+    else
+        echo -e "  当前版本: ${GREEN}v${current_ver}${NC}"
+    fi
+
+    if _singbox_core_is_locked; then
+        echo -e "  版本策略: ${YELLOW}固定 v${SINGBOX_FIXED_VERSION}（禁止升级）${NC}"
+        if [ "$current_ver" != "$SINGBOX_FIXED_VERSION" ]; then
+            _warn "检测到固定锁与当前核心版本不一致，请选择 [2] 恢复固定版。"
+        fi
+    else
+        echo -e "  版本策略: ${GREEN}跟随最新稳定版${NC}"
+    fi
+    echo ""
+    echo -e "    ${GREEN}[1]${NC} 安装/更新最新稳定版"
+    echo -e "    ${GREEN}[2]${NC} 安装固定版 v${SINGBOX_FIXED_VERSION}（安装后禁止升级）"
+    echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
+    echo ""
+    read -r -p "  请选择 [0-2]: " choice
+    case "$choice" in
+        1)
+            if _singbox_core_is_locked; then
+                _error "当前核心已固定为 v${SINGBOX_FIXED_VERSION}，不允许升级到其他版本。"
+                _info "如需修复或重装，请选择 [2] 重新安装固定版。"
+                return 1
+            fi
+            _do_update_singbox latest
+            ;;
+        2)
+            if ! _singbox_core_is_locked; then
+                _warn "安装完成后，脚本将永久锁定 v${SINGBOX_FIXED_VERSION}，后续菜单不再允许核心升级。"
+                read -r -p "  确认安装并锁定固定版？(y/N): " confirm
+                [[ "$confirm" =~ ^[Yy]$ ]] || { _info "已取消固定版安装。"; return 0; }
+            fi
+            _do_update_singbox "$SINGBOX_FIXED_VERSION"
+            ;;
+        0) return 0 ;;
+        *) _error "无效输入，请选择 [0-2]。"; return 1 ;;
+    esac
 }
 
 # 执行 sing-box 核心的安装/更新
 _do_update_singbox() {
+    local install_target="${1:-latest}"
+    if [ "$install_target" = "latest" ] && _singbox_core_is_locked; then
+        _error "固定版锁已启用，拒绝执行 sing-box 核心升级。"
+        return 1
+    fi
+    case "$install_target" in
+        latest|"$SINGBOX_FIXED_VERSION") ;;
+        *) _error "无效的 sing-box 安装目标: ${install_target}"; return 1 ;;
+    esac
+
     _info "--- 安装/更新 Sing-box 核心 ---"
     # 更新核心时复用已验证的依赖缓存，避免在 128M 容器中再次触发 apk
     # 的高峰内存占用；缓存缺项时 _install_dependencies 仍会自愈安装。
     _install_dependencies
-    if ! _install_sing_box; then
+    if ! _install_sing_box "$install_target"; then
         _error "Sing-box 核心安装/更新失败。"
         return 1
     fi
@@ -6172,8 +6538,23 @@ _do_update_singbox() {
         if [ -x "$SINGBOX_BIN" ]; then _manage_service restart >/dev/null 2>&1 || true; fi
         return 1
     fi
+
+    if [ "$install_target" = "$SINGBOX_FIXED_VERSION" ]; then
+        if ! _write_singbox_core_lock; then
+            _error "固定版本锁写入失败，正在恢复旧核心。"
+            _manage_service stop >/dev/null 2>&1 || true
+            _rollback_singbox_binary
+            if [ -x "$SINGBOX_BIN" ]; then _manage_service restart >/dev/null 2>&1 || true; fi
+            return 1
+        fi
+        _secure_state_permissions
+    fi
     _commit_singbox_binary
-    _success "[主] 服务已用新核心启动，更新已提交。"
+    if [ "$install_target" = "$SINGBOX_FIXED_VERSION" ]; then
+        _success "[主] 服务已使用固定核心 v${SINGBOX_FIXED_VERSION} 启动，版本升级锁已生效。"
+    else
+        _success "[主] 服务已使用最新稳定核心 v${SINGBOX_STAGED_VERSION:-未知} 启动，更新已提交。"
+    fi
 }
 
 # [安装/更新 Xray 核心] — 双模态：未装就装、已装就更新
@@ -6282,9 +6663,9 @@ _do_update_xray() {
     _create_xray_service_from_main
     local service_ok="true"
     if [ "$INIT_SYSTEM" == "systemd" ]; then
-        if [ "$is_first_install" = true ] || systemctl is-active xray >/dev/null 2>&1; then systemctl restart xray || service_ok="false"; fi
+        if [ "$is_first_install" = true ] || systemctl is-active xray >/dev/null 2>&1; then systemctl reset-failed xray >/dev/null 2>&1 || true; systemctl restart xray 8>&- 9>&- 219>&- || service_ok="false"; fi
     elif [ "$INIT_SYSTEM" == "openrc" ]; then
-        if [ "$is_first_install" = true ] || rc-service xray status >/dev/null 2>&1; then rc-service xray restart || service_ok="false"; fi
+        if [ "$is_first_install" = true ] || rc-service xray status >/dev/null 2>&1; then rc-service xray restart 8>&- 9>&- 219>&- || service_ok="false"; fi
     elif [ "$INIT_SYSTEM" == "direct" ]; then
         mkdir -p "$XRAY_RUNTIME_DIR" && chmod 700 "$XRAY_RUNTIME_DIR" || service_ok="false"
         if [ "$service_ok" = "true" ]; then
@@ -6294,7 +6675,7 @@ _do_update_xray() {
                 _is_pid_running_cmd "$xray_pid" "$xray_bin" && kill "$xray_pid" 2>/dev/null
             fi
             rm -f "$XRAY_PID_FILE"
-            nohup "$xray_bin" run -c "${xray_dir}/config.json" >> /var/log/xray.log 2>&1 &
+            nohup "$xray_bin" run -c "${xray_dir}/config.json" >> /var/log/xray.log 2>&1 8>&- 9>&- 219>&- &
             echo $! > "$XRAY_PID_FILE"
             chmod 600 "$XRAY_PID_FILE" 2>/dev/null || true
             sleep 1
@@ -6310,7 +6691,7 @@ _do_update_xray() {
         if [ "$had_old" = "true" ] && [ "$INIT_SYSTEM" = "openrc" ]; then rc-service xray restart >/dev/null 2>&1 || true; fi
         if [ "$had_old" = "true" ] && [ "$INIT_SYSTEM" = "direct" ]; then
             mkdir -p "$XRAY_RUNTIME_DIR" && chmod 700 "$XRAY_RUNTIME_DIR" 2>/dev/null || true
-            nohup "$xray_bin" run -c "${xray_dir}/config.json" >> /var/log/xray.log 2>&1 &
+            nohup "$xray_bin" run -c "${xray_dir}/config.json" >> /var/log/xray.log 2>&1 8>&- 9>&- 219>&- &
             echo $! > "$XRAY_PID_FILE"
             chmod 600 "$XRAY_PID_FILE" 2>/dev/null || true
             sleep 1
@@ -6499,6 +6880,9 @@ _main_menu() {
         local service_status="○ 未知"
         if [ -f "$SINGBOX_BIN" ]; then
             sb_version=" v$($SINGBOX_BIN version 2>/dev/null | head -n1 | awk '{print $3}')"
+            if _singbox_core_is_locked; then
+                sb_version="${sb_version} [固定]"
+            fi
             if [ "$INIT_SYSTEM" == "systemd" ]; then
                 if systemctl is-active --quiet sing-box 2>/dev/null; then
                     service_status="${GREEN}● 运行中${NC}"
@@ -6863,15 +7247,7 @@ EOF
             else
                 read -p "$(echo -e ${YELLOW}"  确定取消定时重启? (y/N): "${NC})" confirm
                 if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-                    if [ "$INIT_SYSTEM" == "systemd" ]; then
-                        systemctl disable --now sing-box-restart.timer 2>/dev/null
-                        rm -f /etc/systemd/system/sing-box-restart.timer /etc/systemd/system/sing-box-restart.service
-                        systemctl daemon-reload
-                    elif [ "$INIT_SYSTEM" == "openrc" ]; then
-                        rc-service sing-box-timer stop 2>/dev/null
-                        rc-update del sing-box-timer default 2>/dev/null
-                        rm -f /etc/init.d/sing-box-timer /usr/local/bin/sb-timer.sh
-                    fi
+                    _remove_scheduled_restart_components
                     _success "定时重启已取消，相关系统组件已清理。"
                 else
                     _info "已取消操作"
@@ -7073,7 +7449,8 @@ _batch_create_nodes() {
     [ -z "$input_str" ] && return 1
 
     # 1. 解析协议列表
-    local proto_ids=$(echo "$input_str" | tr ',' ' ' | xargs)
+    local proto_ids
+    proto_ids=$(printf '%s' "$input_str" | tr ',' ' ' | xargs)
     local proto_count=0
     local has_complex=false 
     local has_sni_req=false 
@@ -7144,8 +7521,16 @@ _batch_create_nodes() {
         echo " 4) 2022-blake3-aes-256-gcm (带 Padding)"
         read -p "选择 [1-4] (默认1): " ss_choice
         ss_variant=${ss_choice:-1}
+        local normalized_ss variant
+        normalized_ss=$(printf '%s' "$ss_variant" | tr ',' ' ' | xargs)
+        for variant in $normalized_ss; do
+            [[ "$variant" =~ ^[1-4]$ ]] || { _error "Shadowsocks 加密方式无效，请选择 1-4。"; return 1; }
+        done
+        [ -n "$normalized_ss" ] || { _error "未选择 Shadowsocks 加密方式。"; return 1; }
+        ss_variant=$(printf '%s' "$normalized_ss" | tr ' ' ',')
         # 计算 SS 实际需要的端口数
-        local ss_needed=$(echo "$ss_variant" | tr ',' ' ' | wc -w)
+        local ss_needed
+        ss_needed=$(printf '%s' "$normalized_ss" | wc -w)
         # 每个 Shadowsocks ID (7) 额外需要 (ss_needed - 1) 个端口
         proto_count=$((proto_count + (ss_needed - 1) * ss_occurences))
     fi
@@ -7175,18 +7560,21 @@ _batch_create_nodes() {
         local duplicate_port=false
         local occupied_port=false
         local seen_ports=" "
-        p_input=$(echo "$p_input" | tr ',' ' ' | xargs)
+        p_input=$(printf '%s' "$p_input" | tr ',' ' ' | xargs)
         [ -z "$p_input" ] && { _error "端口不能为空，请重新输入。"; continue; }
-        if [[ "$p_input" == *"-"* ]]; then
-            local start_p=$(echo $p_input | cut -d'-' -f1)
-            local end_p=$(echo $p_input | cut -d'-' -f2)
-            if [[ ! "$start_p" =~ ^[0-9]+$ ]] || [[ ! "$end_p" =~ ^[0-9]+$ ]] || [ "$start_p" -lt 1 ] || [ "$end_p" -gt 65535 ] || [ "$start_p" -gt "$end_p" ]; then
+        if [[ "$p_input" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            local start_p=$((10#${BASH_REMATCH[1]}))
+            local end_p=$((10#${BASH_REMATCH[2]}))
+            if [ "$start_p" -lt 1 ] || [ "$end_p" -gt 65535 ] || [ "$start_p" -gt "$end_p" ]; then
                 _error "端口范围无效，应为 1-65535 内的 start-end。"
                 continue
             fi
-            for ((p=start_p; p<=end_p; p++)); do current_p_list+=($p); done
+            for ((p=start_p; p<=end_p; p++)); do current_p_list+=("$p"); done
+        elif [[ "$p_input" == *"-"* ]]; then
+            _error "端口范围格式无效，应使用单一的 start-end。"
+            continue
         else
-            current_p_list=($p_input)
+            read -r -a current_p_list <<< "$p_input"
         fi
 
         local p port_index=0
@@ -7216,7 +7604,7 @@ _batch_create_nodes() {
             continue
         fi
         
-        if [ ${#current_p_list[@]} -lt $proto_count ]; then
+        if [ "${#current_p_list[@]}" -lt "$proto_count" ]; then
             _error "输入端口数量不足（仅 ${#current_p_list[@]} 个），请重新输入。"
         else
             ports_list=("${current_p_list[@]}")
@@ -7226,7 +7614,8 @@ _batch_create_nodes() {
 
     # 4. 执行安装循环
     local bulk_idx=0
-    local proto_array=($proto_ids)
+    local proto_array=()
+    read -r -a proto_array <<< "$proto_ids"
     local batch_failed=false
     for i in "${!proto_array[@]}"; do
         local pid=${proto_array[$i]}
@@ -7391,6 +7780,10 @@ main() {
             local need_update=false
             if grep -q "\-C " "$SERVICE_FILE"; then
                 _warn "检测到旧版服务配置(目录加载模式导致冲突)，正在修复..."
+                need_update=true
+            fi
+            if grep -q "ENABLE_DEPRECATED_" "$SERVICE_FILE"; then
+                _warn "检测到 sing-box 1.14 已移除功能的旧兼容环境变量，正在清理..."
                 need_update=true
             fi
             if [ "$INIT_SYSTEM" == "openrc" ] && ! grep -q "supervisor=" "$SERVICE_FILE"; then
