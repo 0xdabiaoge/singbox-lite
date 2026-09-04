@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v27`、`advanced_relay.sh v18`、`xray_manager.sh v3.1.3`。
+当前文档按以下脚本版本整理：`singbox.sh v27`、`advanced_relay.sh v19`、`xray_manager.sh v3.1.3`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -385,6 +385,7 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 
 ### 2026.09.05
 
+- 修复 DDNS 端口转发在 cron 精简环境下找不到 `nft`、导致域名 IP 已变化但规则未同步的问题；已有定时任务更新脚本后即可生效，并补充解析、规则更新、回滚与持久化失败日志及失败退出状态。
 - sing-box 与 Xray 的 Shadowsocks 创建菜单统一补齐 `aes-128-gcm`、`aes-256-gcm`、`chacha20-ietf-poly1305`、`xchacha20-ietf-poly1305` 和三种 SS2022 加密方式，并保留原有 Padding、ShadowTLS 组合。
 - SS2022 改为按算法生成严格长度的 Base64 密钥：AES-128 使用 16 字节，AES-256 与 ChaCha20 使用 32 字节；sing-box 批量创建同步支持七种纯 SS 加密方式。
 - sing-box `[5] 修改节点` 在重新生成 Shadowsocks 认证信息时复用相同的密钥规则，并同步更新服务端配置、元数据、分享链接与 Clash/Mihomo 配置。

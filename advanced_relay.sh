@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# cron 的用户任务通常不包含 sbin；必须在任何外部命令及依赖检查前补全路径。
+# 同时覆盖已有 cron 入口，无需用户删除并重建 DDNS 转发规则。
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+
 # 本脚本会写入节点密码、私钥和分享链接；禁止新文件继承宽松权限。
 umask 077
 
@@ -3237,16 +3241,28 @@ _pf_clear() {
     read -p "  按回车继续..."
 }
 
+_pf_dns_log() {
+    logger -t "pf-dns-refresh" -- "$1" 2>/dev/null || printf '%s\n' "[pf-dns-refresh] $1" >&2
+}
+
 _pf_dns_refresh() {
     [ ! -f "$PF_METADATA_FILE" ] && return 0
     local updated=false
     local refresh_list=""
+    local refresh_status=0
 
     # 不使用“jq | while”管道，避免循环在子 Shell 中运行后丢失 updated 状态。
     refresh_list=$(mktemp /tmp/singboxlite-pf-dns.XXXXXX) || return 1
     if ! jq -r 'to_entries[] | select(.value.engine == "nftables" and .value.target_is_domain == true and .value.resolved_ip != null) | [.key, .value.target_addr, .value.resolved_ip, (.value.target_port|tostring), .value.network, (.value.target_family // "ipv4")] | @tsv' \
         "$PF_METADATA_FILE" > "$refresh_list" 2>/dev/null; then
-        logger -t "pf-dns-refresh" "读取端口转发元数据失败"
+        _pf_dns_log "读取端口转发元数据失败"
+        rm -f "$refresh_list"
+        return 1
+    fi
+
+    # sing-box 用户态转发或没有域名规则时不要求安装 nftables。
+    if [ -s "$refresh_list" ] && ! command -v nft >/dev/null 2>&1; then
+        _pf_dns_log "DDNS 刷新失败：找不到 nft 命令，请检查 nftables 安装及后台 PATH=$PATH；保留原规则"
         rm -f "$refresh_list"
         return 1
     fi
@@ -3260,32 +3276,46 @@ _pf_dns_refresh() {
 
         local new_ip=""
         new_ip=$(_pf_resolve_domain_family "$addr" "$family")
-        [ -z "$new_ip" ] && continue
+        if [ -z "$new_ip" ]; then
+            _pf_dns_log "域名 $addr 解析失败 ($family，端口 $port)，保留旧地址 $old_ip，等待下次重试"
+            refresh_status=1
+            continue
+        fi
         [ "$new_ip" == "$old_ip" ] && continue
 
-        logger -t "pf-dns-refresh" "域名 $addr 的 IP 已变化: $old_ip -> $new_ip (端口 $port)"
+        _pf_dns_log "域名 $addr 的 IP 已变化: $old_ip -> $new_ip (端口 $port)"
         if ! _pf_apply_nft_rules "add" "$port" "$new_ip" "$tport" "$network" "$family"; then
-            logger -t "pf-dns-refresh" "更新端口 $port 的 nftables 规则失败，尝试恢复旧地址 $old_ip"
-            _pf_apply_nft_rules "add" "$port" "$old_ip" "$tport" "$network" "$family" >/dev/null 2>&1
+            refresh_status=1
+            _pf_dns_log "更新端口 $port 的 nftables 规则失败，尝试恢复旧地址 $old_ip"
+            if ! _pf_apply_nft_rules "add" "$port" "$old_ip" "$tport" "$network" "$family" >/dev/null 2>&1; then
+                _pf_dns_log "端口 $port 恢复旧规则也失败，请检查 nftables 权限及规则状态"
+            fi
             continue
         fi
 
         local refreshed_meta
         refreshed_meta=$(jq --arg p "$port" --arg ip "$new_ip" '.[$p].resolved_ip = $ip' "$PF_METADATA_FILE")
         if [ -z "$refreshed_meta" ] || ! _atomic_write_json "$PF_METADATA_FILE" "$refreshed_meta"; then
-            logger -t "pf-dns-refresh" "更新端口 $port 的元数据失败，尝试恢复旧地址 $old_ip"
-            _pf_apply_nft_rules "add" "$port" "$old_ip" "$tport" "$network" "$family" >/dev/null 2>&1
+            refresh_status=1
+            _pf_dns_log "更新端口 $port 的元数据失败，尝试恢复旧地址 $old_ip"
+            if ! _pf_apply_nft_rules "add" "$port" "$old_ip" "$tport" "$network" "$family" >/dev/null 2>&1; then
+                _pf_dns_log "端口 $port 恢复旧规则也失败，请检查 nftables 权限及规则状态"
+            fi
             continue
         fi
 
         updated=true
+        _pf_dns_log "端口 $port 已同步到 $new_ip:$tport ($network)"
     done < "$refresh_list"
 
     if [ "$updated" = true ]; then
-        _save_nftables_rules
-        logger -t "pf-dns-refresh" "nftables 规则已自动更新"
+        if ! _save_nftables_rules; then
+            _pf_dns_log "nftables 运行规则已更新，但持久化失败，请检查磁盘空间及配置目录权限"
+            refresh_status=1
+        fi
     fi
     rm -f "$refresh_list"
+    return "$refresh_status"
 }
 
 _pf_auto_manage_dns_cron() {
@@ -3524,7 +3554,7 @@ _menu() {
         echo -e "${CYAN}"
         echo "  ╔═══════════════════════════════════════╗"
         echo "  ║       singbox-lite 进阶转发管理       ║"
-        echo "  ║                (v18)                  ║"
+        echo "  ║                (v19)                  ║"
         echo "  ╚═══════════════════════════════════════╝"
         echo -e "${NC}"
 
