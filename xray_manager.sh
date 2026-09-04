@@ -4,7 +4,7 @@ umask 077
 # xray_manager.sh — Xray-core 节点管理子脚本
 # 与 singbox.sh 共存，共享 clash.yaml
 # ============================================================
-XRAY_SCRIPT_VERSION="3.1.2"
+XRAY_SCRIPT_VERSION="3.1.3"
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 # --- 路径定义 ---
@@ -1165,6 +1165,20 @@ _add_trojan_grpc_reality() {
 #                   5. Shadowsocks
 # ============================================================
 
+_generate_xray_shadowsocks_password() {
+    local method="$1" key_length
+    case "$method" in
+        2022-blake3-aes-128-gcm) key_length=16 ;;
+        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) key_length=32 ;;
+        aes-128-gcm|aes-256-gcm|chacha20-ietf-poly1305|xchacha20-ietf-poly1305)
+            openssl rand -hex 16
+            return
+            ;;
+        *) _error "不支持的 Shadowsocks 加密方式: ${method}"; return 1 ;;
+    esac
+    openssl rand -base64 "$key_length"
+}
+
 _add_shadowsocks_xray() {
     [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
     local node_ip="$server_ip"
@@ -1174,35 +1188,51 @@ _add_shadowsocks_xray() {
     _info "      Xray Shadowsocks 加密方式"
     echo "========================================"
     echo " [经典 SS]"
-    echo " 1) aes-256-gcm"
-    echo " 2) chacha20-ietf-poly1305"
+    echo " 1) aes-128-gcm"
+    echo " 2) aes-256-gcm"
+    echo " 3) chacha20-ietf-poly1305"
+    echo " 4) xchacha20-ietf-poly1305"
     echo " [SS-2022 (强抗重放保护)]"
-    echo " 3) 2022-blake3-aes-256-gcm"
-    echo " 4) 2022-blake3-aes-256-gcm (带 Padding)"
+    echo " 5) 2022-blake3-aes-128-gcm"
+    echo " 6) 2022-blake3-aes-256-gcm"
+    echo " 7) 2022-blake3-chacha20-poly1305"
+    echo " 8) 2022-blake3-aes-256-gcm (带 Padding)"
     echo " 0) 返回"
     echo "========================================"
-    read -p "请选择 [0-4]: " choice
+    read -r -p "请选择 [0-8]: " choice
     
     local method="" password="" name_prefix="" use_multiplex="false"
     case $choice in
-        1) 
+        1)
+            method="aes-128-gcm"
+            name_prefix="X-SS-aes128"
+            ;;
+        2)
             method="aes-256-gcm"
-            password=$(openssl rand -hex 16)
             name_prefix="X-SS-aes256"
             ;;
-        2) 
+        3)
             method="chacha20-ietf-poly1305"
-            password=$(openssl rand -hex 16)
             name_prefix="X-SS-chacha20"
             ;;
-        3) 
-            method="2022-blake3-aes-256-gcm"
-            password=$(openssl rand -base64 32)
-            name_prefix="X-SS-2022"
+        4)
+            method="xchacha20-ietf-poly1305"
+            name_prefix="X-SS-xchacha20"
             ;;
-        4) 
+        5)
+            method="2022-blake3-aes-128-gcm"
+            name_prefix="X-SS-2022-aes128"
+            ;;
+        6)
             method="2022-blake3-aes-256-gcm"
-            password=$(openssl rand -base64 32)
+            name_prefix="X-SS-2022-aes256"
+            ;;
+        7)
+            method="2022-blake3-chacha20-poly1305"
+            name_prefix="X-SS-2022-chacha20"
+            ;;
+        8)
+            method="2022-blake3-aes-256-gcm"
             name_prefix="X-SS-2022-Padding"
             use_multiplex="true"
             _info "已配置 Multiplex + Padding 选项"
@@ -1210,6 +1240,7 @@ _add_shadowsocks_xray() {
         0) return 1 ;;
         *) _error "无效输入"; return 1 ;;
     esac
+    password=$(_generate_xray_shadowsocks_password "$method") || return 1
     
     read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
     node_ip=${custom_ip:-$server_ip}

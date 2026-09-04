@@ -4,7 +4,7 @@
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="25"
+export SCRIPT_VERSION="27"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -1238,8 +1238,10 @@ _install_dependencies() {
     # [修复] Alpine 上 dcron 安装后需手动启动 cron 守护进程
     if command -v apk &>/dev/null; then
         if command -v crond &>/dev/null; then
-            rc-service dcron start 2>/dev/null
-            rc-update add dcron default 2>/dev/null
+            # BusyBox 自带 crond 并不代表系统存在 dcron 的 OpenRC 服务；
+            # 定时任务守护进程属于可选能力，不能让核心安装继承失败状态。
+            rc-service dcron start 2>/dev/null || true
+            rc-update add dcron default 2>/dev/null || true
         fi
     fi
 
@@ -3423,6 +3425,9 @@ _show_node_link() {
     local link_ip="$3"
     local port="$4"
     local tag="$5"
+    local metadata_ip="$link_ip"
+    metadata_ip="${metadata_ip#[}"
+    metadata_ip="${metadata_ip%]}"
     # [关键修复] 处理 IPv6 括号包裹逻辑
     if [[ "$link_ip" == *":"* ]] && [[ "$link_ip" != "["* ]]; then
         link_ip="[${link_ip}]"
@@ -3536,7 +3541,6 @@ _show_node_link() {
             local username="$1" password="$2"
             echo ""
             _info "节点信息: 服务器: ${link_ip}, 端口: ${port}, 用户名: ${username}, 密码: ${password}"
-            return
             ;;
     esac
     
@@ -3564,10 +3568,29 @@ _show_node_link() {
                 _atomic_modify_json "$ARGO_METADATA_FILE" '. + {($tag): ((.[$tag] // {}) + {share_link:$url, name:$name})}' \
                     --arg tag "$tag" --arg url "$url" --arg name "$name" || return 1
             else
-                _atomic_modify_json "$METADATA_FILE" '. + {($tag): ((.[$tag] // {}) + {share_link:$url, name:$name, owner:"singbox-main", yaml:true})}' \
-                    --arg tag "$tag" --arg url "$url" --arg name "$name" || return 1
+                _atomic_modify_json "$METADATA_FILE" '
+                    . + {($tag): ((.[$tag] // {}) + {
+                        share_link:$url,
+                        name:$name,
+                        owner:"singbox-main",
+                        variant:$variant,
+                        clientServer:$server
+                    } | if has("yaml") then . else .yaml = true end)}
+                ' --arg tag "$tag" --arg url "$url" --arg name "$name" --arg variant "$type" --arg server "$metadata_ip" || return 1
             fi
         fi
+    fi
+    # SOCKS5 与 ShadowTLS 没有通用的单行分享链接，但同样保存规范化元数据，
+    # 使“修改节点”不需要从 YAML 或备注名称猜测连接地址和具体变种。
+    if [ -n "$tag" ] && [ "$tag" != "null" ] && [[ "$tag" != argo-* ]]; then
+        _atomic_modify_json "$METADATA_FILE" '
+            . + {($tag): ((.[$tag] // {}) + {
+                name:$name,
+                owner:"singbox-main",
+                variant:$variant,
+                clientServer:$server
+            } | if has("yaml") then . else .yaml = true end)}
+        ' --arg tag "$tag" --arg name "$name" --arg variant "$type" --arg server "$metadata_ip" || return 1
     fi
     return 0
 }
@@ -4275,7 +4298,7 @@ _create_anytls_tls_node() {
     local share_link="anytls://${password}@${link_ip}:${port}?security=tls&sni=${server_name}${insecure_param}&type=tcp#$(_url_encode "$name")"
     
     _success "AnyTLS 节点 [${name}] 添加成功!"
-    _show_node_link "anytls" "$name" "$link_ip" "$port" "$tag" "$password" "$server_name" "$skip_verify" || return 1
+    _show_node_link "anytls" "$name" "$link_ip" "$port" "$tag" "$password" "$server_name" "$skip_verify" "$cert_path" || return 1
 }
 
 _create_anyreality_node() {
@@ -4805,6 +4828,20 @@ _add_tuic() {
     _show_node_link "tuic" "$name" "$link_ip" "$port" "$tag" "$uuid" "$password" "$server_name" || return 1
 }
 
+_generate_shadowsocks_password() {
+    local method="$1" key_length
+    case "$method" in
+        2022-blake3-aes-128-gcm) key_length=16 ;;
+        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) key_length=32 ;;
+        aes-128-gcm|aes-256-gcm|chacha20-ietf-poly1305|xchacha20-ietf-poly1305)
+            ${SINGBOX_BIN} generate rand --hex 16
+            return
+            ;;
+        *) _error "不支持的 Shadowsocks 加密方式: ${method}"; return 1 ;;
+    esac
+    ${SINGBOX_BIN} generate rand --base64 "$key_length"
+}
+
 _add_shadowsocks_menu() {
     local choice=""
     if [ "$BATCH_MODE" = "true" ]; then
@@ -4815,54 +4852,68 @@ _add_shadowsocks_menu() {
         _info "          添加 Shadowsocks 节点"
         echo "========================================"
         echo " [经典 SS]"
-        echo " 1) aes-256-gcm"
-        echo " 2) chacha20-ietf-poly1305"
+        echo " 1) aes-128-gcm"
+        echo " 2) aes-256-gcm"
+        echo " 3) chacha20-ietf-poly1305"
+        echo " 4) xchacha20-ietf-poly1305"
         echo " [SS-2022 (强抗重放保护)]"
-        echo " 3) 2022-blake3-aes-256-gcm"
-        echo " 4) 2022-blake3-aes-256-gcm (带 Padding)"
+        echo " 5) 2022-blake3-aes-128-gcm"
+        echo " 6) 2022-blake3-aes-256-gcm"
+        echo " 7) 2022-blake3-chacha20-poly1305"
+        echo " 8) 2022-blake3-aes-256-gcm (带 Padding)"
         echo " [SS-2022 + ShadowTLS (完美伪装组合)]"
-        echo " 5) 2022-blake3-aes-256-gcm + ShadowTLS v3"
+        echo " 9) 2022-blake3-aes-256-gcm + ShadowTLS v3"
         echo " 0) 返回"
         echo "========================================"
-        read -p "请选择加密方式 [0-5]: " choice
+        read -r -p "请选择加密方式 [0-9]: " choice
     fi
 
     local method="" password="" name_prefix="" use_multiplex=false use_shadowtls=false
     case $choice in
-        1) 
+        1)
+            method="aes-128-gcm"
+            name_prefix="SS-aes128"
+            ;;
+        2)
             method="aes-256-gcm"
-            password=$(${SINGBOX_BIN} generate rand --hex 16)
             name_prefix="SS-aes256"
             ;;
-        2) 
+        3)
             method="chacha20-ietf-poly1305"
-            password=$(${SINGBOX_BIN} generate rand --hex 16)
             name_prefix="SS-chacha20"
             ;;
-        3)
-            method="2022-blake3-aes-256-gcm"
-            # SS-2022 的 aes-256 需要严格的 32 字节 (256位) base64 密钥
-            password=$(${SINGBOX_BIN} generate rand --base64 32)
-            name_prefix="SS-2022"
-            ;;
         4)
+            method="xchacha20-ietf-poly1305"
+            name_prefix="SS-xchacha20"
+            ;;
+        5)
+            method="2022-blake3-aes-128-gcm"
+            name_prefix="SS-2022-aes128"
+            ;;
+        6)
             method="2022-blake3-aes-256-gcm"
-            password=$(${SINGBOX_BIN} generate rand --base64 32)
+            name_prefix="SS-2022-aes256"
+            ;;
+        7)
+            method="2022-blake3-chacha20-poly1305"
+            name_prefix="SS-2022-chacha20"
+            ;;
+        8)
+            method="2022-blake3-aes-256-gcm"
             name_prefix="SS-2022-Padding"
             use_multiplex=true
             _info "已启用 Multiplex + Padding 模式"
             _warning "注意：客户端也必须启用 Multiplex + Padding 才能连接！"
             ;;
-        5)
-            # SS-2022 256 位版本（抗重放增强）
+        9)
             method="2022-blake3-aes-256-gcm"
-            password=$(${SINGBOX_BIN} generate rand --base64 32)
             name_prefix="SS-ShadowTLS"
             use_shadowtls=true
             ;;
         0) return 1 ;;
         *) _error "无效输入"; return 1 ;;
     esac
+    password=$(_generate_shadowsocks_password "$method") || return 1
 
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
@@ -5712,7 +5763,255 @@ _dns_config_menu() {
     done
 }
 
+_detect_main_node_variant() {
+    local tag="$1"
+    jq -r --arg tag "$tag" '
+        .inbounds[]? | select(.tag == $tag) |
+        if .type == "vless" and (.tls.reality.enabled // false) then "vless-reality"
+        elif .type == "vless" and .transport.type == "ws" then "vless-ws-tls"
+        elif .type == "vless" and .transport.type == "grpc" then "vless-grpc-tls"
+        elif .type == "vless" then "vless-tcp"
+        elif .type == "trojan" and .transport.type == "ws" then "trojan-ws-tls"
+        elif .type == "anytls" and (.tls.reality.enabled // false) then "any-reality"
+        elif .type == "anytls" then "anytls"
+        elif .type == "hysteria2" then "hysteria2"
+        elif .type == "tuic" then "tuic"
+        elif .type == "shadowtls" then "shadowsocks-shadowtls"
+        elif .type == "shadowsocks" then "shadowsocks"
+        elif .type == "socks" then "socks"
+        else "unsupported"
+        end
+    ' "$CONFIG_FILE" 2>/dev/null | head -n 1
+}
+
+_normalize_client_server() {
+    local value="$1"
+    value="${value#[}"
+    value="${value%]}"
+    printf '%s' "$value"
+}
+
+_legacy_link_server() {
+    local link="$1" authority
+    [ -n "$link" ] || return 1
+    authority="${link#*://}"
+    authority="${authority%%[/?#]*}"
+    authority="${authority##*@}"
+    if [[ "$authority" == \[*\]:* ]]; then
+        authority="${authority#\[}"
+        authority="${authority%%\]*}"
+    else
+        authority="${authority%:*}"
+    fi
+    [ -n "$authority" ] || return 1
+    printf '%s' "$authority"
+}
+
+_validate_tls_key_pair() {
+    local cert_path="$1" key_path="$2" cert_pub key_pub
+    # ACME 客户端通常用符号链接指向续签后的实际证书；只要链接当前可解析为
+    # 普通文件就应保留原路径，让后续续签无需再次修改节点。
+    [ -f "$cert_path" ] || { _error "证书文件不存在或链接失效: $cert_path"; return 1; }
+    [ -f "$key_path" ] || { _error "私钥文件不存在或链接失效: $key_path"; return 1; }
+    openssl x509 -in "$cert_path" -noout >/dev/null 2>&1 || { _error "证书格式无效。"; return 1; }
+    openssl pkey -in "$key_path" -noout >/dev/null 2>&1 || { _error "私钥格式无效或需要交互密码。"; return 1; }
+    cert_pub=$(openssl x509 -in "$cert_path" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null) || return 1
+    key_pub=$(openssl pkey -in "$key_path" -pubout -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null) || return 1
+    [ -n "$cert_pub" ] && [ "$cert_pub" = "$key_pub" ] || { _error "证书与私钥不匹配。"; return 1; }
+}
+
+# 以服务器配置和规范化元数据为唯一事实源，完整重建客户端 YAML 与分享链接。
+_refresh_modified_node_artifacts() {
+    local tag="$1" old_proxy_name="$2"
+    local node variant port metadata name client_server share_link proxy_name
+    node=$(jq -c --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" 2>/dev/null | head -n 1) || return 1
+    [ -n "$node" ] || { _error "无法重建节点产物：节点不存在。"; return 1; }
+    variant=$(_detect_main_node_variant "$tag")
+    [ "$variant" != "unsupported" ] || { _error "暂不支持修改该节点类型。"; return 1; }
+    port=$(printf '%s' "$node" | jq -r '.listen_port') || return 1
+    metadata=$(jq -c --arg tag "$tag" '.[$tag] // {}' "$METADATA_FILE" 2>/dev/null) || return 1
+    name=$(printf '%s' "$metadata" | jq -r '.name // empty')
+    proxy_name="$old_proxy_name"
+    if [ -z "$proxy_name" ]; then
+        proxy_name=$(_find_proxy_name "$port" "$(printf '%s' "$node" | jq -r '.type')" "$tag")
+    fi
+    [ -n "$name" ] || name="$proxy_name"
+    [ -n "$name" ] || name="$tag"
+    client_server=$(printf '%s' "$metadata" | jq -r '.clientServer // empty')
+    if [ -z "$client_server" ] && [ -n "$proxy_name" ]; then
+        client_server=$(_get_proxy_field "$proxy_name" '.server // ""')
+    fi
+    if [ -z "$client_server" ]; then
+        share_link=$(printf '%s' "$metadata" | jq -r '.share_link // empty')
+        client_server=$(_legacy_link_server "$share_link" 2>/dev/null || true)
+    fi
+    [ -n "$client_server" ] || client_server=$(_get_public_ip)
+    client_server=$(_normalize_client_server "$client_server")
+    [ -n "$client_server" ] || { _error "无法确定客户端连接地址。"; return 1; }
+
+    _atomic_modify_json "$METADATA_FILE" '
+        . + {($tag): ((.[$tag] // {}) + {
+            name:$name, owner:"singbox-main", variant:$variant, clientServer:$server
+        } | if has("yaml") then . else .yaml = ($variant != "any-reality") end)}
+    ' --arg tag "$tag" --arg name "$name" --arg variant "$variant" --arg server "$client_server" || return 1
+
+    local yaml_enabled
+    yaml_enabled=$(jq -r --arg tag "$tag" '.[$tag].yaml // true' "$METADATA_FILE" 2>/dev/null)
+    if [ "$yaml_enabled" = "true" ]; then
+        [ -n "$proxy_name" ] || { _error "找不到节点对应的 Clash YAML 条目。"; return 1; }
+        export OLD_NAME="$proxy_name" NEW_NAME="$name" NODE_SERVER="$client_server" NODE_PORT="$port"
+        _atomic_modify_yaml "$CLASH_YAML_FILE" '
+            (.proxies[] | select(.name == env(OLD_NAME))) |=
+                (.name = env(NEW_NAME) | .server = env(NODE_SERVER) | .port = (env(NODE_PORT) | tonumber))
+            | (.proxy-groups[].proxies[] | select(. == env(OLD_NAME))) = env(NEW_NAME)
+        ' || return 1
+        proxy_name="$name"
+    fi
+
+    local uuid password username method sni public_key short_id cert_path key_path skip_verify
+    local path service_name obfs_password hop up down inner_tag shadow_password
+    case "$variant" in
+        vless-reality)
+            uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
+            sni=$(printf '%s' "$node" | jq -r '.tls.reality.handshake.server // .tls.server_name // empty')
+            public_key=$(jq -r --arg tag "$tag" '.[$tag].publicKey // empty' "$METADATA_FILE")
+            short_id=$(printf '%s' "$node" | jq -r '.tls.reality.short_id[0] // empty')
+            [ -n "$public_key" ] || { _error "Reality 公钥元数据缺失，无法安全重建客户端配置。"; return 1; }
+            if [ "$yaml_enabled" = "true" ]; then
+                export NODE_UUID="$uuid" NODE_SNI="$sni" NODE_PUBLIC_KEY="$public_key" NODE_SHORT_ID="$short_id"
+                _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .servername = env(NODE_SNI) | .["reality-opts"]["public-key"] = env(NODE_PUBLIC_KEY) | .["reality-opts"]["short-id"] = env(NODE_SHORT_ID))' || return 1
+            fi
+            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$uuid" "$sni" "$public_key" "$short_id" "xtls-rprx-vision" || return 1
+            ;;
+        vless-ws-tls|vless-grpc-tls)
+            uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
+            sni=$(printf '%s' "$node" | jq -r '.tls.server_name // empty')
+            cert_path=$(printf '%s' "$node" | jq -r '.tls.certificate_path // empty')
+            key_path=$(printf '%s' "$node" | jq -r '.tls.key_path // empty')
+            skip_verify=$(_get_proxy_field "$name" '.["skip-cert-verify"] // false')
+            export NODE_UUID="$uuid" NODE_SNI="$sni" NODE_SKIP_VERIFY="$skip_verify"
+            if [ "$variant" = "vless-ws-tls" ]; then
+                path=$(printf '%s' "$node" | jq -r '.transport.path // "/"')
+                export NODE_PATH="$path"
+                _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .sni = env(NODE_SNI) | ."skip-cert-verify" = (env(NODE_SKIP_VERIFY) == "true") | .["ws-opts"].path = env(NODE_PATH) | .["ws-opts"].headers.Host = env(NODE_SNI))' || return 1
+                _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$uuid" "$sni" "$path" "$skip_verify" "$cert_path" || return 1
+            else
+                service_name=$(printf '%s' "$node" | jq -r '.transport.service_name // empty')
+                export NODE_SERVICE="$service_name"
+                _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .servername = env(NODE_SNI) | ."skip-cert-verify" = (env(NODE_SKIP_VERIFY) == "true") | .["grpc-opts"]["grpc-service-name"] = env(NODE_SERVICE))' || return 1
+                _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$uuid" "$sni" "$service_name" "$skip_verify" "$cert_path" || return 1
+            fi
+            ;;
+        vless-tcp)
+            uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
+            export NODE_UUID="$uuid"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))).uuid = env(NODE_UUID)' || return 1
+            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$uuid" || return 1
+            ;;
+        trojan-ws-tls)
+            password=$(printf '%s' "$node" | jq -r '.users[0].password')
+            sni=$(printf '%s' "$node" | jq -r '.tls.server_name // empty')
+            path=$(printf '%s' "$node" | jq -r '.transport.path // "/"')
+            cert_path=$(printf '%s' "$node" | jq -r '.tls.certificate_path // empty')
+            key_path=$(printf '%s' "$node" | jq -r '.tls.key_path // empty')
+            skip_verify=$(_get_proxy_field "$name" '.["skip-cert-verify"] // false')
+            export NODE_PASSWORD="$password" NODE_SNI="$sni" NODE_PATH="$path" NODE_SKIP_VERIFY="$skip_verify"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.password = env(NODE_PASSWORD) | .sni = env(NODE_SNI) | ."skip-cert-verify" = (env(NODE_SKIP_VERIFY) == "true") | .["ws-opts"].path = env(NODE_PATH) | .["ws-opts"].headers.Host = env(NODE_SNI))' || return 1
+            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$password" "$sni" "$path" "$skip_verify" "$cert_path" || return 1
+            ;;
+        anytls)
+            password=$(printf '%s' "$node" | jq -r '.users[0].password')
+            sni=$(printf '%s' "$node" | jq -r '.tls.server_name // empty')
+            [ -n "$sni" ] || sni=$(_get_proxy_field "$name" '.sni // ""')
+            cert_path=$(printf '%s' "$node" | jq -r '.tls.certificate_path // empty')
+            key_path=$(printf '%s' "$node" | jq -r '.tls.key_path // empty')
+            skip_verify=$(_get_proxy_field "$name" '.["skip-cert-verify"] // false')
+            export NODE_PASSWORD="$password" NODE_SNI="$sni" NODE_SKIP_VERIFY="$skip_verify"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.password = env(NODE_PASSWORD) | .sni = env(NODE_SNI) | ."skip-cert-verify" = (env(NODE_SKIP_VERIFY) == "true"))' || return 1
+            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$password" "$sni" "$skip_verify" "$cert_path" || return 1
+            ;;
+        any-reality)
+            password=$(printf '%s' "$node" | jq -r '.users[0].password')
+            sni=$(printf '%s' "$node" | jq -r '.tls.reality.handshake.server // .tls.server_name // empty')
+            public_key=$(jq -r --arg tag "$tag" '.[$tag].publicKey // empty' "$METADATA_FILE")
+            short_id=$(printf '%s' "$node" | jq -r '.tls.reality.short_id[0] // empty')
+            [ -n "$public_key" ] || { _error "Any-Reality 公钥元数据缺失，无法安全重建分享链接。"; return 1; }
+            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$password" "$sni" "$public_key" "$short_id" || return 1
+            ;;
+        hysteria2)
+            password=$(printf '%s' "$node" | jq -r '.users[0].password')
+            sni=$(printf '%s' "$node" | jq -r '.tls.server_name // empty')
+            [ -n "$sni" ] || sni=$(_get_proxy_field "$name" '.sni // ""')
+            obfs_password=$(printf '%s' "$node" | jq -r '.obfs.password // empty')
+            hop=$(jq -r --arg tag "$tag" '.[$tag].portHopping // empty' "$METADATA_FILE")
+            up=$(jq -r --arg tag "$tag" '.[$tag].up // "100"' "$METADATA_FILE")
+            down=$(jq -r --arg tag "$tag" '.[$tag].down // "100"' "$METADATA_FILE")
+            cert_path=$(printf '%s' "$node" | jq -r '.tls.certificate_path // empty')
+            key_path=$(printf '%s' "$node" | jq -r '.tls.key_path // empty')
+            export NODE_PASSWORD="$password" NODE_SNI="$sni" NODE_OBFS="$obfs_password" NODE_HOP="$hop" NODE_UP="$up" NODE_DOWN="$down"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.password = env(NODE_PASSWORD) | .sni = env(NODE_SNI) | .up = (env(NODE_UP) | tonumber) | .down = (env(NODE_DOWN) | tonumber))' || return 1
+            if [ -n "$obfs_password" ]; then
+                _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.obfs = "salamander" | ."obfs-password" = env(NODE_OBFS))' || return 1
+            else
+                _atomic_modify_yaml "$CLASH_YAML_FILE" 'del(.proxies[] | select(.name == env(NEW_NAME)) | .obfs, .proxies[] | select(.name == env(NEW_NAME)) | ."obfs-password")' || return 1
+            fi
+            if [ -n "$hop" ]; then
+                _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))).ports = env(NODE_HOP)' || return 1
+            else
+                _atomic_modify_yaml "$CLASH_YAML_FILE" 'del(.proxies[] | select(.name == env(NEW_NAME)) | .ports)' || return 1
+            fi
+            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$password" "$sni" "$obfs_password" "$hop" || return 1
+            ;;
+        tuic)
+            uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
+            password=$(printf '%s' "$node" | jq -r '.users[0].password')
+            sni=$(printf '%s' "$node" | jq -r '.tls.server_name // empty')
+            [ -n "$sni" ] || sni=$(_get_proxy_field "$name" '.sni // ""')
+            cert_path=$(printf '%s' "$node" | jq -r '.tls.certificate_path // empty')
+            key_path=$(printf '%s' "$node" | jq -r '.tls.key_path // empty')
+            export NODE_UUID="$uuid" NODE_PASSWORD="$password" NODE_SNI="$sni"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .password = env(NODE_PASSWORD) | .sni = env(NODE_SNI))' || return 1
+            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$uuid" "$password" "$sni" || return 1
+            ;;
+        shadowsocks)
+            method=$(printf '%s' "$node" | jq -r '.method')
+            password=$(printf '%s' "$node" | jq -r '.password')
+            export NODE_METHOD="$method" NODE_PASSWORD="$password"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.cipher = env(NODE_METHOD) | .password = env(NODE_PASSWORD))' || return 1
+            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$method" "$password" || return 1
+            ;;
+        shadowsocks-shadowtls)
+            inner_tag=$(printf '%s' "$node" | jq -r '.detour // empty')
+            shadow_password=$(printf '%s' "$node" | jq -r '.users[0].password')
+            sni=$(printf '%s' "$node" | jq -r '.handshake.server // empty')
+            method=$(jq -r --arg tag "$inner_tag" '.inbounds[]? | select(.tag == $tag) | .method // empty' "$CONFIG_FILE")
+            password=$(jq -r --arg tag "$inner_tag" '.inbounds[]? | select(.tag == $tag) | .password // empty' "$CONFIG_FILE")
+            export NODE_METHOD="$method" NODE_PASSWORD="$password" NODE_SHADOW_PASSWORD="$shadow_password" NODE_SNI="$sni"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.cipher = env(NODE_METHOD) | .password = env(NODE_PASSWORD) | .["plugin-opts"].host = env(NODE_SNI) | .["plugin-opts"].password = env(NODE_SHADOW_PASSWORD))' || return 1
+            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$method" "$password" "$shadow_password" "$sni" || return 1
+            ;;
+        socks)
+            username=$(printf '%s' "$node" | jq -r '.users[0].username')
+            password=$(printf '%s' "$node" | jq -r '.users[0].password')
+            export NODE_USERNAME="$username" NODE_PASSWORD="$password"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.username = env(NODE_USERNAME) | .password = env(NODE_PASSWORD))' || return 1
+            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$username" "$password" || return 1
+            ;;
+    esac
+
+    if [ -n "${cert_path:-}" ] && [ -n "${key_path:-}" ]; then
+        local cert_mode="custom" cert_sha
+        [[ "$cert_path" == "$SINGBOX_DIR/"* && "$key_path" == "$SINGBOX_DIR/"* ]] && cert_mode="self_signed"
+        cert_sha=$(_cert_sha256_hex "$cert_path" 2>/dev/null || true)
+        _atomic_modify_json "$METADATA_FILE" '.[$tag] += {serverName:$sni,certMode:$mode,certificatePath:$cert,keyPath:$key,certSha256:$sha,skipVerify:($skip == "true")}' \
+            --arg tag "$tag" --arg sni "${sni:-}" --arg mode "$cert_mode" --arg cert "$cert_path" --arg key "$key_path" --arg sha "$cert_sha" --arg skip "${skip_verify:-false}" || return 1
+    elif [ -n "${sni:-}" ]; then
+        _atomic_modify_json "$METADATA_FILE" '.[$tag].serverName = $sni' --arg tag "$tag" --arg sni "$sni" || return 1
+    fi
+}
+
 _modify_port() (
+    local preset_tag="${1:-}"
     local primary_nodes
     primary_nodes=$(_list_main_primary_inbounds)
     if [ -z "$primary_nodes" ]; then
@@ -5728,7 +6027,7 @@ _modify_port() (
     local inbound_types=()
     local display_names=()
     
-    local i=1
+    local i=1 preset_num=""
     # [资源优化] 合并3次jq为1次 + 使用公共函数 _find_proxy_name 替代内联查找
     local node
     while IFS= read -r node; do
@@ -5746,12 +6045,19 @@ _modify_port() (
         local meta_name=$(jq -r --arg t "$tag" '.[$t].name // empty' "$METADATA_FILE" 2>/dev/null)
         local display_name=${proxy_name_to_find:-${meta_name:-$tag}}
         display_names+=("$display_name")
+        [ -n "$preset_tag" ] && [ "$tag" = "$preset_tag" ] && preset_num="$i"
         
         echo -e "  ${CYAN}$i)${NC} ${display_name} (${YELLOW}${type}${NC}) @ ${GREEN}${port}${NC}"
         ((i++))
     done <<< "$primary_nodes"
     
-    read -p "请输入要修改端口的节点编号 (输入 0 返回): " num
+    local num=""
+    if [ -n "$preset_tag" ]; then
+        [ -n "$preset_num" ] || { _error "指定的节点不存在或不可修改。"; return 1; }
+        num="$preset_num"
+    else
+        read -p "请输入要修改端口的节点编号 (输入 0 返回): " num
+    fi
     
     [[ ! "$num" =~ ^[0-9]+$ ]] || [ "$num" -eq 0 ] && return
     
@@ -6077,37 +6383,10 @@ _modify_port() (
         _info "Clash 节点名同步: ${old_proxy_name} -> ${new_proxy_name}"
     fi
     
-    # [修复] 3. 全局同步更新 metadata.json 中的链接端口与备注名
+    # 3. 同步更新元数据中的备注名与 HY2 跳跃状态。分享链接在所有
+    # 服务端、YAML 和 tag 变更完成后由统一构建器重新生成。
     if [ -f "$METADATA_FILE" ]; then
         if jq -e ".\"$tag_to_modify\"" "$METADATA_FILE" >/dev/null 2>&1; then
-            # [关键修复] _view_nodes 优先读取的是 .share_link 字段 (非 .link)
-            local current_link=$(jq -r ".\"$tag_to_modify\".share_link // \"\"" "$METADATA_FILE")
-            if [ -n "$current_link" ]; then
-                # 精准替换：仅替换 URL 中端口位置的数字（@IP:PORT? 和 #name-PORT 部分），避免误伤 UUID/密码
-                local new_link=$(echo "$current_link" | sed -E "s/(:${old_port})([?&#\/]|$)/:${new_port}\2/g; s/(-${old_port})([?&#\/]|$)/-${new_port}\2/g")
-                if [ -n "$hop_info" ]; then
-                    if [ -n "$final_hop_info" ]; then
-                        # 更新 mport 参数
-                        if [[ "$new_link" == *"&mport="* ]] || [[ "$new_link" == *"?mport="* ]]; then
-                            new_link=$(echo "$new_link" | sed -E "s/([?&]mport=)[0-9]+-[0-9]+/\1${final_hop_info}/g")
-                        else
-                            new_link="${new_link}&mport=${final_hop_info}"
-                        fi
-                        # 更新 ports 参数
-                        if [[ "$new_link" == *"&ports="* ]] || [[ "$new_link" == *"?ports="* ]]; then
-                            new_link=$(echo "$new_link" | sed -E "s/([?&]ports=)[0-9]+-[0-9]+/\1${final_hop_info}/g")
-                        else
-                            new_link="${new_link}&ports=${final_hop_info}"
-                        fi
-                    else
-                        new_link=$(echo "$new_link" | sed -E 's/[?&]mport=[0-9]+-[0-9]+//g')
-                        new_link=$(echo "$new_link" | sed -E 's/[?&]ports=[0-9]+-[0-9]+//g')
-                        new_link=$(echo "$new_link" | sed -E 's/\?&/?/g; s/&$//g; s/\?$//g')
-                    fi
-                fi
-                _atomic_modify_json "$METADATA_FILE" ".\"$tag_to_modify\".share_link = \"$new_link\"" || return 1
-                _info "分享链接已同步更新。"
-            fi
             local current_meta_name
             current_meta_name=$(jq -r ".\"$tag_to_modify\".name // \"\"" "$METADATA_FILE")
             if [ -n "$current_meta_name" ]; then
@@ -6256,7 +6535,9 @@ _modify_port() (
                     if [ "$p" -eq "$new_port" ]; then continue; fi
                     local skip_live="false"
                     if [ "$p" -ge "${hop_info%-*}" ] && [ "$p" -le "${hop_info#*-}" ]; then skip_live="true"; fi
-                    if _check_port_conflict "$p" "udp" "true" "$tag_to_modify" "$skip_live"; then ((skipped++)); continue; fi
+                    # metadata key 已在上方迁移为 final_tag；排除旧 tag 会把节点
+                    # 自己的跳跃范围误判为冲突，导致所有原生子入站被跳过。
+                    if _check_port_conflict "$p" "udp" "true" "$final_tag" "$skip_live"; then ((skipped++)); continue; fi
                     local hop_tag="${final_tag}-hop-${p}"
                     batch_array=$(echo "$batch_array" | jq --arg t "$hop_tag" --arg p "$p" --arg pw "$hy2_password" --arg cert "$cert_path" --arg key "$key_path" --arg op "$hy2_obfs_password" '. += [{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}} | if $op != "" then .obfs={"type":"salamander","password":$op} else . end]')
                 done
@@ -6272,6 +6553,11 @@ _modify_port() (
             fi
         fi
     fi
+
+    # 不再对旧链接做字符串替换；从最终配置和元数据完整重建，避免端口数字
+    # 误伤密码/UUID，也确保证书指纹、SNI、认证信息与 HY2 跳跃参数一致。
+    local final_proxy_name="${proposed_new_proxy_name:-$proposed_old_proxy_name}"
+    _refresh_modified_node_artifacts "$final_tag" "$final_proxy_name" || return 1
     
     local modify_check_result
     if ! modify_check_result=$(_check_combined_config_files "$SINGBOX_BIN" "$CONFIG_FILE" "$RELAY_CONFIG_FILE" 2>&1); then
@@ -6294,6 +6580,453 @@ _modify_port() (
     fi
     _success "端口修改成功: ${old_port} -> ${new_port}"
 )
+
+_modify_node_apply() (
+    local tag="$1" expected_node="$2" expected_metadata="$3" old_proxy_name="$4" action="$5"
+    shift 5
+    local arg1="${1:-}" arg2="${2:-}" arg3="${3:-}" arg4="${4:-}" arg5="${5:-}"
+    local lock_owned="false"
+    if [ "${SINGBOXLITE_LOCK_HELD:-0}" != "1" ]; then
+        command -v flock >/dev/null 2>&1 || { _error "缺少 flock，拒绝无锁修改节点。"; return 1; }
+        exec 8>"${SINGBOX_DIR}/.singboxlite.lock" || return 1
+        if ! _flock_wait 8 30; then exec 8>&-; _error "等待状态锁超时。"; return 1; fi
+        export SINGBOXLITE_LOCK_HELD=1
+        lock_owned="true"
+    fi
+
+    local backup_dir restart_attempted=0 restart_needed=0 committed=0
+    backup_dir=$(mktemp -d /tmp/.singbox-modify-node.XXXXXX) || return 1
+    if ! _main_create_tx_snapshot "$backup_dir"; then
+        _error "无法完整创建节点修改事务快照，操作尚未开始。"
+        rm -rf -- "$backup_dir"
+        if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi
+        return 1
+    fi
+    export MAIN_CREATE_TX_ACTIVE=1
+    if [ -f "${backup_dir}/nft.available" ]; then
+        export MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=1
+    else
+        export MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0
+    fi
+    trap 'modify_rc=$?; trap - EXIT INT TERM; if [ "$committed" -ne 1 ]; then if ! _restore_full_transaction_snapshot "$backup_dir" "$restart_attempted" "节点修改"; then modify_rc=1; fi; fi; export MAIN_CREATE_TX_ACTIVE=0 MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0; if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi; exit "$modify_rc"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    _validate_protected_yaml_metadata || return 1
+    _is_argo_inbound_tag "$tag" && { _error "Argo 节点只能在 Argo 菜单修改。"; return 1; }
+    [[ "$tag" == *"-hop-"* ]] && { _error "HY2 跳跃辅助入站不能单独修改。"; return 1; }
+    _is_shadowtls_inner_tag "$tag" && { _error "ShadowTLS 内层不能单独修改。"; return 1; }
+
+    local current_node current_metadata variant type port
+    current_node=$(jq -cS --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" 2>/dev/null | head -n 1) || return 1
+    current_metadata=$(jq -cS --arg tag "$tag" '.[$tag] // {}' "$METADATA_FILE" 2>/dev/null) || return 1
+    if [ "$current_node" != "$expected_node" ] || [ "$current_metadata" != "$expected_metadata" ]; then
+        _error "节点在选择后已被其他操作修改，请重新进入菜单。"
+        return 1
+    fi
+    variant=$(_detect_main_node_variant "$tag")
+    type=$(printf '%s' "$current_node" | jq -r '.type')
+    port=$(printf '%s' "$current_node" | jq -r '.listen_port')
+    [ "$variant" != "unsupported" ] || { _error "暂不支持修改该节点类型。"; return 1; }
+
+    case "$action" in
+        name)
+            if [ -n "$old_proxy_name" ] && [ "$arg1" != "$old_proxy_name" ]; then
+                export PROXY_NAME="$arg1"
+                if ${YQ_BINARY} eval '.proxies[] | select(.name == env(PROXY_NAME)) | .name' "$CLASH_YAML_FILE" 2>/dev/null | grep -Fxq "$arg1"; then
+                    _error "共享 Clash YAML 已存在同名节点: $arg1"
+                    return 1
+                fi
+            fi
+            _atomic_modify_json "$METADATA_FILE" '.[$tag].name = $value' --arg tag "$tag" --arg value "$arg1" || return 1
+            ;;
+        address)
+            _atomic_modify_json "$METADATA_FILE" '.[$tag].clientServer = $value' --arg tag "$tag" --arg value "$arg1" || return 1
+            ;;
+        auth)
+            case "$variant" in
+                vless-*) _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .users[0].uuid) = $value' --arg tag "$tag" --arg value "$arg1" || return 1 ;;
+                trojan-ws-tls|hysteria2|anytls|any-reality)
+                    _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .users[0].password) = $value' --arg tag "$tag" --arg value "$arg1" || return 1 ;;
+                tuic)
+                    _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .users[0]) |= (.uuid = $uuid | .password = $password)' --arg tag "$tag" --arg uuid "$arg1" --arg password "$arg2" || return 1 ;;
+                shadowsocks)
+                    _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .password) = $value' --arg tag "$tag" --arg value "$arg1" || return 1 ;;
+                shadowsocks-shadowtls)
+                    local inner_tag
+                    inner_tag=$(printf '%s' "$current_node" | jq -r '.detour // empty')
+                    [ -n "$inner_tag" ] || { _error "ShadowTLS 内层 tag 缺失。"; return 1; }
+                    _atomic_modify_json "$CONFIG_FILE" '
+                        (.inbounds[] | select(.tag == $tag) | .users[0].password) = $outer
+                        | (.inbounds[] | select(.tag == $inner) | .password) = $inner_password
+                    ' --arg tag "$tag" --arg inner "$inner_tag" --arg outer "$arg1" --arg inner_password "$arg2" || return 1
+                    ;;
+                socks)
+                    _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .users[0]) |= (.username = $username | .password = $password)' --arg tag "$tag" --arg username "$arg1" --arg password "$arg2" || return 1 ;;
+            esac
+            restart_needed=1
+            ;;
+        identity)
+            case "$variant" in
+                vless-reality|any-reality)
+                    _atomic_modify_json "$CONFIG_FILE" '
+                        (.inbounds[] | select(.tag == $tag) | .tls.server_name) = $sni
+                        | (.inbounds[] | select(.tag == $tag) | .tls.reality.handshake.server) = $sni
+                    ' --arg tag "$tag" --arg sni "$arg1" || return 1
+                    ;;
+                shadowsocks-shadowtls)
+                    _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .handshake.server) = $sni' --arg tag "$tag" --arg sni "$arg1" || return 1
+                    ;;
+                vless-ws-tls|vless-grpc-tls|trojan-ws-tls|anytls|hysteria2|tuic)
+                    local cert_path key_path skip_verify
+                    if [ "$arg2" = "self_signed" ]; then
+                        cert_path="${SINGBOX_DIR}/${tag}.pem"
+                        key_path="${SINGBOX_DIR}/${tag}.key"
+                        _generate_self_signed_cert "$arg1" "$cert_path" "$key_path" || return 1
+                        skip_verify="true"
+                    else
+                        cert_path="$arg3"
+                        key_path="$arg4"
+                        skip_verify="$arg5"
+                        _validate_tls_key_pair "$cert_path" "$key_path" || return 1
+                    fi
+                    _atomic_modify_json "$CONFIG_FILE" '
+                        (.inbounds[] | select(.tag == $tag) | .tls) |=
+                            (.server_name = $sni | .certificate_path = $cert | .key_path = $key)
+                    ' --arg tag "$tag" --arg sni "$arg1" --arg cert "$cert_path" --arg key "$key_path" || return 1
+                    if [ -n "$old_proxy_name" ]; then
+                        export OLD_NAME="$old_proxy_name" NODE_SKIP_VERIFY="$skip_verify"
+                        _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(OLD_NAME)))."skip-cert-verify" = (env(NODE_SKIP_VERIFY) == "true")' || return 1
+                    fi
+                    ;;
+            esac
+            restart_needed=1
+            ;;
+        transport)
+            case "$variant" in
+                vless-ws-tls|trojan-ws-tls)
+                    _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .transport.path) = $value' --arg tag "$tag" --arg value "$arg1" || return 1 ;;
+                vless-grpc-tls)
+                    _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .transport.service_name) = $value' --arg tag "$tag" --arg value "$arg1" || return 1 ;;
+                *) _error "该节点没有可修改的传输路径。"; return 1 ;;
+            esac
+            restart_needed=1
+            ;;
+        reality_keys)
+            [[ "$variant" == "vless-reality" || "$variant" == "any-reality" ]] || return 1
+            local keypair private_key public_key short_id
+            keypair=$(${SINGBOX_BIN} generate reality-keypair) || return 1
+            private_key=$(printf '%s\n' "$keypair" | awk '/PrivateKey/ {print $2; exit}')
+            public_key=$(printf '%s\n' "$keypair" | awk '/PublicKey/ {print $2; exit}')
+            short_id=$(${SINGBOX_BIN} generate rand --hex 8) || return 1
+            [ -n "$private_key" ] && [ -n "$public_key" ] && [ -n "$short_id" ] || { _error "Reality 密钥生成失败。"; return 1; }
+            _atomic_modify_json "$CONFIG_FILE" '
+                (.inbounds[] | select(.tag == $tag) | .tls.reality.private_key) = $private
+                | (.inbounds[] | select(.tag == $tag) | .tls.reality.short_id) = [$sid]
+            ' --arg tag "$tag" --arg private "$private_key" --arg sid "$short_id" || return 1
+            _atomic_modify_json "$METADATA_FILE" '.[$tag] |= (. + {publicKey:$public,shortId:$sid})' --arg tag "$tag" --arg public "$public_key" --arg sid "$short_id" || return 1
+            restart_needed=1
+            ;;
+        hy2_obfs)
+            [ "$variant" = "hysteria2" ] || return 1
+            if [ -n "$arg1" ]; then
+                _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .obfs) = {type:"salamander",password:$password}' --arg tag "$tag" --arg password "$arg1" || return 1
+                _atomic_modify_json "$METADATA_FILE" '.[$tag].obfsPassword = $password' --arg tag "$tag" --arg password "$arg1" || return 1
+            else
+                _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag)) |= del(.obfs)' --arg tag "$tag" || return 1
+                _atomic_modify_json "$METADATA_FILE" 'del(.[$tag].obfsPassword)' --arg tag "$tag" || return 1
+            fi
+            restart_needed=1
+            ;;
+        hy2_bandwidth)
+            [ "$variant" = "hysteria2" ] || return 1
+            _atomic_modify_json "$METADATA_FILE" '.[$tag] |= (. + {up:$up,down:$down})' --arg tag "$tag" --arg up "$arg1" --arg down "$arg2" || return 1
+            ;;
+        hy2_hop)
+            [ "$variant" = "hysteria2" ] || return 1
+            local old_hop old_mode start end count pf_conflict hop_conflict new_mode=""
+            old_hop=$(printf '%s' "$current_metadata" | jq -r '.portHopping // empty')
+            old_mode=$(printf '%s' "$current_metadata" | jq -r '.portHoppingMode // empty')
+            if [ -n "$old_hop" ] && [ -z "$old_mode" ]; then
+                if jq -e --arg prefix "${tag}-hop-" '.inbounds[]? | select((.tag // "") | startswith($prefix))' "$CONFIG_FILE" >/dev/null 2>&1; then old_mode="native"; else old_mode="nftables"; fi
+            fi
+            if [ -n "$arg1" ]; then
+                start="${arg1%-*}"; end="${arg1#*-}"; count=$((end - start + 1))
+                pf_conflict=$(_find_pf_udp_conflict_in_range "$start" "$end" || true)
+                [ -z "$pf_conflict" ] || { _error "跳跃范围覆盖已有端口转发入口。"; return 1; }
+                hop_conflict=$(_find_udp_hop_conflict_in_range "$start" "$end" "$tag" || true)
+                [ -z "$hop_conflict" ] || { _error "跳跃范围与其他 HY2 节点冲突。"; return 1; }
+            fi
+            _atomic_modify_json "$CONFIG_FILE" '.inbounds |= map(select((((.tag // "") | startswith($prefix))) | not))' --arg prefix "${tag}-hop-" || return 1
+            if [ "$old_mode" = "nftables" ] && [ -n "$old_hop" ]; then
+                _nft_apply_redirect_rule delete "${old_hop%-*}" "${old_hop#*-}" "$port" "singboxlite-hy2-hop-${tag}" || return 1
+            fi
+            if [ -n "$arg1" ]; then
+                if _nft_apply_redirect_rule add "$start" "$end" "$port" "singboxlite-hy2-hop-${tag}" && _save_nftables_rules; then
+                    new_mode="nftables"
+                else
+                    _nft_delete_rules_by_comment "singboxlite-hy2-hop-${tag}" >/dev/null 2>&1 || true
+                    [ "$count" -le 1000 ] || { _error "当前环境不能使用 nftables，原生跳跃最多允许 1000 个端口。"; return 1; }
+                    local main_node password obfs_password cert_path key_path batch_array="[]" p hop_tag
+                    main_node=$(jq -c --arg tag "$tag" '.inbounds[] | select(.tag == $tag)' "$CONFIG_FILE")
+                    password=$(printf '%s' "$main_node" | jq -r '.users[0].password')
+                    obfs_password=$(printf '%s' "$main_node" | jq -r '.obfs.password // empty')
+                    cert_path=$(printf '%s' "$main_node" | jq -r '.tls.certificate_path')
+                    key_path=$(printf '%s' "$main_node" | jq -r '.tls.key_path')
+                    for ((p=start; p<=end; p++)); do
+                        [ "$p" -eq "$port" ] && continue
+                        _check_port_conflict "$p" "udp" "true" "$tag" && continue
+                        hop_tag="${tag}-hop-${p}"
+                        batch_array=$(printf '%s' "$batch_array" | jq --arg t "$hop_tag" --argjson p "$p" --arg pw "$password" --arg cert "$cert_path" --arg key "$key_path" --arg op "$obfs_password" '. += [{type:"hysteria2",tag:$t,listen:"::",listen_port:$p,users:[{password:$pw}],tls:{enabled:true,alpn:["h3"],certificate_path:$cert,key_path:$key}} | if $op != "" then .obfs={type:"salamander",password:$op} else . end]') || return 1
+                    done
+                    _atomic_modify_json "$CONFIG_FILE" '.inbounds += $nodes' --argjson nodes "$batch_array" || return 1
+                    new_mode="native"
+                fi
+                _atomic_modify_json "$METADATA_FILE" '.[$tag] |= (. + {portHopping:$hop,portHoppingMode:$mode})' --arg tag "$tag" --arg hop "$arg1" --arg mode "$new_mode" || return 1
+            else
+                [ "$old_mode" != "nftables" ] || _save_nftables_rules || return 1
+                _atomic_modify_json "$METADATA_FILE" 'del(.[$tag].portHopping, .[$tag].portHoppingMode)' --arg tag "$tag" || return 1
+            fi
+            restart_needed=1
+            ;;
+        *) _error "未知节点修改动作。"; return 1 ;;
+    esac
+
+    # HY2 原生跳跃的所有子入站必须跟随主节点的密码、混淆和证书变化。
+    if [ "$variant" = "hysteria2" ]; then
+        local main_after hy2_password hy2_obfs cert_after key_after sni_after
+        main_after=$(jq -c --arg tag "$tag" '.inbounds[] | select(.tag == $tag)' "$CONFIG_FILE") || return 1
+        hy2_password=$(printf '%s' "$main_after" | jq -r '.users[0].password')
+        hy2_obfs=$(printf '%s' "$main_after" | jq -r '.obfs.password // empty')
+        cert_after=$(printf '%s' "$main_after" | jq -r '.tls.certificate_path')
+        key_after=$(printf '%s' "$main_after" | jq -r '.tls.key_path')
+        sni_after=$(printf '%s' "$main_after" | jq -r '.tls.server_name // empty')
+        _atomic_modify_json "$CONFIG_FILE" '
+            .inbounds |= map(
+                if ((.tag // "") | startswith($prefix)) then
+                    .users = [{password:$password}]
+                    | .tls.certificate_path = $cert | .tls.key_path = $key
+                    | if $sni != "" then .tls.server_name = $sni else . end
+                    | if $obfs != "" then .obfs = {type:"salamander",password:$obfs} else del(.obfs) end
+                else . end)
+        ' --arg prefix "${tag}-hop-" --arg password "$hy2_password" --arg obfs "$hy2_obfs" --arg cert "$cert_after" --arg key "$key_after" --arg sni "$sni_after" || return 1
+    fi
+
+    _refresh_modified_node_artifacts "$tag" "$old_proxy_name" || return 1
+    local check_result
+    if ! check_result=$(_check_combined_config_files "$SINGBOX_BIN" "$CONFIG_FILE" "$RELAY_CONFIG_FILE" 2>&1); then
+        _error "节点修改后的组合配置校验失败："
+        echo "$check_result"
+        return 1
+    fi
+    if [ "$restart_needed" -eq 1 ]; then
+        restart_attempted=1
+        _manage_service restart || { _error "节点修改后服务重启失败。"; return 1; }
+    fi
+    committed=1
+    trap - EXIT INT TERM
+    rm -rf -- "$backup_dir" || _warn "节点修改事务快照清理失败: $backup_dir"
+    export MAIN_CREATE_TX_ACTIVE=0 MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0
+    if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi
+    _success "节点修改已保存并通过配置校验。"
+)
+
+_confirm_node_change() {
+    local confirm
+    read -r -p "确认保存并应用本次修改？[Y/n]: " confirm
+    [[ "$confirm" =~ ^[Nn]$ ]] && return 1
+    _modify_node_apply "$@"
+}
+
+_modify_node() {
+    local primary_nodes node i=1 num count index tag type port display_name proxy_name variant
+    local tags=() types=() ports=() names=()
+    primary_nodes=$(_list_main_primary_inbounds)
+    [ -n "$primary_nodes" ] || { _warning "当前没有可修改的主节点。"; return; }
+    _info "--- 修改节点 ---"
+    while IFS= read -r node; do
+        [ -n "$node" ] || continue
+        IFS=$'\t' read -r tag type port <<< "$(printf '%s' "$node" | jq -r '[.tag,.type,(.listen_port|tostring)] | @tsv')"
+        proxy_name=$(_find_proxy_name "$port" "$type" "$tag")
+        display_name=$(jq -r --arg tag "$tag" '.[$tag].name // empty' "$METADATA_FILE" 2>/dev/null)
+        display_name=${display_name:-${proxy_name:-$tag}}
+        tags+=("$tag"); types+=("$type"); ports+=("$port"); names+=("$display_name")
+        variant=$(_detect_main_node_variant "$tag")
+        echo -e "  ${CYAN}${i})${NC} ${display_name} (${YELLOW}${variant}${NC}) @ ${GREEN}${port}${NC}"
+        ((i++))
+    done <<< "$primary_nodes"
+    read -r -p "请输入要修改的节点编号 (输入 0 返回): " num
+    [[ "$num" =~ ^[0-9]+$ ]] || { _error "请输入有效编号。"; return 1; }
+    [ "$num" -ne 0 ] || return
+    count=${#tags[@]}; [ "$num" -le "$count" ] || { _error "编号超出范围。"; return 1; }
+    index=$((num - 1)); tag=${tags[$index]}; type=${types[$index]}; port=${ports[$index]}; display_name=${names[$index]}
+    variant=$(_detect_main_node_variant "$tag")
+    proxy_name=$(_find_proxy_name "$port" "$type" "$tag")
+    local expected_node expected_metadata choice
+    expected_node=$(jq -cS --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE") || return 1
+    expected_metadata=$(jq -cS --arg tag "$tag" '.[$tag] // {}' "$METADATA_FILE") || return 1
+
+    echo ""
+    _info "当前节点: ${display_name} (${variant})"
+    echo "  1) 修改节点名称"
+    echo "  2) 修改客户端连接地址"
+    echo "  3) 修改监听端口"
+    case "$variant" in
+        tuic) echo "  4) 修改 UUID 和密码" ;;
+        shadowsocks-shadowtls) echo "  4) 修改 ShadowTLS 与内部 SS 密码" ;;
+        socks) echo "  4) 修改用户名和密码" ;;
+        *) echo "  4) 修改认证信息" ;;
+    esac
+    case "$variant" in
+        vless-reality|any-reality|shadowsocks-shadowtls) echo "  5) 修改伪装域名/SNI" ;;
+        vless-ws-tls|vless-grpc-tls|trojan-ws-tls|anytls|hysteria2|tuic) echo "  5) 修改 SNI 与证书" ;;
+    esac
+    case "$variant" in
+        vless-reality|any-reality) echo "  6) 重新生成 Reality 密钥和 Short ID" ;;
+        vless-ws-tls|trojan-ws-tls) echo "  6) 修改 WebSocket 路径" ;;
+        vless-grpc-tls) echo "  6) 修改 gRPC serviceName" ;;
+        hysteria2) echo "  6) 修改 Salamander 混淆"; echo "  7) 修改端口跳跃"; echo "  8) 修改客户端带宽参数" ;;
+    esac
+    echo "  0) 返回"
+    read -r -p "请选择修改项: " choice
+
+    local value value2 current method cert_choice cert_path key_path skip_verify confirm
+    case "$choice" in
+        1)
+            read -r -p "请输入新节点名称: " value
+            [ -n "$value" ] && [[ "$value" != *$'\n'* ]] || { _error "节点名称不能为空或包含换行。"; return 1; }
+            _info "节点名称: ${display_name} -> ${value}"
+            _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" name "$value"
+            ;;
+        2)
+            current=$(jq -r --arg tag "$tag" '.[$tag].clientServer // empty' "$METADATA_FILE")
+            [ -n "$current" ] || current=$(_get_proxy_field "$proxy_name" '.server // ""')
+            read -r -p "请输入新的客户端连接地址 (当前: ${current}): " value
+            value=$(_normalize_client_server "$value")
+            [ -n "$value" ] && [[ "$value" != *[[:space:]]* ]] && [[ "$value" != *"://"* ]] || { _error "连接地址格式无效，请只输入 IP 或域名。"; return 1; }
+            _info "客户端连接地址: ${current} -> ${value}"
+            _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" address "$value"
+            ;;
+        3) _modify_port "$tag" ;;
+        4)
+            case "$variant" in
+                vless-*)
+                    read -r -p "请输入新 UUID (回车随机生成): " value; value=${value:-$(${SINGBOX_BIN} generate uuid)}
+                    [[ "$value" =~ ^[0-9A-Fa-f-]{36}$ ]] || { _error "UUID 格式无效。"; return 1; }
+                    ;;
+                trojan-ws-tls|hysteria2|anytls|any-reality)
+                    read -r -s -p "请输入新密码 (回车随机生成): " value; echo ""; value=${value:-$(${SINGBOX_BIN} generate rand --hex 16)}
+                    ;;
+                tuic)
+                    read -r -p "请输入新 UUID (回车随机生成): " value; value=${value:-$(${SINGBOX_BIN} generate uuid)}
+                    [[ "$value" =~ ^[0-9A-Fa-f-]{36}$ ]] || { _error "UUID 格式无效。"; return 1; }
+                    read -r -s -p "请输入新密码 (回车随机生成): " value2; echo ""; value2=${value2:-$(${SINGBOX_BIN} generate rand --hex 16)}
+                    ;;
+                shadowsocks)
+                    method=$(printf '%s' "$expected_node" | jq -r '.method')
+                    read -r -s -p "请输入新密钥/密码 (回车按当前算法随机生成): " value; echo ""
+                    [ -n "$value" ] || value=$(_generate_shadowsocks_password "$method") || return 1
+                    ;;
+                shadowsocks-shadowtls)
+                    read -r -s -p "请输入新 ShadowTLS 密码 (回车随机生成): " value; echo ""; value=${value:-$(${SINGBOX_BIN} generate rand --hex 16)}
+                    read -r -s -p "请输入新内部 SS 密钥 (回车随机生成): " value2; echo ""; value2=${value2:-$(${SINGBOX_BIN} generate rand --base64 32)}
+                    ;;
+                socks)
+                    read -r -p "请输入新用户名 (回车随机生成): " value; value=${value:-$(${SINGBOX_BIN} generate rand --hex 8)}
+                    read -r -s -p "请输入新密码 (回车随机生成): " value2; echo ""; value2=${value2:-$(${SINGBOX_BIN} generate rand --hex 16)}
+                    ;;
+            esac
+            [ -n "$value" ] || { _error "认证信息不能为空。"; return 1; }
+            _info "认证信息将被更新（新凭据不会在确认信息中显示）。"
+            _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" auth "$value" "$value2"
+            ;;
+        5)
+            case "$variant" in
+                vless-reality|any-reality)
+                    current=$(printf '%s' "$expected_node" | jq -r '.tls.reality.handshake.server // .tls.server_name // empty')
+                    read -r -p "请输入新伪装域名/SNI (当前: ${current}): " value
+                    [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "域名/SNI 格式无效。"; return 1; }
+                    _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" identity "$value"
+                    ;;
+                shadowsocks-shadowtls)
+                    current=$(printf '%s' "$expected_node" | jq -r '.handshake.server // empty')
+                    read -r -p "请输入新伪装域名 (当前: ${current}): " value
+                    [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "伪装域名格式无效。"; return 1; }
+                    _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" identity "$value"
+                    ;;
+                vless-ws-tls|vless-grpc-tls|trojan-ws-tls|anytls|hysteria2|tuic)
+                    current=$(printf '%s' "$expected_node" | jq -r '.tls.server_name // empty')
+                    [ -n "$current" ] || current=$(_get_proxy_field "$proxy_name" '.sni // .servername // ""')
+                    read -r -p "请输入新 SNI/证书域名 (当前: ${current}): " value
+                    [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "域名/SNI 格式无效。"; return 1; }
+                    echo "  1) 重新生成脚本管理的自签证书"
+                    echo "  2) 使用自定义证书和私钥"
+                    read -r -p "请选择证书方式 [1-2] (默认: 1): " cert_choice; cert_choice=${cert_choice:-1}
+                    if [ "$cert_choice" = "1" ]; then
+                        _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" identity "$value" self_signed
+                    elif [ "$cert_choice" = "2" ]; then
+                        read -r -p "请输入证书完整路径: " cert_path
+                        read -r -p "请输入私钥完整路径: " key_path
+                        _validate_tls_key_pair "$cert_path" "$key_path" || return 1
+                        read -r -p "客户端是否跳过证书链验证？[y/N]: " confirm
+                        skip_verify=false; [[ "$confirm" =~ ^[Yy]$ ]] && skip_verify=true
+                        _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" identity "$value" custom "$cert_path" "$key_path" "$skip_verify"
+                    else
+                        _error "无效选择。"; return 1
+                    fi
+                    ;;
+                *) _error "该节点没有 SNI/证书修改项。"; return 1 ;;
+            esac
+            ;;
+        6)
+            case "$variant" in
+                vless-reality|any-reality)
+                    read -r -p "重新生成后旧客户端将立即失效，确认继续？[y/N]: " confirm
+                    [[ "$confirm" =~ ^[Yy]$ ]] || return
+                    _modify_node_apply "$tag" "$expected_node" "$expected_metadata" "$proxy_name" reality_keys
+                    ;;
+                vless-ws-tls|trojan-ws-tls)
+                    current=$(printf '%s' "$expected_node" | jq -r '.transport.path // "/"')
+                    read -r -p "请输入新 WebSocket 路径 (当前: ${current}): " value
+                    [ -n "$value" ] || { _error "路径不能为空。"; return 1; }; [[ "$value" == /* ]] || value="/$value"
+                    _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" transport "$value"
+                    ;;
+                vless-grpc-tls)
+                    current=$(printf '%s' "$expected_node" | jq -r '.transport.service_name // empty')
+                    read -r -p "请输入新 gRPC serviceName (当前: ${current}): " value
+                    [ -n "$value" ] && [[ "$value" != *[[:space:]]* ]] || { _error "serviceName 不能为空或包含空白。"; return 1; }
+                    _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" transport "$value"
+                    ;;
+                hysteria2)
+                    echo "  1) 开启/重新生成 Salamander 密码"; echo "  2) 关闭混淆"
+                    read -r -p "请选择 [1-2]: " value2
+                    if [ "$value2" = "1" ]; then read -r -s -p "请输入混淆密码 (回车随机): " value; echo ""; value=${value:-$(${SINGBOX_BIN} generate rand --hex 16)}; elif [ "$value2" = "2" ]; then value=""; else _error "无效选择。"; return 1; fi
+                    _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" hy2_obfs "$value"
+                    ;;
+                *) _error "该节点没有此修改项。"; return 1 ;;
+            esac
+            ;;
+        7)
+            [ "$variant" = "hysteria2" ] || { _error "该节点没有端口跳跃。"; return 1; }
+            current=$(jq -r --arg tag "$tag" '.[$tag].portHopping // "未启用"' "$METADATA_FILE")
+            read -r -p "请输入新跳跃范围 start-end，输入 none 关闭 (当前: ${current}): " value
+            if [ "$value" = "none" ]; then value=""; else
+                [[ "$value" =~ ^([0-9]+)-([0-9]+)$ ]] || { _error "范围格式无效。"; return 1; }
+                [ "${BASH_REMATCH[1]}" -ge 1 ] && [ "${BASH_REMATCH[2]}" -le 65535 ] && [ "${BASH_REMATCH[1]}" -le "${BASH_REMATCH[2]}" ] || { _error "跳跃范围无效。"; return 1; }
+            fi
+            _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" hy2_hop "$value"
+            ;;
+        8)
+            [ "$variant" = "hysteria2" ] || { _error "该节点没有带宽参数。"; return 1; }
+            read -r -p "请输入客户端上行 Mbps: " value
+            read -r -p "请输入客户端下行 Mbps: " value2
+            [[ "$value" =~ ^[0-9]+$ && "$value2" =~ ^[0-9]+$ ]] && [ "$value" -ge 1 ] && [ "$value2" -ge 1 ] || { _error "带宽必须是正整数。"; return 1; }
+            _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" hy2_bandwidth "$value" "$value2"
+            ;;
+        0) return ;;
+        *) _error "无效选择。"; return 1 ;;
+    esac
+}
 
 # --- 更新管理脚本 ---
 _download_bash_script_atomic() {
@@ -6983,7 +7716,7 @@ _main_menu() {
         echo -e "  ${CYAN}【节点管理】${NC}"
         echo -e "    ${GREEN}[1]${NC} 添加节点          ${GREEN}[2]${NC} Argo 隧道节点"
         echo -e "    ${GREEN}[3]${NC} 查看节点链接      ${GREEN}[4]${NC} 删除节点"
-        echo -e "    ${GREEN}[5]${NC} 修改节点端口"
+        echo -e "    ${GREEN}[5]${NC} 修改节点"
         echo ""
         
         # 服务控制
@@ -7024,7 +7757,7 @@ _main_menu() {
             2) _require_singbox && _argo_menu ;;
             3) _require_singbox && _view_nodes ;;
             4) _require_singbox && _delete_node ;;
-            5) _require_singbox && _modify_port ;;
+            5) _require_singbox && _modify_node ;;
             6) _require_singbox && _manage_service "restart" ;;
             7) _require_singbox && _manage_service "stop" ;;
             8) _require_singbox && _manage_service "status" ;;
@@ -7518,24 +8251,28 @@ _batch_create_nodes() {
     # 2.4 SS 专项 (支持多选)
     local ss_variant="1"
     if [ "$has_ss" = true ]; then
-        echo "选择 Shadowsocks 批量加密方式 (支持多选，如 1,2,3,4):"
-        echo " 1) aes-256-gcm"
-        echo " 2) chacha20-ietf-poly1305"
-        echo " 3) 2022-blake3-aes-256-gcm"
-        echo " 4) 2022-blake3-aes-256-gcm (带 Padding)"
-        read -p "选择 [1-4] (默认1): " ss_choice
+        echo "选择 Shadowsocks 批量加密方式 (支持多选，如 1,2,5,6):"
+        echo " 1) aes-128-gcm"
+        echo " 2) aes-256-gcm"
+        echo " 3) chacha20-ietf-poly1305"
+        echo " 4) xchacha20-ietf-poly1305"
+        echo " 5) 2022-blake3-aes-128-gcm"
+        echo " 6) 2022-blake3-aes-256-gcm"
+        echo " 7) 2022-blake3-chacha20-poly1305"
+        echo " 8) 2022-blake3-aes-256-gcm (带 Padding)"
+        read -r -p "选择 [1-8] (默认1): " ss_choice
         ss_variant=${ss_choice:-1}
         local normalized_ss variant
         normalized_ss=$(printf '%s' "$ss_variant" | tr ',' ' ' | xargs)
         for variant in $normalized_ss; do
-            [[ "$variant" =~ ^[1-4]$ ]] || { _error "Shadowsocks 加密方式无效，请选择 1-4。"; return 1; }
+            [[ "$variant" =~ ^[1-8]$ ]] || { _error "Shadowsocks 加密方式无效，请选择 1-8。"; return 1; }
         done
         [ -n "$normalized_ss" ] || { _error "未选择 Shadowsocks 加密方式。"; return 1; }
         ss_variant=$(printf '%s' "$normalized_ss" | tr ' ' ',')
         # 计算 SS 实际需要的端口数
         local ss_needed
         ss_needed=$(printf '%s' "$normalized_ss" | wc -w)
-        # 每个 Shadowsocks ID (7) 额外需要 (ss_needed - 1) 个端口
+        # 每个 Shadowsocks 协议 ID (8) 额外需要 (ss_needed - 1) 个端口
         proto_count=$((proto_count + (ss_needed - 1) * ss_occurences))
     fi
 

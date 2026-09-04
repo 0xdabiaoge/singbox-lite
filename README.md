@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v25`、`advanced_relay.sh v18`、`xray_manager.sh v3.1.2`。
+当前文档按以下脚本版本整理：`singbox.sh v27`、`advanced_relay.sh v18`、`xray_manager.sh v3.1.3`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -76,7 +76,7 @@ sb
 |  | 2 | Argo 隧道节点 |
 |  | 3 | 查看节点链接 |
 |  | 4 | 删除节点 |
-|  | 5 | 修改节点端口 |
+|  | 5 | 修改节点（名称、地址、端口、认证、SNI/证书及协议专属参数） |
 | 服务控制 | 6 | 重启 sing-box |
 |  | 7 | 停止 sing-box |
 |  | 8 | 查看运行状态 |
@@ -92,6 +92,8 @@ sb
 | 进阶功能 | 18 | 落地/中转/第三方节点导入/端口转发 |
 |  | 19 | Xray 节点管理 |
 | 退出 | 0 | 退出脚本 |
+
+`[5] 修改节点` 会按实际协议显示可用项目。所有主节点均可修改名称、客户端连接地址、端口和认证信息；Reality 可更新伪装域名并轮换密钥，TLS 类节点可更新 SNI、自签证书或自定义证书，WebSocket/gRPC 可修改传输路径，Hysteria2 还可调整混淆、端口跳跃和客户端带宽。保存时会统一校验 sing-box 配置并同步元数据、分享链接与 Clash/Mihomo 配置，失败则自动回滚。
 
 ## sing-box 节点协议
 
@@ -111,11 +113,17 @@ sb
 
 sing-box Shadowsocks 可选项：
 
+- `aes-128-gcm`
 - `aes-256-gcm`
 - `chacha20-ietf-poly1305`
+- `xchacha20-ietf-poly1305`
+- `2022-blake3-aes-128-gcm`
 - `2022-blake3-aes-256-gcm`
+- `2022-blake3-chacha20-poly1305`
 - `2022-blake3-aes-256-gcm` + Multiplex/Padding
 - `2022-blake3-aes-256-gcm` + ShadowTLS v3
+
+SS2022 会按算法生成严格长度的 Base64 密钥：AES-128 使用 16 字节，AES-256 与 ChaCha20 使用 32 字节。批量创建支持前述七种纯 SS 加密方式及 Padding 组合。
 
 ShadowTLS 组合没有通用的单行分享链接，脚本会给出 Mihomo 配置参考，并把完整配置写入 `clash.yaml`。
 
@@ -206,7 +214,7 @@ sing-box 用户态 UDP 转发的性能通常低于 nftables，但适合没有 ne
 | 5 | VLESS + XHTTP + TLS | 面向 Xray 客户端；可用于 CF H2 回源 |
 | 6 | VLESS + gRPC + TLS | 使用 CF 时需开启 gRPC 并正确配置 SSL 模式 |
 | 7 | Trojan + gRPC + TLS | 使用 CF 时需开启 gRPC 并正确配置 SSL 模式 |
-| 8 | Shadowsocks | AES-256-GCM、ChaCha20、SS2022、SS2022 + Padding |
+| 8 | Shadowsocks | AES-128/256-GCM、ChaCha20、XChaCha20、三种 SS2022 及 SS2022 + Padding |
 
 Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/etc/sing-box/clash.yaml`。删除和修改节点时只处理归属于目标节点的 YAML 项，避免误删另一核心的同名或相邻配置。
 
@@ -374,3 +382,9 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - 修复 Alpine/BusyBox 下 Xray 原子 JSON 临时文件模板不兼容；自签 TLS 链接优先使用证书指纹，兼容已移除 `allowInsecure` 的新版 Xray。
 - 修复 Podman 低内存安装跳过 `cron` 后 Argo 节点缺少自动守护的问题：仅在使用 Argo 时按需安装并启动 cron；守护创建失败会回滚节点，避免留下无法自愈的半成品配置。
 - sing-box 与 Xray 统一加入基于物理内存、cgroup `memory.max`/`memory.high` 的 `GOMEMLIMIT`；128 MB 档由 `48MiB` 收紧到约 `40MiB`，并覆盖 systemd、OpenRC、direct 三种启动方式。
+
+### 2026.09.05
+
+- sing-box 与 Xray 的 Shadowsocks 创建菜单统一补齐 `aes-128-gcm`、`aes-256-gcm`、`chacha20-ietf-poly1305`、`xchacha20-ietf-poly1305` 和三种 SS2022 加密方式，并保留原有 Padding、ShadowTLS 组合。
+- SS2022 改为按算法生成严格长度的 Base64 密钥：AES-128 使用 16 字节，AES-256 与 ChaCha20 使用 32 字节；sing-box 批量创建同步支持七种纯 SS 加密方式。
+- sing-box `[5] 修改节点` 在重新生成 Shadowsocks 认证信息时复用相同的密钥规则，并同步更新服务端配置、元数据、分享链接与 Clash/Mihomo 配置。
