@@ -1240,6 +1240,10 @@ _add_shadowsocks_xray() {
         0) return 1 ;;
         *) _error "无效输入"; return 1 ;;
     esac
+    if [[ "$method" == 2022-* ]]; then
+        _warn "Xray SS2022 依赖系统时间（偏差不能超过 30 秒），不会继承 sing-box 内置 NTP。"
+        _warn "容器无法校准系统时间时，请先用主菜单 [11] 诊断；时钟异常的容器建议使用 sing-box SS2022。"
+    fi
     password=$(_generate_xray_shadowsocks_password "$method") || return 1
     
     read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip

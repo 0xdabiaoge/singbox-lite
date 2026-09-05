@@ -1,10 +1,12 @@
 #!/bin/bash
 
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+
 # 配置、元数据、私钥和临时文件默认仅 root 可读写。
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="27"
+export SCRIPT_VERSION="28"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -556,18 +558,10 @@ _init_server_ip() {
 _manage_service() {
     local action="$1"
 
-    # 容器时间通常继承宿主机；但部分 Podman 服务商会封锁 UDP/123。
-    # sing-box 的内置 NTP 初始化失败属于致命错误，因此 Podman 仅移除本脚本
-    # 曾自动写入的默认项，用户自行配置的 NTP 则保留不动。
+    # NTP 查询失败不等于核心必然退出，但首次查询仍有等待成本。
+    # 先有界探测，再迁移脚本管理的默认配置；容器也可使用进程内时间补偿。
     if [[ "$action" == "restart" || "$action" == "start" ]]; then
-        if _is_podman_environment; then
-            if [ -s "$CONFIG_FILE" ] && jq -e '.ntp == {"enabled":true,"server":"time.apple.com","server_port":123,"interval":"30m"}' "$CONFIG_FILE" >/dev/null 2>&1; then
-                _atomic_modify_json "$CONFIG_FILE" 'del(.ntp)' 2>/dev/null || return 1
-            fi
-        elif [ -s "$CONFIG_FILE" ] && ! jq -e '.ntp' "$CONFIG_FILE" >/dev/null 2>&1; then
-            _info "检测到内核配置缺失内置时间同步(NTP)模块，正在自动注入防重放保护补丁..."
-            _atomic_modify_json "$CONFIG_FILE" '.ntp = {"enabled": true, "server": "time.apple.com", "server_port": 123, "interval": "30m"}' 2>/dev/null
-        fi
+        _time_prepare_ntp_config || return 1
         _ensure_relay_config || return 1
         local preflight_result
         if ! preflight_result=$(_check_combined_config_files "$SINGBOX_BIN" "$CONFIG_FILE" "$RELAY_CONFIG_FILE" 2>&1); then
@@ -811,29 +805,219 @@ _build_dns_config_json() {
 
 # --- 资源与环境管理 ---
 
-# 系统时间同步 (解决 TLS 握手 EOF 问题)
-_sync_system_time() {
-    _info "正在检查并同步系统时间..."
-    local current_year=$(date +%Y)
-    [ "$current_year" -lt 2024 ] && _warning "系统时间滞后，正在强制同步..."
-    # 采用三级同步策略提升鲁棒性 (NTP -> HTTP -> Package)
-    if _pkg_install ntpdate >/dev/null 2>&1 && command -v ntpdate &>/dev/null; then
-        ntpdate -u ntp.aliyun.com >/dev/null 2>&1 || ntpdate -u pool.ntp.org >/dev/null 2>&1
-    elif [ "$INIT_SYSTEM" == "openrc" ]; then
-        _pkg_install chrony >/dev/null 2>&1
-        chronyd -q 'server ntp.aliyun.com iburst' >/dev/null 2>&1
-    else
-        # 最后的屏障：通过 HTTP 头部修正时间 (防御 UDP 123 拦截)
-        local http_time=$(curl -sI --max-time 3 https://www.google.com | grep -i '^date:' | cut -f2- -d' ')
-        if [ -n "$http_time" ]; then
-            # [修复] 先尝试 GNU date 直接设置，失败后尝试 epoch 方式 (兼容 BusyBox)
-            if ! date -s "$http_time" >/dev/null 2>&1; then
-                local epoch=$(date -d "$http_time" +%s 2>/dev/null)
-                [ -n "$epoch" ] && date -s "@$epoch" >/dev/null 2>&1
+# 时间管理：不放宽 SS2022 的 30 秒防重放校验，不要求容器修改系统时间。
+_time_is_container() {
+    # Incus 虚拟机也可能提供 /dev/lxd；不能仅凭该接口判定为容器。
+    [ -e /run/.containerenv ] || [ -e /.dockerenv ] || [ -s /run/systemd/container ] && return 0
+    if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --container --quiet 2>/dev/null; then
+        return 0
+    fi
+    grep -qaE 'container=|lxc|libpod|podman|docker' /proc/1/environ /proc/1/cgroup 2>/dev/null
+}
+
+# 只发起 SNTP 查询；Bash UDP + dd/od，避免为低内存容器安装 Python/守护进程。
+# 随机 transmit nonce 必须被原样回显；检查服务器模式、闰秒状态及 stratum。
+_time_probe_ntp() {
+    local server="$1" port="${2:-123}" nonce escaped="" raw started finished i octet
+    local -a bytes
+    TIME_PROBE_EPOCH="" TIME_PROBE_OFFSET="" TIME_PROBE_SOURCE=""
+    [[ "$port" =~ ^[0-9]+$ ]] && ((port > 0 && port <= 65535)) || return 1
+    for i in timeout bash openssl dd od date; do command -v "$i" >/dev/null 2>&1 || return 1; done
+    nonce=$(openssl rand -hex 8) || return 1
+    [[ "$nonce" =~ ^[0-9a-f]{16}$ ]] || return 1
+    for ((i=0; i<16; i+=2)); do escaped+="\\x${nonce:i:2}"; done
+    started=$(date +%s) || return 1
+    raw=$(timeout -s KILL 3 bash -c '
+        exec 3<>"/dev/udp/$1/$2" || exit 1
+        # UDP 必须一次写出完整的 48 字节；分次 printf/dd 会产生多个报文。
+        packet="\\043"
+        for ((i=0; i<39; i++)); do packet+="\\000"; done
+        printf "%b" "$packet$3" >&3 || exit 1
+        # BusyBox timeout 不保证杀掉整棵进程树；直接约束阻塞读取者。
+        timeout -s KILL 2 dd bs=512 count=1 <&3 2>/dev/null | od -An -v -tu1
+    ' bash "$server" "$port" "$escaped" 2>/dev/null) || return 1
+    finished=$(date +%s) || return 1
+    raw=${raw//$'\n'/ }
+    read -r -a bytes <<< "$raw"
+    [ "${#bytes[@]}" -ge 48 ] || return 1
+    for octet in "${bytes[@]}"; do [[ "$octet" =~ ^[0-9]+$ ]] && ((octet <= 255)) || return 1; done
+    (( (bytes[0] & 7) == 4 && (bytes[0] >> 6) != 3 && bytes[1] > 0 && bytes[1] < 16 )) || return 1
+    for ((i=0; i<8; i++)); do
+        (( bytes[24+i] == 16#${nonce:i*2:2} )) || return 1
+    done
+    TIME_PROBE_EPOCH=$((bytes[40]*16777216 + bytes[41]*65536 + bytes[42]*256 + bytes[43] - 2208988800))
+    ((TIME_PROBE_EPOCH >= 1577836800 && finished >= started && finished-started <= 5)) || return 1
+    TIME_PROBE_OFFSET=$((TIME_PROBE_EPOCH - (started+finished)/2))
+    TIME_PROBE_SOURCE="$server:$port"
+}
+
+_time_has_ss2022() {
+    local config
+    for config in "$CONFIG_FILE" "${RELAY_CONFIG_FILE:-${SINGBOX_DIR}/relay.json}"; do
+        [ -s "$config" ] || continue
+        jq -e '[.inbounds[]?, .outbounds[]?] | any(.type == "shadowsocks" and ((.method // "") | startswith("2022-")))' "$config" >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+_time_prepare_ntp_config() {
+    _with_state_lock _time_prepare_ntp_config_locked
+}
+
+_time_prepare_ntp_config_locked() {
+    [ -s "$CONFIG_FILE" ] || return 0
+    local current managed="" wanted server state_file="${SINGBOX_DIR}/time-sync.json"
+    local status="unreachable" tmp old_present
+    current=$(jq -cS '.ntp // null' "$CONFIG_FILE") || return 1
+    old_present=$(jq -r 'has("ntp")' "$CONFIG_FILE") || return 1
+    [ ! -s "$state_file" ] || managed=$(jq -cS '.managed_ntp // null' "$state_file" 2>/dev/null)
+    # 仅迁移无配置、历史默认项或与 sidecar 完全一致的脚本管理项。
+    # 用户自定义服务器、间隔、detour 和显式 enabled:false 不被覆盖。
+    if [ "$current" != null ] && [ "$current" != "$managed" ] && ! jq -e '
+        .ntp == {enabled:true,server:"time.apple.com",server_port:123,interval:"30m"}
+        or .ntp == {enabled:true,server:"time.apple.com",server_port:123,interval:"1m",write_to_system:false,connect_timeout:"3s"}
+    ' "$CONFIG_FILE" >/dev/null; then
+        if _time_has_ss2022; then
+            _info "保留用户自定义 NTP 配置；SS2022 需确认校时成功，主菜单 [11] 可诊断。"
+            if ! jq -e '.ntp.enabled == true' "$CONFIG_FILE" >/dev/null; then
+                _warn "内置 NTP 已由用户关闭：SS2022 仍依赖系统时间，不能自动补偿宿主机偏差。"
             fi
         fi
+        return 0
     fi
-    _info "当前时间：$(date)"
+
+    wanted='{"enabled":false}'
+    for server in time.apple.com time.cloudflare.com time.google.com; do
+        if _time_probe_ntp "$server" 123; then
+            wanted=$(jq -cn --arg s "$server" '{enabled:true,server:$s,server_port:123,interval:"1m",write_to_system:false,connect_timeout:"3s"}') || return 1
+            status="reachable"
+            break
+        fi
+    done
+    tmp=$(mktemp "${state_file}.tmp.XXXXXX") || return 1
+    if ! jq -n --argjson ntp "$wanted" --arg status "$status" --arg offset "${TIME_PROBE_OFFSET:-}" --arg source "${TIME_PROBE_SOURCE:-}" --arg checked "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        '{managed_ntp:$ntp,last_probe_status:$status,system_offset_seconds:$offset,source:$source,checked_at_system_utc:$checked}' > "$tmp" || ! chmod 600 "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if [ "$current" != "$(printf '%s' "$wanted" | jq -cS .)" ]; then
+        if ! _atomic_modify_json "$CONFIG_FILE" '.ntp = $ntp' --argjson ntp "$wanted"; then
+            rm -f -- "$tmp"
+            return 1
+        fi
+    fi
+    if ! mv -f "$tmp" "$state_file"; then
+        _atomic_modify_json "$CONFIG_FILE" 'if $present then .ntp=$ntp else del(.ntp) end' --argjson ntp "$current" --argjson present "$old_present" || _error "恢复原 NTP 配置失败"
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if [ "$status" = reachable ]; then
+        _info "核心 NTP: ${TIME_PROBE_SOURCE}，每 1 分钟补偿时间；系统偏差约 ${TIME_PROBE_OFFSET} 秒，不写系统时钟。"
+    else
+        _warn "三个 NTP 时间源均未通过有界探测，暂不启用脚本管理的内置 NTP，避免拖延其他节点启动。"
+        _warn "下次启动/重启或 [11] 修复会重新探测；未校时不等于 SS2022 已可用。"
+        _time_has_ss2022 && _warn "检测到 SS2022：系统偏差超过 30 秒时将被拒绝；请使用可达时间源或联系宿主机管理员。"
+    fi
+    return 0
+}
+
+_time_diagnostics() {
+    local server port offset logs="" found=false
+    _info "系统 UTC: $(date -u '+%Y-%m-%d %H:%M:%S')"
+    if _time_is_container; then
+        _info "容器模式：不修改系统/宿主机时间；sing-box 内置 NTP 仅补偿其协议时钟。"
+    fi
+    if [ -s "$CONFIG_FILE" ]; then
+        jq -r '"核心 NTP: enabled=\(.ntp.enabled // false), server=\(.ntp.server // "未配置"), interval=\(.ntp.interval // "默认"), write_to_system=\(.ntp.write_to_system // false)"' "$CONFIG_FILE"
+        server=$(jq -r '.ntp.server // "time.apple.com"' "$CONFIG_FILE")
+        port=$(jq -r '.ntp.server_port // 123' "$CONFIG_FILE")
+    else
+        server=time.apple.com port=123
+    fi
+    if _time_probe_ntp "$server" "$port"; then
+        found=true
+    else
+        _warn "配置时间源的直连探测失败（自定义 detour 需结合核心日志判断）。"
+        for server in time.cloudflare.com time.google.com; do
+            if _time_probe_ntp "$server" 123; then found=true; break; fi
+        done
+    fi
+    if [ "$found" = true ]; then
+        offset=$TIME_PROBE_OFFSET
+        _info "NTP 参考: $TIME_PROBE_SOURCE；参考时间减系统时间约 ${offset} 秒（正值表示系统落后）。"
+        if ((offset > 20 || offset < -20)); then
+            _warn "系统时间偏差较大：Xray/未启用核心校时的 SS2022 有失败风险。"
+        fi
+    else
+        _warn "无可用 NTP 应答，不能确认时间准确或 SS2022 可用。HTTPS Date 只能辅助诊断，不能直接补偿核心。"
+    fi
+    if [ "${INIT_SYSTEM:-}" = systemd ]; then
+        logs=$(journalctl -u sing-box --since '2 hours ago' -n 1000 --no-pager 2>/dev/null | grep -E 'ntp:|bad timestamp' | tail -n 8)
+    elif [ -r "${LOG_FILE:-/var/log/sing-box.log}" ]; then
+        logs=$(tail -n 1000 "${LOG_FILE:-/var/log/sing-box.log}" | grep -E 'ntp:|bad timestamp' | tail -n 8)
+    fi
+    if [ -n "$logs" ]; then
+        _info "近期核心日志（历史成功不代表当前仍准确）："
+        printf '%s\n' "$logs"
+    else
+        _warn "未取得近期核心校时日志，不能仅凭服务运行判断校时成功。"
+    fi
+    _info "客户端也必须时间准确；sing-box 的补偿不会同步到独立 Xray 或客户端。"
+    [ "$found" = true ]
+}
+
+# 自动调用（如 Argo）在容器内只提示，不安装校时软件、更不修改宿主机时间。
+_sync_system_time() {
+    if _time_is_container; then
+        _warn "容器不执行系统校时；SS2022 使用 sing-box 内置 NTP，其他进程仍依赖宿主机时间。"
+        return 0
+    fi
+    local caps sync_ok=false
+    caps=$(awk '/^CapEff:/ {print $2}' /proc/self/status)
+    if ! [[ "$caps" =~ ^[0-9a-fA-F]+$ ]] || (( (16#$caps & (1 << 25)) == 0 )); then
+        _warn "缺少 CAP_SYS_TIME，不尝试修改系统时间。"
+        return 1
+    fi
+    # 先复用运行中的持续校时服务；仅在需要时使用已有依赖安装路径。
+    if command -v chronyc >/dev/null 2>&1 && timeout 5 chronyc tracking >/dev/null 2>&1; then
+        timeout 8 chronyc makestep >/dev/null 2>&1 && sync_ok=true
+    elif _pkg_install ntpdate >/dev/null 2>&1 && command -v ntpdate >/dev/null 2>&1; then
+        timeout 10 ntpdate -u time.cloudflare.com >/dev/null 2>&1 && sync_ok=true
+    elif [ "${INIT_SYSTEM:-}" = openrc ] && _pkg_install chrony >/dev/null 2>&1; then
+        timeout 10 chronyd -q 'server time.cloudflare.com iburst' >/dev/null 2>&1 && sync_ok=true
+    fi
+    if [ "$sync_ok" != true ]; then
+        _error "系统校时失败，不能宣称已同步；请检查权限、时间源及网络。"
+        return 1
+    fi
+    if _time_probe_ntp time.cloudflare.com 123 && ((TIME_PROBE_OFFSET <= 5 && TIME_PROBE_OFFSET >= -5)); then
+        _success "系统校时后复核通过：偏差约 ${TIME_PROBE_OFFSET} 秒。"
+    else
+        _warn "校时命令已执行，但复核未通过；建议配置持续校时服务并排查底层时钟。"
+        return 1
+    fi
+}
+
+_time_menu() {
+    local choice confirm
+    echo "1) 时间诊断（只读）"
+    echo "2) 修复核心时间补偿并重启 sing-box"
+    echo "3) 同步系统时间（非容器且有权限时）"
+    echo "0) 返回"
+    read -r -p "请选择 [0-3]: " choice
+    case "$choice" in
+        1) _time_diagnostics ;;
+        2)
+            [ -x "$SINGBOX_BIN" ] && [ -s "$CONFIG_FILE" ] || { _error "请先安装 sing-box 核心及配置"; return 1; }
+            read -r -p "会短暂重启 sing-box；保留自定义/显式关闭的 NTP 配置，继续？(y/N): " confirm
+            [[ "$confirm" = y || "$confirm" = Y ]] || return 0
+            _manage_service restart || return 1
+            _time_diagnostics
+            ;;
+        3) _sync_system_time ;;
+        0) return 0 ;;
+        *) _error "无效选项"; return 1 ;;
+    esac
 }
 
 # Clash YAML 节点管理
@@ -1166,6 +1350,8 @@ case "$INIT_SYSTEM" in
 esac
 
 export -f _info _success _warn _warning _error _flock_wait _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_locked _atomic_modify_yaml _atomic_modify_yaml_locked _with_state_lock _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _add_node_to_yaml_locked _remove_node_from_yaml _remove_node_from_yaml_locked _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules
+
+export -f _time_is_container _time_probe_ntp _time_has_ss2022 _time_prepare_ntp_config _time_prepare_ntp_config_locked _time_diagnostics _time_menu
 
 server_ip=""
 BATCH_MODE=false
@@ -3126,7 +3312,9 @@ _initialize_config_files() {
     "enabled": true,
     "server": "time.apple.com",
     "server_port": 123,
-    "interval": "30m"
+    "interval": "1m",
+    "write_to_system": false,
+    "connect_timeout": "3s"
   },
   "dns": {
     "servers": [
@@ -7724,7 +7912,7 @@ _main_menu() {
         echo -e "    ${GREEN}[6]${NC} 重启服务          ${GREEN}[7]${NC} 停止服务"
         echo -e "    ${GREEN}[8]${NC} 查看运行状态      ${GREEN}[9]${NC} 查看实时日志"
         echo -e "    ${GREEN}[10]${NC} 定时重启设置"
-        echo -e "    ${GREEN}[11]${NC} 同步系统时间"
+        echo -e "    ${GREEN}[11]${NC} 时间诊断/校时"
         echo ""
         
         # 配置与更新
@@ -7763,7 +7951,7 @@ _main_menu() {
             8) _require_singbox && _manage_service "status" ;;
             9) _require_singbox && _view_log ;;
             10) _require_singbox && _scheduled_restart_menu ;;
-            11) _sync_system_time ;;
+            11) _time_menu ;;
             12) _require_singbox && _check_config ;;
             13) _update_script ;;
             14) _require_singbox && _dns_config_menu ;;
@@ -8511,6 +8699,13 @@ main() {
         if _check_and_fix_dns; then
             config_updated=true
         fi
+
+        # 新旧配置均按能力探测选择核心 NTP，不按 Podman/LXC 名称禁用。
+        local ntp_before ntp_after
+        ntp_before=$(jq -cS '.ntp // null' "$CONFIG_FILE")
+        _time_prepare_ntp_config || { _error "时间补偿配置准备失败"; return 1; }
+        ntp_after=$(jq -cS '.ntp // null' "$CONFIG_FILE")
+        [ "$ntp_before" = "$ntp_after" ] || config_updated=true
         
         if [ "$config_updated" = true ]; then
             _manage_service restart
