@@ -970,6 +970,36 @@ _validate_imported_outbound() {
             and ((.flow? // "") == "")
             and ((.tls.enabled? // false) == false)
             and (.transport? == null)
+        elif $mode == "vless-ws-tls" then
+            only_keys(["type","tag","server","server_port","uuid","network","tls","transport"])
+            and .type == "vless"
+            and (.uuid | type == "string" and test("^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"))
+            and .network == "tcp"
+            and ((.flow? // "") == "")
+            and (.tls | only_keys(["enabled","server_name","insecure","utls"]))
+            and (.tls.enabled == true)
+            and (.tls.insecure | type == "boolean")
+            and (.tls.server_name | type == "string" and length > 0)
+            and (.tls.utls | only_keys(["enabled","fingerprint"]))
+            and (.tls.utls.enabled == true)
+            and (.tls.utls.fingerprint as $fp | ($fp | type == "string") and (["chrome","firefox","edge","safari","360","qq","ios","android","random","randomized"] | index($fp) != null))
+            and (.transport | only_keys(["type","path","headers"]))
+            and .transport.type == "ws"
+            and (.transport.path | type == "string" and startswith("/"))
+            and (.transport.headers | only_keys(["Host"]))
+            and (.transport.headers.Host | type == "string" and length > 0)
+        elif $mode == "https-proxy" then
+            (only_keys(["type","tag","server","server_port","tls"]) or only_keys(["type","tag","server","server_port","username","password","tls"]))
+            and .type == "http"
+            and (.tls | only_keys(["enabled","server_name","insecure"]))
+            and (.tls.enabled == true)
+            and (.tls.server_name | type == "string" and length > 0)
+            and (.tls.insecure | type == "boolean")
+            and ((.username? == null and .password? == null) or (.username | type == "string" and length > 0 and (.password | type == "string")))
+        elif $mode == "http-proxy" then
+            (only_keys(["type","tag","server","server_port"]) or only_keys(["type","tag","server","server_port","username","password"]))
+            and .type == "http"
+            and ((.username? == null and .password? == null) or (.username | type == "string" and length > 0 and (.password | type == "string")))
         elif $mode == "ss-aes-128-gcm" then
             only_keys(["type","tag","server","server_port","method","password"])
             and .type == "shadowsocks"
@@ -990,6 +1020,83 @@ _validate_imported_outbound() {
             and (.password | type == "string" and length > 0)
         else false end
     ' >/dev/null 2>&1
+}
+
+_manual_http_outbound() {
+    local server port tls_choice sni username password
+    read -r -p "  HTTP/HTTPS 代理服务器地址（IP 或域名，可带端口如 host:443）: " server
+    if [[ "$server" =~ ^\[(.*)\]:([0-9]+)$ ]]; then
+        server="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    elif [[ "$server" =~ ^([^:]+):([0-9]+)$ ]]; then
+        server="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    elif [[ "$server" =~ ^\[(.*)\]$ ]]; then
+        server="${BASH_REMATCH[1]}"
+    fi
+
+    if [ -z "$server" ] || [[ "$server" =~ [[:space:]/?\#@] ]] || ! _valid_server_address "$server"; then
+        _error "服务器地址无效"
+        return 1
+    fi
+
+    if [ -z "$port" ]; then
+        read -r -p "  服务器端口 [默认: 443]: " port
+        port="${port:-443}"
+    fi
+    if ! _valid_port "$port"; then
+        _error "服务器端口无效"
+        return 1
+    fi
+
+    read -r -p "  是否启用 TLS (HTTPS)? [Y/n]: " tls_choice
+    local enable_tls=true
+    if [[ "$tls_choice" =~ ^[Nn]$ ]]; then
+        enable_tls=false
+    fi
+
+    if [ "$enable_tls" = true ]; then
+        if _valid_hostname "$server"; then
+            sni="$server"
+            read -r -p "  TLS 证书域名 (SNI) [默认: $sni, 直接回车即可]: " input_sni
+            [ -n "$input_sni" ] && sni="$input_sni"
+        else
+            read -r -p "  TLS 证书域名 (SNI) [若落地机使用域名证书请填写，无则回车]: " input_sni
+            sni="$input_sni"
+            [ -z "$sni" ] && sni="$server"
+        fi
+    fi
+
+    read -r -p "  是否配置用户名密码认证? (y/N): " auth_choice
+    username=""
+    password=""
+    if [[ "$auth_choice" =~ ^[Yy]$ ]]; then
+        read -r -p "  用户名: " username
+        read -r -s -p "  密码: " password
+        echo ""
+        if [ -z "$username" ] || [ -z "$password" ]; then
+            _error "用户名和密码不能为空"
+            return 1
+        fi
+    fi
+
+    if [ "$enable_tls" = true ]; then
+        if [ -n "$username" ]; then
+            jq -n --arg server "$server" --argjson port "$port" --arg sni "$sni" --arg username "$username" --arg password "$password" \
+                '{type:"http",tag:"TEMP_TAG",server:$server,server_port:$port,username:$username,password:$password,tls:{enabled:true,server_name:$sni,insecure:false}}'
+        else
+            jq -n --arg server "$server" --argjson port "$port" --arg sni "$sni" \
+                '{type:"http",tag:"TEMP_TAG",server:$server,server_port:$port,tls:{enabled:true,server_name:$sni,insecure:false}}'
+        fi
+    else
+        if [ -n "$username" ]; then
+            jq -n --arg server "$server" --argjson port "$port" --arg username "$username" --arg password "$password" \
+                '{type:"http",tag:"TEMP_TAG",server:$server,server_port:$port,username:$username,password:$password}'
+        else
+            jq -n --arg server "$server" --argjson port "$port" \
+                '{type:"http",tag:"TEMP_TAG",server:$server,server_port:$port}'
+        fi
+    fi
 }
 
 _manual_socks_outbound() {
@@ -1032,26 +1139,39 @@ _import_link_config() {
     echo -e "${NC}"
     echo -e "    ${YELLOW}[0]${NC} 返回"
     echo -e "    ${GREEN}[1]${NC} VLESS + TCP + Reality + Vision（链接）"
-    echo -e "    ${GREEN}[2]${NC} 纯 VLESS + TCP（链接）"
-    echo -e "    ${GREEN}[3]${NC} Shadowsocks aes-128-gcm（链接）"
-    echo -e "    ${GREEN}[4]${NC} Shadowsocks aes-256-gcm（链接）"
-    echo -e "    ${GREEN}[5]${NC} SOCKS5 无认证（手动输入）"
-    echo -e "    ${GREEN}[6]${NC} SOCKS5 用户名密码认证（手动输入）"
+    echo -e "    ${GREEN}[2]${NC} VLESS + WebSocket + TLS（链接，如 CF CDN / Argo）"
+    echo -e "    ${GREEN}[3]${NC} 纯 VLESS + TCP（链接）"
+    echo -e "    ${GREEN}[4]${NC} Shadowsocks aes-128-gcm（链接）"
+    echo -e "    ${GREEN}[5]${NC} Shadowsocks aes-256-gcm（链接）"
+    echo -e "    ${GREEN}[6]${NC} HTTPS / HTTP 代理（链接导入，支持 https:// 或 host:port）"
+    echo -e "    ${GREEN}[7]${NC} HTTPS / HTTP 代理（手动输入）"
+    echo -e "    ${GREEN}[8]${NC} SOCKS5 无认证（手动输入）"
+    echo -e "    ${GREEN}[9]${NC} SOCKS5 用户名密码认证（手动输入）"
     echo ""
 
     local choice parser_mode validation_mode outbound_json parser_status share_link
-    read -r -p "  请选择第三方节点类型 [0-6]: " choice
+    read -r -p "  请选择第三方节点类型 [0-9]: " choice
     case "$choice" in
         0) return ;;
         1) parser_mode="vless-reality-vision" ;;
-        2) parser_mode="vless-tcp" ;;
-        3) parser_mode="ss-aes-128-gcm" ;;
-        4) parser_mode="ss-aes-256-gcm" ;;
-        5)
+        2) parser_mode="vless-ws-tls" ;;
+        3) parser_mode="vless-tcp" ;;
+        4) parser_mode="ss-aes-128-gcm" ;;
+        5) parser_mode="ss-aes-256-gcm" ;;
+        6) parser_mode="https-proxy" ;;
+        7)
+            outbound_json=$(_manual_http_outbound) || return
+            if echo "$outbound_json" | jq -e '.tls.enabled == true' >/dev/null 2>&1; then
+                validation_mode="https-proxy"
+            else
+                validation_mode="http-proxy"
+            fi
+            ;;
+        8)
             validation_mode="socks5-none"
             outbound_json=$(_manual_socks_outbound none) || return
             ;;
-        6)
+        9)
             validation_mode="socks5-auth"
             outbound_json=$(_manual_socks_outbound auth) || return
             ;;
@@ -1425,6 +1545,10 @@ _finalize_relay_setup() {
     fi
 
     _success "已解析落地节点: ${dest_type} -> ${dest_addr}:${dest_port}"
+    if [ "$dest_type" == "http" ]; then
+        _warn "【提示】HTTP/HTTPS 代理落地节点通常仅支持 TCP (HTTP CONNECT)，不支持 UDP 转发。"
+        _info "建议中转入口优先选择 VLESS+TCP+Reality 或 AnyTLS。"
+    fi
     
     # --- 选择中转入口协议 ---
     echo -e "\n  ${CYAN}【请选择本机的 [中转入口] 协议】${NC}"

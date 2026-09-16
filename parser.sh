@@ -368,6 +368,68 @@ _parse_vless_tcp() {
     printf '%s\n' "$output"
 }
 
+_parse_vless_ws_tls() {
+    local link security transport sni host path fingerprint insecure_raw insecure output
+    link="$1"
+    _parse_vless_uri "$link"
+    _require_query_keys encryption flow security sni servername fp insecure allowInsecure host path alpn ed headerType type
+
+    security="${QUERY_PARAMS[security]-}"
+    transport="${QUERY_PARAMS[type]-}"
+    [[ "$security" == "tls" ]] || _fatal "VLESS-WS-TLS 节点的 security 必须为 tls"
+    [[ "$transport" == "ws" ]] || _fatal "VLESS-WS-TLS 节点的 type 必须为 ws"
+
+    local encryption="${QUERY_PARAMS[encryption]-}"
+    [[ -z "$encryption" || "$encryption" == "none" ]] || _fatal "VLESS encryption 必须为 none"
+
+    local flow="${QUERY_PARAMS[flow]-}"
+    [[ -z "$flow" ]] || _fatal "VLESS WebSocket 节点不能启用 flow"
+
+    local header_type="${QUERY_PARAMS[headerType]-}"
+    [[ -z "$header_type" || "$header_type" == "none" ]] || _fatal "VLESS WS 不支持额外头部伪装"
+
+    sni="${QUERY_PARAMS[sni]-}"
+    [[ -n "$sni" ]] || sni="${QUERY_PARAMS[servername]-}"
+    [[ -n "$sni" ]] || sni="$VLESS_SERVER"
+    _validate_server "$sni" || _fatal "VLESS-WS-TLS 节点缺少有效的 SNI 或服务器域名"
+
+    host="${QUERY_PARAMS[host]-}"
+    [[ -n "$host" ]] || host="$sni"
+    _validate_server "$host" || _fatal "VLESS-WS-TLS 节点的 host 格式无效"
+
+    path="${QUERY_PARAMS[path]-}"
+    [[ -n "$path" ]] || path="/"
+    [[ "$path" == /* ]] || path="/${path}"
+
+    fingerprint="${QUERY_PARAMS[fp]-chrome}"
+    case "$fingerprint" in
+        chrome|firefox|edge|safari|360|qq|ios|android|random|randomized) ;;
+        *) _fatal "uTLS 指纹不在 sing-box 支持列表中" ;;
+    esac
+
+    insecure_raw="${QUERY_PARAMS[insecure]-}"
+    [[ -n "$insecure_raw" ]] || insecure_raw="${QUERY_PARAMS[allowInsecure]-0}"
+    if [[ "$insecure_raw" == "1" || "$insecure_raw" == "true" ]]; then
+        insecure=true
+    else
+        insecure=false
+    fi
+
+    if ! output=$(jq -n \
+        --arg server "$VLESS_SERVER" \
+        --argjson port "$VLESS_PORT" \
+        --arg uuid "$VLESS_UUID" \
+        --arg sni "$sni" \
+        --arg host "$host" \
+        --arg path "$path" \
+        --arg fingerprint "$fingerprint" \
+        --argjson insecure "$insecure" \
+        '{type:"vless",tag:"proxy",server:$server,server_port:$port,uuid:$uuid,network:"tcp",tls:{enabled:true,server_name:$sni,insecure:$insecure,utls:{enabled:true,fingerprint:$fingerprint}},transport:{type:"ws",path:$path,headers:{Host:$host}}}'); then
+        _fatal "生成 VLESS + WebSocket + TLS outbound 失败"
+    fi
+    printf '%s\n' "$output"
+}
+
 _parse_ss_uri() {
     local link expected_method body main query raw_userinfo endpoint decoded method_password
     local method password output key
@@ -435,6 +497,122 @@ _parse_ss_uri() {
     printf '%s\n' "$output"
 }
 
+_parse_http_uri() {
+    local link body authority userinfo endpoint raw_user raw_pass username password
+    local use_tls=true default_port=443 output
+    link="$1"
+
+    if [[ "$link" == http://* ]]; then
+        use_tls=false
+        default_port=80
+        body="${link#http://}"
+    elif [[ "$link" == https://* ]]; then
+        use_tls=true
+        default_port=443
+        body="${link#https://}"
+    else
+        use_tls=true
+        default_port=443
+        body="$link"
+    fi
+
+    body="${body%%#*}"
+    local query="" authority="$body"
+    if [[ "$body" == *\?* ]]; then
+        authority="${body%%\?*}"
+        query="${body#*\?}"
+    fi
+    [[ -n "$authority" ]] || _fatal "HTTP 代理地址为空"
+
+    username=""
+    password=""
+    if [[ "$authority" == *@* ]]; then
+        userinfo="${authority%@*}"
+        endpoint="${authority##*@}"
+        [[ -n "$userinfo" && -n "$endpoint" ]] || _fatal "HTTP 代理链接格式无效"
+        raw_user="${userinfo%%:*}"
+        if [[ "$userinfo" == *:* ]]; then
+            raw_pass="${userinfo#*:}"
+        else
+            raw_pass=""
+        fi
+        _url_decode "$raw_user" 0 || _fatal "HTTP 用户名 URL 解码失败"
+        username="$DECODED_VALUE"
+        _url_decode "$raw_pass" 0 || _fatal "HTTP 密码 URL 解码失败"
+        password="$DECODED_VALUE"
+    else
+        endpoint="$authority"
+    fi
+
+    endpoint="${endpoint%/}"
+    if [[ "$endpoint" == *:* ]]; then
+        _split_host_port "$endpoint" || _fatal "HTTP 服务器地址或端口无效"
+    else
+        _validate_server "$endpoint" || _fatal "HTTP 服务器地址无效"
+        PARSED_SERVER="$endpoint"
+        PARSED_PORT="$default_port"
+    fi
+
+    local sni="" insecure=false
+    if [[ -n "$query" ]]; then
+        _parse_query "$query" || _fatal "HTTP 代理查询参数格式无效或包含重复参数"
+        _require_query_keys "sni" "peer" "insecure" "allowInsecure"
+        sni="${QUERY_PARAMS[sni]-}"
+        [[ -n "$sni" ]] || sni="${QUERY_PARAMS[peer]-}"
+        local insec="${QUERY_PARAMS[insecure]-}"
+        [[ -n "$insec" ]] || insec="${QUERY_PARAMS[allowInsecure]-}"
+        if [[ "$insec" == "1" || "$insec" == "true" ]]; then
+            insecure=true
+        elif [[ -n "$insec" && "$insec" != "0" && "$insec" != "false" ]]; then
+            _fatal "HTTP 代理 insecure 参数值无效"
+        fi
+    fi
+
+    if [[ "$use_tls" == "true" ]]; then
+        if [[ -z "$sni" ]]; then
+            sni="$PARSED_SERVER"
+        else
+            _validate_server "$sni" || _fatal "HTTP 代理 SNI 地址无效"
+        fi
+        if [[ -n "$username" || -n "$password" ]]; then
+            output=$(jq -n \
+                --arg server "$PARSED_SERVER" \
+                --argjson port "$PARSED_PORT" \
+                --arg user "$username" \
+                --arg pass "$password" \
+                --arg sni "$sni" \
+                --argjson insecure "$insecure" \
+                '{type:"http",tag:"proxy",server:$server,server_port:$port,username:$user,password:$pass,tls:{enabled:true,server_name:$sni,insecure:$insecure}}')
+        else
+            output=$(jq -n \
+                --arg server "$PARSED_SERVER" \
+                --argjson port "$PARSED_PORT" \
+                --arg sni "$sni" \
+                --argjson insecure "$insecure" \
+                '{type:"http",tag:"proxy",server:$server,server_port:$port,tls:{enabled:true,server_name:$sni,insecure:$insecure}}')
+        fi
+    else
+        if [[ -n "$username" || -n "$password" ]]; then
+            output=$(jq -n \
+                --arg server "$PARSED_SERVER" \
+                --argjson port "$PARSED_PORT" \
+                --arg user "$username" \
+                --arg pass "$password" \
+                '{type:"http",tag:"proxy",server:$server,server_port:$port,username:$user,password:$pass}')
+        else
+            output=$(jq -n \
+                --arg server "$PARSED_SERVER" \
+                --argjson port "$PARSED_PORT" \
+                '{type:"http",tag:"proxy",server:$server,server_port:$port}')
+        fi
+    fi
+
+    if [[ -z "$output" ]]; then
+        _fatal "生成 HTTP/HTTPS outbound 失败"
+    fi
+    printf '%s\n' "$output"
+}
+
 _read_link() {
     local argument_count extra read_status
     argument_count="$1"
@@ -465,7 +643,7 @@ _read_link() {
 
 MODE="$1"
 case "$MODE" in
-    vless-reality-vision|vless-tcp|ss-aes-128-gcm|ss-aes-256-gcm) ;;
+    vless-reality-vision|vless-tcp|vless-ws-tls|ss-aes-128-gcm|ss-aes-256-gcm|https-proxy) ;;
     *) _fatal "不支持的解析模式" ;;
 esac
 
@@ -481,6 +659,8 @@ _read_link "$#" "${2-}"
 case "$MODE" in
     vless-reality-vision) _parse_vless_reality_vision "$LINK_INPUT" ;;
     vless-tcp) _parse_vless_tcp "$LINK_INPUT" ;;
+    vless-ws-tls) _parse_vless_ws_tls "$LINK_INPUT" ;;
     ss-aes-128-gcm) _parse_ss_uri "$LINK_INPUT" "aes-128-gcm" ;;
     ss-aes-256-gcm) _parse_ss_uri "$LINK_INPUT" "aes-256-gcm" ;;
+    https-proxy) _parse_http_uri "$LINK_INPUT" ;;
 esac

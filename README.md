@@ -136,15 +136,18 @@ ShadowTLS 组合没有通用的单行分享链接，脚本会给出 Mihomo 配�
 | 选项 | 支持方式 | 约束 |
 | --- | --- | --- |
 | VLESS + TCP + Reality + Vision | `vless://` 链接 | 必须是原生 TCP、Reality、`xtls-rprx-vision` |
+| VLESS + WebSocket + TLS | `vless://` 链接 | 必须是 WebSocket 传输层与 TLS 加密，支持 Cloudflare CDN/Argo 回源 |
 | 纯 VLESS + TCP | `vless://` 链接 | 必须是原生 TCP，不能启用 TLS/Reality |
 | Shadowsocks `aes-128-gcm` | `ss://` 链接 | 不接受插件或其他加密方法 |
 | Shadowsocks `aes-256-gcm` | `ss://` 链接 | 不接受插件或其他加密方法 |
+| HTTPS / HTTP 代理 | 链接导入 | 支持 `https://`、`http://` 或 `host:port`，支持 `?sni=` 及 `?insecure=` 参数 |
+| HTTPS / HTTP 代理 | 手动输入 | 输入服务器地址、端口，选择是否开启 TLS (HTTPS) 及可选认证 |
 | SOCKS5 无认证 | 手动输入 | 输入服务器地址和端口 |
 | SOCKS5 用户名/密码认证 | 手动输入 | 输入服务器地址、端口、用户名和密码 |
 
-Hysteria2、TUIC、VMess、Trojan、AnyTLS 等第三方分享链接不属于当前导入白名单；解析器会明确拒绝，而不是生成可能错误的配置。
+Hysteria2、TUIC、VMess、Trojan、AnyTLS 等其余第三方分享链接不属于当前导入白名单；解析器会明确拒绝，而不是生成可能错误的配置。
 
-VLESS 两种导入结果都会显式写入 `network: "tcp"`。Reality 模式还会严格检查 SNI、公钥、Short ID、uTLS 指纹和 `flow`。
+VLESS 导入结果都会显式写入 `network: "tcp"`。Reality 模式严格检查 SNI、公钥、Short ID、uTLS 指纹和 `flow`；WS+TLS 模式严格校验 SNI、Host、Path 与 uTLS 指纹；HTTP/HTTPS 代理作为落地节点时通过 HTTP CONNECT 转发 TCP 流量。
 
 ## 落地与中转
 
