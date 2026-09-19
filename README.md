@@ -177,6 +177,7 @@ VLESS 导入结果都会显式写入 `network: "tcp"`。Reality 模式严格检�
 - Hysteria2
 - TUIC v5
 - AnyTLS
+- Shadowsocks `aes-256-gcm`
 
 创建、删除和修改中转路由都使用事务快照；配置检查或服务重启失败时会尝试恢复原状态。
 

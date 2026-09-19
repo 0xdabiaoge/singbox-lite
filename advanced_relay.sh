@@ -1547,7 +1547,7 @@ _finalize_relay_setup() {
     _success "已解析落地节点: ${dest_type} -> ${dest_addr}:${dest_port}"
     if [ "$dest_type" == "http" ]; then
         _warn "【提示】HTTP/HTTPS 代理落地节点通常仅支持 TCP (HTTP CONNECT)，不支持 UDP 转发。"
-        _info "建议中转入口优先选择 VLESS+TCP+Reality 或 AnyTLS。"
+        _info "建议中转入口优先选择 VLESS+TCP+Reality、AnyTLS 或 Shadowsocks。"
     fi
     
     # --- 选择中转入口协议 ---
@@ -1556,8 +1556,9 @@ _finalize_relay_setup() {
     echo -e "    ${GREEN}[2]${NC} Hysteria2"
     echo -e "    ${GREEN}[3]${NC} TUICv5"
     echo -e "    ${GREEN}[4]${NC} AnyTLS"
+    echo -e "    ${GREEN}[5]${NC} Shadowsocks aes-256-gcm"
     echo ""
-    read -p "  请输入选项 [1-4]: " relay_choice
+    read -p "  请输入选项 [1-5]: " relay_choice
     
     local relay_type=""
     local listen_network="tcp"
@@ -1566,6 +1567,7 @@ _finalize_relay_setup() {
         2) relay_type="hysteria2"; listen_network="udp" ;;
         3) relay_type="tuic"; listen_network="udp" ;;
         4) relay_type="anytls" ;;
+        5) relay_type="shadowsocks" ;;
         *) _error "无效选项"; return ;;
     esac
     
@@ -1597,8 +1599,11 @@ _finalize_relay_setup() {
         fi
     done
     
-    read -p "  请输入中转机入口 SNI (回车默认 www.amd.com): " entrance_sni
-    [[ -z "$entrance_sni" ]] && entrance_sni="www.amd.com"
+    local entrance_sni=""
+    if [ "$relay_type" != "shadowsocks" ]; then
+        read -p "  请输入中转机入口 SNI (回车默认 www.amd.com): " entrance_sni
+        [[ -z "$entrance_sni" ]] && entrance_sni="www.amd.com"
+    fi
     
     local default_name="${dest_type}-Relay-${listen_port}"
     read -p "  请输入节点名称 (回车: ${default_name}): " node_name
@@ -1744,6 +1749,15 @@ _finalize_relay_setup() {
         local pin_param=""
         [ -n "$cert_pcs" ] && pin_param="&pcs=${cert_pcs}"
         link="anytls://${password}@${link_ip}:${listen_port}?security=tls&sni=${entrance_sni}&insecure=1&type=tcp${pin_param}#$(_url_encode "${node_name}")"
+        
+    elif [ "$relay_type" == "shadowsocks" ]; then
+        local method="aes-256-gcm"
+        local password=$($SINGBOX_BIN generate rand --hex 16)
+        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg m "$method" --arg pw "$password" \
+            '{"type":"shadowsocks","tag":$t,"listen":"::","listen_port":($p|tonumber),"method":$m,"password":$pw}')
+            
+        local userinfo=$(printf '%s' "${method}:${password}" | base64 | tr -d '\n\r ' | tr '+/' '-_' | tr -d '=')
+        link="ss://${userinfo}@${link_ip}:${listen_port}#$(_url_encode "${node_name}")"
     fi
     
     # 构造 Clash 客户端节点，随后与 config/metadata 一起事务提交。
@@ -1773,6 +1787,11 @@ _finalize_relay_setup() {
         local sn=$(echo "$inbound_json" | jq -r '.tls.server_name')
         proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --arg p "$listen_port" --arg pw "$password" --arg sn "$sn" \
             '{name:$n,type:"anytls",server:$s,port:($p|tonumber),password:$pw,"client-fingerprint":"chrome",udp:true,sni:$sn,alpn:["h2","http/1.1"],"skip-cert-verify":true}')
+    elif [ "$relay_type" == "shadowsocks" ]; then
+        local password=$(echo "$inbound_json" | jq -r '.password')
+        local method=$(echo "$inbound_json" | jq -r '.method')
+        proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --arg p "$listen_port" --arg m "$method" --arg pw "$password" \
+            '{name:$n,type:"ss",server:$s,port:($p|tonumber),cipher:$m,password:$pw,udp:true}')
     fi
     if [ -z "$proxy_json" ]; then
         _error "无法生成中转客户端配置"
@@ -2045,7 +2064,7 @@ _clear_all_relays() {
 
     relay_tags=$(jq -c '[
         (.route.rules[]? | select(((.outbound? // "") | startswith("relay-out-"))) | .inbound),
-        (.inbounds[]? | select((.tag? // "") | test("^(vless-reality|hysteria2|tuic|anytls)-in-[0-9]+$")) | .tag)
+        (.inbounds[]? | select((.tag? // "") | test("^(vless-reality|hysteria2|tuic|anytls|shadowsocks)-in-[0-9]+$")) | .tag)
     ] | unique' "$CONFIG_FILE" 2>/dev/null)
     [ -n "$relay_tags" ] || relay_tags='[]'
 
