@@ -887,6 +887,42 @@ EOF
         echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
         _info "已初始化中转配置文件: $RELAY_CONFIG_FILE"
     fi
+
+    # 确保主配置文件 config.json 存在（用于 check 组合校验）
+    if [ ! -s "$MAIN_CONFIG_FILE" ]; then
+        cat > "$MAIN_CONFIG_FILE" << 'EOF'
+{
+  "dns": {
+    "servers": [
+      {
+        "type": "local",
+        "tag": "dns-local",
+        "prefer_go": true
+      }
+    ],
+    "final": "dns-local",
+    "strategy": "prefer_ipv4"
+  },
+  "inbounds": [],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [],
+    "final": "direct",
+    "default_domain_resolver": {
+      "server": "dns-local",
+      "strategy": "prefer_ipv4"
+    }
+  }
+}
+EOF
+        chmod 600 "$MAIN_CONFIG_FILE" 2>/dev/null || true
+        _info "已自愈初始化主配置文件: $MAIN_CONFIG_FILE"
+    fi
     _ensure_relay_yaml_groups || { [ "$acquired" = "true" ] && _state_lock_release; return 1; }
     _secure_state_file "$LINKS_FILE"
     _secure_state_file "$RELAY_CLASH_YAML"
@@ -1160,7 +1196,7 @@ _import_link_config() {
         5) parser_mode="ss-aes-256-gcm" ;;
         6) parser_mode="https-proxy" ;;
         7)
-            outbound_json=$(_manual_http_outbound) || return
+            outbound_json=$(_manual_http_outbound) || { read -r -p "  按回车键返回..."; return; }
             if echo "$outbound_json" | jq -e '.tls.enabled == true' >/dev/null 2>&1; then
                 validation_mode="https-proxy"
             else
@@ -1169,20 +1205,20 @@ _import_link_config() {
             ;;
         8)
             validation_mode="socks5-none"
-            outbound_json=$(_manual_socks_outbound none) || return
+            outbound_json=$(_manual_socks_outbound none) || { read -r -p "  按回车键返回..."; return; }
             ;;
         9)
             validation_mode="socks5-auth"
-            outbound_json=$(_manual_socks_outbound auth) || return
+            outbound_json=$(_manual_socks_outbound auth) || { read -r -p "  按回车键返回..."; return; }
             ;;
-        *) _error "无效选项"; return ;;
+        *) _error "无效选项"; read -r -p "  按回车键返回..."; return ;;
     esac
 
     if [ -n "$parser_mode" ]; then
-        _check_parser || return
+        _check_parser || { read -r -p "  按回车键返回..."; return; }
         local PARSER_BIN="$_PARSER_PATH"
         read -r -p "  请输入对应类型的节点分享链接: " share_link
-        [ -n "$share_link" ] || { _error "节点链接不能为空"; return; }
+        [ -n "$share_link" ] || { _error "节点链接不能为空"; read -r -p "  按回车键返回..."; return; }
         _info "正在按 ${parser_mode} 严格解析链接..."
         outbound_json=$(printf '%s\n' "$share_link" | bash "$PARSER_BIN" "$parser_mode")
         parser_status=$?
@@ -1191,27 +1227,38 @@ _import_link_config() {
             parser_error=$(printf '%s' "$outbound_json" | jq -r '.error // empty' 2>/dev/null)
             _error "链接解析失败（解析器退出码: ${parser_status}）"
             [ -n "$parser_error" ] && _error "$parser_error"
+            read -r -p "  按回车键返回..."
             return
         fi
         validation_mode="$parser_mode"
     fi
 
+    # 若导入的是明文 http:// 链接，parser.sh 生成无 tls 对象的 http outbound，此时自动切换校验模式
+    if [ "$validation_mode" = "https-proxy" ]; then
+        if ! echo "$outbound_json" | jq -e '.tls.enabled == true' >/dev/null 2>&1; then
+            validation_mode="http-proxy"
+        fi
+    fi
+
     if ! _validate_imported_outbound "$validation_mode" "$outbound_json"; then
         _error "解析结果不符合所选协议的严格 schema，已拒绝导入"
+        read -r -p "  按回车键返回..."
         return
     fi
 
     outbound_json=$(printf '%s' "$outbound_json" | jq -c '.tag = "TEMP_TAG"') || {
         _error "解析结果不是有效 JSON"
+        read -r -p "  按回车键返回..."
         return
     }
     local dest_type dest_addr dest_port
     IFS=$'\t' read -r dest_type dest_addr dest_port <<< "$(printf '%s' "$outbound_json" | jq -r '[.type,.server,(.server_port|tostring)] | @tsv')"
     if ! _valid_server_address "$dest_addr"; then
         _error "解析结果中的服务器地址无效"
+        read -r -p "  按回车键返回..."
         return 1
     fi
-    _finalize_relay_setup "$dest_type" "$dest_addr" "$dest_port" "$outbound_json"
+    _finalize_relay_setup "$dest_type" "$dest_addr" "$dest_port" "$outbound_json" || { read -r -p "  按回车键返回..."; return 1; }
 }
 
 # 检查依赖 (主脚本已预装绝大部分，此处仅做快速校验)
@@ -1568,7 +1615,7 @@ _finalize_relay_setup() {
         3) relay_type="tuic"; listen_network="udp" ;;
         4) relay_type="anytls" ;;
         5) relay_type="shadowsocks" ;;
-        *) _error "无效选项"; return ;;
+        *) _error "无效选项"; return 1 ;;
     esac
     
     # --- 配置入口详细信息 ---
@@ -1896,7 +1943,7 @@ _relay_config() {
     echo ""
     read -r token_input
     
-    if [ -z "$token_input" ]; then _error "输入为空。"; return; fi
+    if [ -z "$token_input" ]; then _error "输入为空。"; read -r -p "  按回车键返回..."; return; fi
     
     local decoded_json
     
@@ -1909,6 +1956,7 @@ _relay_config() {
         decoded_json=$(printf '%s' "$encrypted_data" | openssl enc -aes-256-cbc -pbkdf2 -d -a -A -pass fd:3 3<<<"$passphrase" 2>/dev/null)
         if [ -z "$decoded_json" ] || ! echo "$decoded_json" | jq . >/dev/null 2>&1; then
             _error "Token 解密失败！密钥可能不正确。"
+            read -r -p "  按回车键返回..."
             return
         fi
         _success "Token 解密成功。"
@@ -1921,6 +1969,7 @@ _relay_config() {
         decoded_json=$(printf '%s' "$legacy_encrypted_data" | openssl enc -aes-256-cbc -pbkdf2 -d -a -A -pass fd:3 3<<<"$legacy_passphrase" 2>/dev/null)
         if [ -z "$decoded_json" ] || ! printf '%s' "$decoded_json" | jq . >/dev/null 2>&1; then
             _error "旧版 Token 解密失败"
+            read -r -p "  按回车键返回..."
             return
         fi
     else
@@ -1929,6 +1978,7 @@ _relay_config() {
         local decode_status=$?
         if [ $decode_status -ne 0 ] || [ -z "$decoded_json" ] || ! echo "$decoded_json" | jq . >/dev/null 2>&1; then
             _error "Token 无效或无法解码！"
+            read -r -p "  按回车键返回..."
             return
         fi
         _warn "检测到旧版未加密 Token，建议在落地机重新生成加密版本。"
@@ -1959,8 +2009,8 @@ _relay_config() {
         fi
     fi
     
-    if [ -z "$outbound_json" ]; then _error "Token 解析失败"; return; fi
-    _finalize_relay_setup "$dest_type" "$dest_addr" "$dest_port" "$outbound_json"
+    if [ -z "$outbound_json" ]; then _error "Token 解析失败"; read -r -p "  按回车键返回..."; return; fi
+    _finalize_relay_setup "$dest_type" "$dest_addr" "$dest_port" "$outbound_json" || { read -r -p "  按回车键返回..."; return 1; }
 }
 
 # --- 3. 查看中转路由 ---
@@ -3765,7 +3815,8 @@ case "${1:-}" in
         refresh_status=$?
         _state_lock_release
         exit "$refresh_status"
-        ;;
 esac
 
-_menu
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    _menu
+fi
