@@ -221,6 +221,7 @@ sing-box 用户态 UDP 转发的性能通常低于 nftables，但适合没有 ne
 | 8 | Shadowsocks | AES-128/256-GCM、ChaCha20、XChaCha20、三种 SS2022 及 SS2022 + Padding |
 
 Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/etc/sing-box/clash.yaml`。删除和修改节点时只处理归属于目标节点的 YAML 项，避免误删另一核心的同名或相邻配置。
+仅安装 Xray 时，Xray 管理器会先初始化这份共享 YAML；以后安装 sing-box 会复用已有的非空文件，并将新节点追加到同一配置中。
 
 ## IPv6
 
