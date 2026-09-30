@@ -284,6 +284,107 @@ _xray_atomic_modify_yaml() {
         fi
 }
 
+# Xray 可以独立于 sing-box 安装；首次使用时也必须准备共享客户端配置。
+# 模板与 singbox.sh 的 _initialize_config_files 保持一致，已有配置绝不覆盖。
+_ensure_xray_clash_yaml() {
+    [ -s "$CLASH_YAML_FILE" ] && return 0
+    mkdir -p "$SINGBOX_DIR" || return 1
+    chmod 700 "$SINGBOX_DIR" 2>/dev/null || true
+
+    local tmp
+    tmp=$(mktemp "${CLASH_YAML_FILE}.tmp.XXXXXX") || return 1
+    if ! cat > "$tmp" <<'EOF'
+port: 7890
+socks-port: 7891
+mixed-port: 7892
+allow-lan: false
+bind-address: '*'
+mode: rule
+log-level: info
+ipv6: true
+find-process-mode: strict
+external-controller: '127.0.0.1:9090'
+profile:
+  store-selected: true
+  store-fake-ip: true
+unified-delay: true
+tcp-concurrent: true
+ntp:
+  enable: true
+  write-to-system: false
+  server: ntp.aliyun.com
+  port: 123
+  interval: 30
+dns:
+  enable: true
+  respect-rules: true
+  use-system-hosts: true
+  prefer-h3: false
+  listen: '0.0.0.0:1053'
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  use-hosts: true
+  fake-ip-filter:
+    - +.lan
+    - +.local
+    - localhost.ptlogin2.qq.com
+    - +.msftconnecttest.com
+    - +.msftncsi.com
+  nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+    - 'https://1.1.1.1/dns-query'
+    - 'https://dns.quad9.net/dns-query'
+  default-nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+  proxy-server-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  fallback:
+    - 'https://1.0.0.1/dns-query'
+    - 'https://9.9.9.10/dns-query'
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    ipcidr:
+      - 240.0.0.0/4
+tun:
+  enable: true
+  stack: system
+  auto-route: true
+  auto-detect-interface: true
+  strict-route: false
+  dns-hijack:
+    - 'any:53'
+  device: SakuraiTunnel
+  endpoint-independent-nat: true
+proxies: []
+proxy-groups:
+  - name: 节点选择
+    type: select
+    proxies: []
+rules:
+  - GEOIP,PRIVATE,DIRECT,no-resolve
+  - GEOIP,CN,DIRECT
+  - MATCH,节点选择
+EOF
+    then
+        rm -f -- "$tmp"
+        _error "无法创建共享 clash.yaml。"
+        return 1
+    fi
+    if ! "$YQ_BINARY" eval '.' "$tmp" >/dev/null 2>&1; then
+        rm -f -- "$tmp"
+        _error "共享 clash.yaml 模板校验失败。"
+        return 1
+    fi
+    chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+    mv -f -- "$tmp" "$CLASH_YAML_FILE" || { rm -f -- "$tmp"; return 1; }
+    _success "共享 clash.yaml 已初始化。"
+}
+
 # --- Clash YAML 节点操作（使用 Xray 专用实现，避免继承父脚本的宽泛删除） ---
 _xray_add_node_to_yaml() {
         local proxy_json="$1"
@@ -1801,6 +1902,7 @@ _xray_add_node_menu() {
 _initialize_xray_runtime() {
     local listen_fix_status
     _init_xray_config || return 1
+    _ensure_xray_clash_yaml || return 1
     _create_xray_service || return 1
     _check_and_fix_xray_listen
     listen_fix_status=$?
