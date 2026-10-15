@@ -140,12 +140,16 @@ ShadowTLS 组合没有通用的单行分享链接，脚本会给出 Mihomo 配�
 | 纯 VLESS + TCP | `vless://` 链接 | 必须是原生 TCP，不能启用 TLS/Reality |
 | Shadowsocks `aes-128-gcm` | `ss://` 链接 | 不接受插件或其他加密方法 |
 | Shadowsocks `aes-256-gcm` | `ss://` 链接 | 不接受插件或其他加密方法 |
+| Shadowsocks `2022-blake3-aes-128-gcm` | `ss://` 链接 | Base64 密钥解码后须为 16 字节；支持单密钥及服务端密钥:用户密钥 |
+| Shadowsocks `2022-blake3-aes-256-gcm` | `ss://` 链接 | Base64 密钥解码后须为 32 字节；支持单密钥及服务端密钥:用户密钥 |
 | HTTPS / HTTP 代理 | 链接导入 | 支持 `https://`、`http://` 或 `host:port`，支持 `?sni=` 及 `?insecure=` 参数 |
 | HTTPS / HTTP 代理 | 手动输入 | 输入服务器地址、端口，选择是否开启 TLS (HTTPS) 及可选认证 |
 | SOCKS5 无认证 | 手动输入 | 输入服务器地址和端口 |
 | SOCKS5 用户名/密码认证 | 手动输入 | 输入服务器地址、端口、用户名和密码 |
 
 Hysteria2、TUIC、VMess、Trojan、AnyTLS 等其余第三方分享链接不属于当前导入白名单；解析器会明确拒绝，而不是生成可能错误的配置。
+
+SS2022 可导入 SIP002 明文用户信息链接；为兼容现有分享工具，也接受非标准的 Base64 编码用户信息及旧式整串 Base64 链接。带插件的链接会被拒绝；普通分享链接无法表达落地节点是否要求 ShadowTLS 或 Multiplex/Padding，因此这些附加设置不会自动启用。中转机与第三方落地机需要保持时间准确；导入成功只表示配置通过检查，仍需确认实际连通。
 
 VLESS 导入结果都会显式写入 `network: "tcp"`。Reality 模式严格检查 SNI、公钥、Short ID、uTLS 指纹和 `flow`；WS+TLS 模式严格校验 SNI、Host、Path 与 uTLS 指纹；HTTP/HTTPS 代理作为落地节点时通过 HTTP CONNECT 转发 TCP 流量。
 
@@ -259,7 +263,7 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - sing-box、Xray 和 yq 下载执行来源约束、SHA-256 校验和可执行性检查。
 - 新核心替换前后会检查版本；已有配置存在时还会执行组合配置校验。
 - 敏感配置默认按 root-only 权限保存，临时文件和运行目录会限制权限并清理。
-- 自签 TLS 分享链接在可取得证书指纹时只输出 `pcs` 固定证书，不再同时输出新版 Xray 已拒绝的 `insecure` 参数。
+- VLESS/Trojan 等可能由 Xray 核心运行的自签 TLS 分享链接优先输出 `pcs` 固定证书，不再同时输出新版 Xray 已拒绝的 `insecure` 参数。普通 AnyTLS 由 sing-box 核心运行；v2rayN 7.24.9 导入分享链接时虽读取 `pcs`，生成 sing-box 出站时却不应用它，因此默认自签证书的 AnyTLS 链接使用 `insecure=1`，与 Clash YAML 的 `skip-cert-verify: true` 一致。该方式会跳过证书身份验证；需要验证身份时请使用自有域名与受信任证书，或继续使用 Any-Reality。
 - 第三方解析器只输出最小允许 schema，中转脚本会再次校验字段和值。
 
 ## 更新日志

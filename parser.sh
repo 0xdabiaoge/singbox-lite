@@ -111,6 +111,35 @@ _decode_base64_urlsafe() {
     DECODED_VALUE="$decoded"
 }
 
+_validate_ss2022_key() {
+    local key="$1" expected_bytes="$2" pattern decoded_bytes
+    case "$expected_bytes" in
+        16) pattern='^[A-Za-z0-9+/]{22}==$' ;;
+        32) pattern='^[A-Za-z0-9+/]{43}=$' ;;
+        *) return 1 ;;
+    esac
+    [[ "$key" =~ $pattern ]] || return 1
+    decoded_bytes=$(set -o pipefail; printf '%s' "$key" | base64 -d 2>/dev/null | wc -c) || return 1
+    [[ "$decoded_bytes" -eq "$expected_bytes" ]]
+}
+
+_validate_ss2022_password() {
+    local password="$1" method="$2" expected_bytes server_key user_key
+    case "$method" in
+        2022-blake3-aes-128-gcm) expected_bytes=16 ;;
+        2022-blake3-aes-256-gcm) expected_bytes=32 ;;
+        *) return 1 ;;
+    esac
+    server_key="$password"
+    if [[ "$password" == *:* ]]; then
+        [[ "$password" != *:*:* ]] || return 1
+        server_key="${password%%:*}"
+        user_key="${password#*:}"
+        _validate_ss2022_key "$user_key" "$expected_bytes" || return 1
+    fi
+    _validate_ss2022_key "$server_key" "$expected_bytes"
+}
+
 _normalize_port() {
     local raw value
     raw="$1"
@@ -484,6 +513,9 @@ _parse_ss_uri() {
     [[ "$method" == "$expected_method" ]] || _fatal "Shadowsocks 链接的加密方法与所选类型不一致"
     [[ -n "$password" ]] || _fatal "Shadowsocks 密码不能为空"
     [[ "$password" != *$'\r'* && "$password" != *$'\n'* ]] || _fatal "Shadowsocks 密码包含无效控制字符"
+    if [[ "$method" == 2022-blake3-* ]]; then
+        _validate_ss2022_password "$password" "$method" || _fatal "SS2022 密钥必须是符合所选 AES 算法长度的 Base64（单密钥或服务端密钥:用户密钥）"
+    fi
 
     _split_host_port "$endpoint" || _fatal "Shadowsocks 服务器地址或端口无效"
     if ! output=$(jq -n \
@@ -643,13 +675,13 @@ _read_link() {
 
 MODE="$1"
 case "$MODE" in
-    vless-reality-vision|vless-tcp|vless-ws-tls|ss-aes-128-gcm|ss-aes-256-gcm|https-proxy) ;;
+    vless-reality-vision|vless-tcp|vless-ws-tls|ss-aes-128-gcm|ss-aes-256-gcm|ss-2022-aes-128-gcm|ss-2022-aes-256-gcm|https-proxy) ;;
     *) _fatal "不支持的解析模式" ;;
 esac
 
 command -v jq >/dev/null 2>&1 || _fatal "缺少 jq 依赖"
 case "$MODE" in
-    ss-aes-128-gcm|ss-aes-256-gcm)
+    ss-aes-128-gcm|ss-aes-256-gcm|ss-2022-aes-128-gcm|ss-2022-aes-256-gcm)
         command -v base64 >/dev/null 2>&1 || _fatal "缺少 base64 依赖"
         ;;
 esac
@@ -662,5 +694,7 @@ case "$MODE" in
     vless-ws-tls) _parse_vless_ws_tls "$LINK_INPUT" ;;
     ss-aes-128-gcm) _parse_ss_uri "$LINK_INPUT" "aes-128-gcm" ;;
     ss-aes-256-gcm) _parse_ss_uri "$LINK_INPUT" "aes-256-gcm" ;;
+    ss-2022-aes-128-gcm) _parse_ss_uri "$LINK_INPUT" "2022-blake3-aes-128-gcm" ;;
+    ss-2022-aes-256-gcm) _parse_ss_uri "$LINK_INPUT" "2022-blake3-aes-256-gcm" ;;
     https-proxy) _parse_http_uri "$LINK_INPUT" ;;
 esac

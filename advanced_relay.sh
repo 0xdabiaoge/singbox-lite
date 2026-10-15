@@ -1046,6 +1046,16 @@ _validate_imported_outbound() {
             and .type == "shadowsocks"
             and .method == "aes-256-gcm"
             and (.password | type == "string" and length > 0)
+        elif $mode == "ss-2022-aes-128-gcm" then
+            only_keys(["type","tag","server","server_port","method","password"])
+            and .type == "shadowsocks"
+            and .method == "2022-blake3-aes-128-gcm"
+            and (.password | type == "string" and test("^[A-Za-z0-9+/]{22}==(:[A-Za-z0-9+/]{22}==)?$"))
+        elif $mode == "ss-2022-aes-256-gcm" then
+            only_keys(["type","tag","server","server_port","method","password"])
+            and .type == "shadowsocks"
+            and .method == "2022-blake3-aes-256-gcm"
+            and (.password | type == "string" and test("^[A-Za-z0-9+/]{43}=(:[A-Za-z0-9+/]{43}=)?$"))
         elif $mode == "socks5-none" then
             only_keys(["type","tag","server","server_port","version"])
             and .type == "socks" and .version == "5" and (.username? == null) and (.password? == null)
@@ -1183,10 +1193,12 @@ _import_link_config() {
     echo -e "    ${GREEN}[7]${NC} HTTPS / HTTP 代理（手动输入）"
     echo -e "    ${GREEN}[8]${NC} SOCKS5 无认证（手动输入）"
     echo -e "    ${GREEN}[9]${NC} SOCKS5 用户名密码认证（手动输入）"
+    echo -e "    ${GREEN}[10]${NC} Shadowsocks 2022-blake3-aes-128-gcm（链接）"
+    echo -e "    ${GREEN}[11]${NC} Shadowsocks 2022-blake3-aes-256-gcm（链接）"
     echo ""
 
     local choice parser_mode validation_mode outbound_json parser_status share_link
-    read -r -p "  请选择第三方节点类型 [0-9]: " choice
+    read -r -p "  请选择第三方节点类型 [0-11]: " choice
     case "$choice" in
         0) return ;;
         1) parser_mode="vless-reality-vision" ;;
@@ -1211,10 +1223,15 @@ _import_link_config() {
             validation_mode="socks5-auth"
             outbound_json=$(_manual_socks_outbound auth) || { read -r -p "  按回车键返回..."; return; }
             ;;
+        10) parser_mode="ss-2022-aes-128-gcm" ;;
+        11) parser_mode="ss-2022-aes-256-gcm" ;;
         *) _error "无效选项"; read -r -p "  按回车键返回..."; return ;;
     esac
 
     if [ -n "$parser_mode" ]; then
+        if [[ "$parser_mode" == ss-2022-* ]]; then
+            _info "SS2022 需要 Base64 密钥和准确时间；分享链接无法表达的 Multiplex/Padding 设置不会自动启用。"
+        fi
         _check_parser || { read -r -p "  按回车键返回..."; return; }
         local PARSER_BIN="$_PARSER_PATH"
         read -r -p "  请输入对应类型的节点分享链接: " share_link

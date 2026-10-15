@@ -3675,10 +3675,12 @@ _show_node_link() {
             url="tuic://${uuid}:${password}@${link_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$name")"
             ;;
         "anytls")
-            # 参数: password, sni, skip_verify
-            local password="$1" sni="${2:-$DEFAULT_SNI}" skip_verify="$3" cert_path="$4"
-            local insecure_param=$(_tls_insecure_params "$skip_verify" "$cert_path")
-            url="anytls://${password}@${link_ip}:${port}?security=tls&sni=${sni}${insecure_param}#$(_url_encode "$name")"
+            # v2rayN 使用 sing-box 运行 AnyTLS；其 sing-box 出站不会应用链接中的 pcs。
+            # 自签证书必须显式传递 insecure=1，与 clash.yaml 的 skip-cert-verify 一致。
+            local password="$1" sni="${2:-$DEFAULT_SNI}" skip_verify="$3"
+            local insecure_param=""
+            [ "$skip_verify" = "true" ] && insecure_param="&insecure=1"
+            url="anytls://${password}@${link_ip}:${port}?security=tls&sni=${sni}${insecure_param}&type=tcp#$(_url_encode "$name")"
             ;;
         "any-reality")
             # 参数: password, sni, public_key, short_id
@@ -4478,13 +4480,7 @@ _create_anytls_tls_node() {
     meta_json=$(jq -n --arg n "$name" --arg sn "$server_name" '{name:$n, server_name:$sn, yaml:true}')
     _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
     
-    # --- 生成分享链接 ---
-    local insecure_param=""
-    if [ "$skip_verify" == "true" ]; then
-        insecure_param="&insecure=1"
-    fi
-    local share_link="anytls://${password}@${link_ip}:${port}?security=tls&sni=${server_name}${insecure_param}&type=tcp#$(_url_encode "$name")"
-    
+    # _show_node_link 负责输出并保存最终分享链接。
     _success "AnyTLS 节点 [${name}] 添加成功!"
     _show_node_link "anytls" "$name" "$link_ip" "$port" "$tag" "$password" "$server_name" "$skip_verify" "$cert_path" || return 1
 }
