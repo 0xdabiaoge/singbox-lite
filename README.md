@@ -401,3 +401,8 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - sing-box 与 Xray 的 Shadowsocks 创建菜单统一补齐 `aes-128-gcm`、`aes-256-gcm`、`chacha20-ietf-poly1305`、`xchacha20-ietf-poly1305` 和三种 SS2022 加密方式，并保留原有 Padding、ShadowTLS 组合。
 - SS2022 改为按算法生成严格长度的 Base64 密钥：AES-128 使用 16 字节，AES-256 与 ChaCha20 使用 32 字节；sing-box 批量创建同步支持七种纯 SS 加密方式。
 - sing-box `[5] 修改节点` 在重新生成 Shadowsocks 认证信息时复用相同的密钥规则，并同步更新服务端配置、元数据、分享链接与 Clash/Mihomo 配置。
+
+### 2026.10.22
+
+- 修复 Argo 节点预览在进入子菜单后路径被污染的问题：`_sync_argo_early_data()` 弃用 `@tsv` + `IFS=$'\t'` 读取元数据，改为与 `_argo_keepalive()` 一致的逐条紧凑 JSON 读取；VLESS 节点 `password` 为空产生的连续 tab 此前会被 Bash 折叠导致字段整体左移、`path` 被写成整条分享链接并持久化。另加防御：`path` 含 `://` 的历史脏数据不再参与链接重生成。
+- 修复 Alpine 容器（PID 1 非 OpenRC）中 `rc-service dcron start` 静默失败导致误报"Cron 服务启动失败"、Argo watchdog crontab 未写入的问题：OpenRC 启动失败后回退直接拉起 `crond`（dcron/BusyBox），并以 crond 进程存活为成功判定；依赖安装阶段同步调整。
