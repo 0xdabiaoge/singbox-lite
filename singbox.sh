@@ -1421,12 +1421,11 @@ _install_dependencies() {
     
     _install_yq
 
-    # [修复] Alpine 上 dcron 安装后需手动启动 cron 守护进程
+    # Alpine 上优先启用 OpenRC 服务；无 OpenRC PID 1 的容器回退直接启动 crond。
     if command -v apk &>/dev/null; then
-        # BusyBox 自带 crond 并不代表系统存在 dcron 的 OpenRC 服务；
-        # 容器内 PID 1 通常不是 OpenRC，/etc/init.d/ 里没有服务脚本，
-        # rc-service 会静默失败，须直接拉起 crond。
-        # 定时任务守护进程属于可选能力，不能让核心安装继承失败状态。
+        if command -v rc-service &>/dev/null && rc-service dcron start >/dev/null 2>&1; then
+            rc-update add dcron default >/dev/null 2>&1 || true
+        fi
         if ! { pgrep -x crond >/dev/null 2>&1 || pidof crond >/dev/null 2>&1; }; then
             if command -v crond &>/dev/null; then
                 crond >/dev/null 2>&1 || true
@@ -2805,18 +2804,21 @@ _ensure_argo_cron() {
             ;;
     esac
 
-    # 容器内常见"假 OpenRC"：/sbin/rc-service 存在但 PID 1 不是 OpenRC，
-    # /etc/init.d/ 里没有 cron 服务脚本，rc-service 会静默失败。
-    # 此时直接拉起 crond 守护进程（dcron 与 BusyBox 均默认后台运行）。
-    if [ "$started" != true ] && ! { pgrep -x crond >/dev/null 2>&1 || pidof crond >/dev/null 2>&1; }; then
+    # 容器里 rc-service 可能存在，但没有真正运行 OpenRC。
+    if ! { pgrep -x crond >/dev/null 2>&1 || pidof crond >/dev/null 2>&1; }; then
         if command -v crond &>/dev/null; then
-            crond >/dev/null 2>&1 && started=true
+            crond >/dev/null 2>&1 || true
         elif command -v busybox &>/dev/null; then
-            busybox crond >/dev/null 2>&1 && started=true
+            busybox crond >/dev/null 2>&1 || true
         fi
     fi
-    # 已有 crond 在运行也算成功（例如首次安装阶段已启动）。
-    { pgrep -x crond >/dev/null 2>&1 || pidof crond >/dev/null 2>&1; } && started=true
+    if command -v pgrep >/dev/null 2>&1 || command -v pidof >/dev/null 2>&1; then
+        if { pgrep -x crond >/dev/null 2>&1 || pidof crond >/dev/null 2>&1; }; then
+            started=true
+        else
+            started=false
+        fi
+    fi
 
     if [ "$started" != true ]; then
         _error "Cron 服务启动失败，无法启用 Argo 自动守护。"
@@ -2978,12 +2980,7 @@ _sync_argo_early_data() {
     fi
 
     if [ -s "$ARGO_METADATA_FILE" ]; then
-        # 与 _argo_keepalive 保持一致：不能用 @tsv + IFS=$'\t' 读取元数据。
-        # VLESS 节点的 password 恒为空，@tsv 输出中会出现连续两个 tab，
-        # Bash 会把连续的空白类 IFS 字符折叠成一个分隔符，导致后续字段
-        # 整体左移，path 被污染成整条分享链接（issue #16）。
-        # 逐条读取紧凑 JSON 可同时正确保留空字段与特殊字符。
-        local entry
+        local entry tag protocol name domain uuid password path share_link expected_path
         while IFS= read -r entry; do
             [ -z "$entry" ] && continue
             tag=$(jq -r '.key // empty' <<< "$entry")
@@ -2997,10 +2994,12 @@ _sync_argo_early_data() {
             [ -z "$tag" ] && continue
             [[ "$protocol" != "vless-ws" && "$protocol" != "trojan-ws" ]] && continue
             [[ -z "$domain" || "$domain" == "null" ]] && continue
-
-            # 防御：旧版本已把整条分享链接写进 path 的数据不再参与重生成，
-            # 避免继续用被污染的 path 拼接并持久化错误链接。
-            [[ "$path" == *"://"* ]] && continue
+            # 旧同步逻辑写坏的是 share_link，元数据 path 通常仍是原始 WS 路径。
+            # 遇到异常 path 时不要再次生成嵌套链接。
+            if [[ "$path" == *"://"* ]]; then
+                _warn "Argo 节点 ${tag} 的路径异常，已跳过链接同步。"
+                continue
+            fi
 
             if [ -s "$CLASH_YAML_FILE" ] && [ -x "$YQ_BINARY" ] && [ -n "$name" ] && [ "$name" != "null" ]; then
                 export PROXY_NAME="$name"
@@ -3011,7 +3010,9 @@ _sync_argo_early_data() {
                 fi
             fi
 
-            if [[ "$share_link" == *"ed%3D${WS_EARLY_DATA_SIZE}"* || "$share_link" == *"ed=${WS_EARLY_DATA_SIZE}"* ]]; then
+            # 比较真实 WS 路径，而非仅查 ed 字样：坏链接也可能包含 ed。
+            expected_path=$(_url_encode "$(_ws_path_with_early_data "$path")")
+            if [[ "$share_link" == *"@${domain}:443?"* && "$share_link" == *"&path=${expected_path}&"* ]]; then
                 continue
             fi
 

@@ -175,6 +175,8 @@ VLESS 导入结果都会显式写入 `network: "tcp"`。Reality 模式严格检�
 4. 选择本机中转入口协议。
 5. 脚本创建入口、落地 outbound、路由、分享链接和客户端配置。
 
+创建中转入口时可以填写客户端实际连接的 IP 或域名；回车使用自动探测的公网 IP。该地址同时写入分享链接和 Clash/Mihomo 配置，不改变第三方落地节点地址或本机监听地址。NAT 若映射了不同的外部端口，还需按实际端口调整客户端配置并确认端口映射可达。
+
 可选中转入口：
 
 - VLESS + TCP + Reality + Vision
@@ -404,5 +406,11 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 
 ### 2026.10.22
 
-- 修复 Argo 节点预览在进入子菜单后路径被污染的问题：`_sync_argo_early_data()` 弃用 `@tsv` + `IFS=$'\t'` 读取元数据，改为与 `_argo_keepalive()` 一致的逐条紧凑 JSON 读取；VLESS 节点 `password` 为空产生的连续 tab 此前会被 Bash 折叠导致字段整体左移、`path` 被写成整条分享链接并持久化。另加防御：`path` 含 `://` 的历史脏数据不再参与链接重生成。
-- 修复 Alpine 容器（PID 1 非 OpenRC）中 `rc-service dcron start` 静默失败导致误报"Cron 服务启动失败"、Argo watchdog crontab 未写入的问题：OpenRC 启动失败后回退直接拉起 `crond`（dcron/BusyBox），并以 crond 进程存活为成功判定；依赖安装阶段同步调整。
+- PR #18 修复 Argo 节点预览在进入子菜单后分享链接被污染的问题：`_sync_argo_early_data()` 改为逐条紧凑 JSON 读取，避免 VLESS 的空 `password` 字段使后续字段错位；异常 `path` 不再参与链接重生成。旧逻辑持久化的是错误的 `share_link`，元数据 `path` 通常仍保留原值。
+- PR #18 为 Alpine 容器中不可用的 OpenRC cron 服务加入直接启动 `crond` 的回退路径。
+
+### 2026.10.24
+
+- 中转入口新增客户端连接地址选择，支持 IPv4、IPv6 和域名；解决出口 IP 与入口 IP 不同或有多个入口地址时，分享链接和 Clash/Mihomo 配置写错地址的问题。
+- Argo 元数据同步改为逐条 JSON 读取，避免 VLESS 空密码字段造成错位；根据原始 WS 路径识别并重建已有的异常分享链接。
+- Alpine 的 cron 启动在 OpenRC 服务不可用时回退直接运行 `crond`，同时保留正常 OpenRC 环境下的开机启用设置。无 init 的容器仍需在容器启动流程中运行 cron，才能保证容器重启后持续守护。

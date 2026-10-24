@@ -1679,6 +1679,25 @@ _finalize_relay_setup() {
             return 1
         fi
     fi
+
+    # 分享链接和 Clash 使用客户端连接中转入口的地址，不能假定出口 IP 就是入口 IP。
+    local detected_relay_ip relay_server_ip input_relay_ip
+    detected_relay_ip=$(_get_public_ip)
+    while true; do
+        if [ -n "$detected_relay_ip" ]; then
+            read -r -p "  请输入客户端连接中转入口的 IP 或域名 (回车默认: ${detected_relay_ip}): " input_relay_ip || return 1
+        else
+            read -r -p "  无法自动检测入口 IP，请输入客户端连接中转入口的 IP 或域名: " input_relay_ip || return 1
+        fi
+        relay_server_ip="${input_relay_ip:-$detected_relay_ip}"
+        if [[ "$relay_server_ip" == \[*\] ]]; then
+            relay_server_ip="${relay_server_ip:1:${#relay_server_ip}-2}"
+        fi
+        if _valid_server_address "$relay_server_ip"; then
+            break
+        fi
+        _error "连接地址无效，请输入 IPv4、IPv6 或域名。"
+    done
     
     # --- 生成配置 ---
     local tag_suffix="${listen_port}"
@@ -1711,13 +1730,7 @@ _finalize_relay_setup() {
     # 构造路由规则内容 (修复：定义被误删的变量)
     local rule_json=$(jq -n --arg it "$inbound_tag" --arg ot "$outbound_tag" '{"inbound": $it, "outbound": $ot}')
     
-    # [作用域修复] 统一获取公网IP，避免在每个分支中重复声明 local server_ip
-    local relay_server_ip=$(_get_public_ip)
-    if [ -z "$relay_server_ip" ]; then
-        rm -f -- "$cert_path" "$key_path"
-        _error "无法获取有效公网 IP，已取消创建中转"
-        return 1
-    fi
+    # 客户端连接地址已在生成配置前确认；IPv6 分享链接需要加方括号。
     local link_ip="$relay_server_ip"; [[ "$relay_server_ip" == *":"* ]] && link_ip="[$relay_server_ip]"
     
     if [ "$relay_type" == "vless-reality" ]; then
