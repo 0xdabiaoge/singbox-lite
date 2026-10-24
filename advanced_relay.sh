@@ -1635,6 +1635,25 @@ _finalize_relay_setup() {
         *) _error "无效选项"; return 1 ;;
     esac
     
+    # 分享链接和 Clash 使用客户端连接中转入口的地址，不能假定出口 IP 就是入口 IP。
+    local detected_relay_ip relay_server_ip input_relay_ip
+    detected_relay_ip=$(_get_public_ip)
+    while true; do
+        if [ -n "$detected_relay_ip" ]; then
+            read -r -p "  请输入客户端连接中转入口的 IP 或域名 (回车默认: ${detected_relay_ip}): " input_relay_ip || return 1
+        else
+            read -r -p "  无法自动检测入口 IP，请输入客户端连接中转入口的 IP 或域名: " input_relay_ip || return 1
+        fi
+        relay_server_ip="${input_relay_ip:-$detected_relay_ip}"
+        if [[ "$relay_server_ip" == \[*\] ]]; then
+            relay_server_ip="${relay_server_ip:1:${#relay_server_ip}-2}"
+        fi
+        if _valid_server_address "$relay_server_ip"; then
+            break
+        fi
+        _error "连接地址无效，请输入 IPv4、IPv6 或域名。"
+    done
+
     # --- 配置入口详细信息 ---
     while true; do
         read -p "  请输入本机监听端口 (回车随机): " listen_port
@@ -1680,25 +1699,6 @@ _finalize_relay_setup() {
         fi
     fi
 
-    # 分享链接和 Clash 使用客户端连接中转入口的地址，不能假定出口 IP 就是入口 IP。
-    local detected_relay_ip relay_server_ip input_relay_ip
-    detected_relay_ip=$(_get_public_ip)
-    while true; do
-        if [ -n "$detected_relay_ip" ]; then
-            read -r -p "  请输入客户端连接中转入口的 IP 或域名 (回车默认: ${detected_relay_ip}): " input_relay_ip || return 1
-        else
-            read -r -p "  无法自动检测入口 IP，请输入客户端连接中转入口的 IP 或域名: " input_relay_ip || return 1
-        fi
-        relay_server_ip="${input_relay_ip:-$detected_relay_ip}"
-        if [[ "$relay_server_ip" == \[*\] ]]; then
-            relay_server_ip="${relay_server_ip:1:${#relay_server_ip}-2}"
-        fi
-        if _valid_server_address "$relay_server_ip"; then
-            break
-        fi
-        _error "连接地址无效，请输入 IPv4、IPv6 或域名。"
-    done
-    
     # --- 生成配置 ---
     local tag_suffix="${listen_port}"
     local inbound_tag="${relay_type}-in-${tag_suffix}"
