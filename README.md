@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v28`、`advanced_relay.sh v19`、`xray_manager.sh v3.1.3`。
+当前文档按以下脚本版本整理：`singbox.sh v28`、`advanced_relay.sh v20`、`xray_manager.sh v3.1.3`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -21,7 +21,7 @@
 - 节点创建、查看、删除、端口修改、批量创建和分享链接输出。
 - VLESS、Trojan、Hysteria2、TUIC、AnyTLS、Shadowsocks、SOCKS5 等协议管理。
 - VLESS-WS / Trojan-WS 的 Argo 临时隧道和固定隧道。
-- 支持本机节点 Token 与第三方落地节点两种接入流程，并可选择四种中转入口协议。
+- 支持本机节点 Token 与第三方落地节点两种接入流程，并可选择五种中转入口协议。
 - nftables 内核转发与 sing-box 用户态转发双引擎，按实际权限自动选择。
 - IPv4/IPv6 地址、域名目标、TCP、UDP、TCP+UDP 端口转发。
 - 共享状态锁、原子写入、事务快照和失败回滚，降低跨脚本并发修改造成的配置损坏风险。
@@ -180,7 +180,7 @@ VLESS 导入结果都会显式写入 `network: "tcp"`。Reality 模式严格检�
 可选中转入口：
 
 - VLESS + TCP + Reality + Vision
-- Hysteria2
+- Hysteria2（可选 Salamander QUIC 混淆和端口跳跃；混淆密码会同步写入分享链接与 Clash/Mihomo 配置）
 - TUIC v5
 - AnyTLS
 - Shadowsocks `aes-256-gcm`
@@ -414,3 +414,7 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - 中转入口新增客户端连接地址选择，支持 IPv4、IPv6 和域名；解决出口 IP 与入口 IP 不同或有多个入口地址时，分享链接和 Clash/Mihomo 配置写错地址的问题。
 - Argo 元数据同步改为逐条 JSON 读取，避免 VLESS 空密码字段造成错位；根据原始 WS 路径识别并重建已有的异常分享链接。
 - Alpine 的 cron 启动在 OpenRC 服务不可用时回退直接运行 `crond`，同时保留正常 OpenRC 环境下的开机启用设置。无 init 的容器仍需在容器启动流程中运行 cron，才能保证容器重启后持续守护。
+
+### 2026.10.29
+
+- Hysteria2 中转入口新增可选 Salamander QUIC 混淆，自动生成混淆密码，并同步写入服务端入站、分享链接和 Clash/Mihomo 配置；端口跳跃范围也同步写入客户端 YAML 的 `ports` 字段。

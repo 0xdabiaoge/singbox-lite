@@ -1750,6 +1750,21 @@ _finalize_relay_setup() {
         
     elif [ "$relay_type" == "hysteria2" ]; then
         local password=$($SINGBOX_BIN generate rand --hex 16)
+        local obfs_password="" obfs_choice="" obfs_param=""
+
+        if ! read -r -p "是否为本 Hysteria2 中转入口开启 QUIC 流量混淆 (salamander)? (y/N): " obfs_choice; then
+            _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"
+            return 1
+        fi
+        if [[ "$obfs_choice" == "y" || "$obfs_choice" == "Y" ]]; then
+            obfs_password=$("$SINGBOX_BIN" generate rand --hex 16)
+            if [[ ! "$obfs_password" =~ ^[0-9a-fA-F]{32}$ ]]; then
+                _error "生成 Hysteria2 QUIC 混淆密码失败"
+                _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"
+                return 1
+            fi
+            obfs_param="&obfs=salamander&obfs-password=$(_url_encode "$obfs_password")"
+        fi
         
         local hop_str=""
         local port_range=""
@@ -1801,13 +1816,13 @@ _finalize_relay_setup() {
             fi
         fi
         
-        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg pw "$password" --arg sn "$entrance_sni" --arg cert "$cert_path" --arg key "$key_path" \
-            '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"server_name":$sn,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
+        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg pw "$password" --arg op "$obfs_password" --arg sn "$entrance_sni" --arg cert "$cert_path" --arg key "$key_path" \
+            '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"server_name":$sn,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}} | if $op != "" then .obfs={type:"salamander",password:$op} else . end')
 
         local cert_pcs=$(_cert_sha256_hex "$cert_path")
         local pin_param=""
         [ -n "$cert_pcs" ] && pin_param="&pinSHA256=${cert_pcs}"
-        link="hysteria2://${password}@${link_ip}:${listen_port}?sni=${entrance_sni}&insecure=1&up=10000&down=10000${hop_str}${pin_param}#$(_url_encode "${node_name}")"
+        link="hysteria2://${password}@${link_ip}:${listen_port}?sni=${entrance_sni}&insecure=1&up=10000&down=10000${obfs_param}${hop_str}${pin_param}#$(_url_encode "${node_name}")"
         
     elif [ "$relay_type" == "tuic" ]; then
         local uuid=$($SINGBOX_BIN generate uuid)
@@ -1851,8 +1866,8 @@ _finalize_relay_setup() {
     elif [ "$relay_type" == "hysteria2" ]; then
         local password=$(echo "$inbound_json" | jq -r '.users[0].password')
         local sn=$(echo "$inbound_json" | jq -r '.tls.server_name')
-        proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --arg p "$listen_port" --arg pw "$password" --arg sn "$sn" \
-            '{name:$n,type:"hysteria2",server:$s,port:($p|tonumber),password:$pw,sni:$sn,"skip-cert-verify":true,alpn:["h3"]}')
+        proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --arg p "$listen_port" --arg pw "$password" --arg sn "$sn" --arg op "$obfs_password" --arg hop "$port_range" \
+            '{name:$n,type:"hysteria2",server:$s,port:($p|tonumber),password:$pw,sni:$sn,"skip-cert-verify":true,alpn:["h3"]} | if $op != "" then .obfs="salamander" | .["obfs-password"]=$op else . end | if $hop != "" then .ports=$hop else . end')
     elif [ "$relay_type" == "tuic" ]; then
         local uuid=$(echo "$inbound_json" | jq -r '.users[0].uuid')
         local password=$(echo "$inbound_json" | jq -r '.users[0].password')
@@ -3777,7 +3792,7 @@ _menu() {
         echo -e "${CYAN}"
         echo "  ╔═══════════════════════════════════════╗"
         echo "  ║       singbox-lite 进阶转发管理       ║"
-        echo "  ║                (v19)                  ║"
+        echo "  ║                (v20)                  ║"
         echo "  ╚═══════════════════════════════════════╝"
         echo -e "${NC}"
 
