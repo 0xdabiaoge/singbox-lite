@@ -1070,6 +1070,8 @@ _validate_imported_outbound() {
 
 _manual_http_outbound() {
     local server port tls_choice sni username password
+    echo "  示例（HTTPS）：地址 203.0.113.10，端口 443，启用 TLS，证书域名 proxy.example.com。" >&2
+    echo "  示例（HTTP）：地址 203.0.113.10，端口 8080，不启用 TLS。" >&2
     read -r -p "  HTTP/HTTPS 代理服务器地址（IP 或域名，可带端口如 host:443）: " server
     if [[ "$server" =~ ^\[(.*)\]:([0-9]+)$ ]]; then
         server="${BASH_REMATCH[1]}"
@@ -1145,6 +1147,106 @@ _manual_http_outbound() {
     fi
 }
 
+_https_proxy_tls_args() {
+    local server="$1" port="$2" sni="$3" endpoint="$1:$2"
+    _HTTPS_TLS_ARGS=()
+    [[ "$server" == *:* ]] && endpoint="[$server]:$port"
+    _HTTPS_TLS_ARGS=(-connect "$endpoint")
+    if [ -n "$sni" ] && ! _valid_ipv4_literal "$sni" && ! _valid_ipv6_literal "$sni"; then
+        _HTTPS_TLS_ARGS+=(-servername "$sni")
+    fi
+}
+
+_https_proxy_fetch_cert() {
+    local server="$1" port="$2" sni="$3" cert
+    _https_proxy_tls_args "$server" "$port" "$sni"
+    cert=$(timeout 8 openssl s_client "${_HTTPS_TLS_ARGS[@]}" -showcerts </dev/null 2>/dev/null | openssl x509 -noout -ext subjectAltName 2>/dev/null) || return 1
+    [ -n "$cert" ] || return 1
+    printf '%s\n' "$cert"
+}
+
+_https_proxy_strict_check() {
+    local server="$1" port="$2" sni="$3"
+    _https_proxy_tls_args "$server" "$port" "$sni"
+    if _valid_ipv4_literal "$sni" || _valid_ipv6_literal "$sni"; then
+        _HTTPS_TLS_ARGS+=(-verify_ip "$sni")
+    else
+        _HTTPS_TLS_ARGS+=(-verify_hostname "$sni")
+    fi
+    timeout 8 openssl s_client "${_HTTPS_TLS_ARGS[@]}" -verify_return_error </dev/null >/dev/null 2>&1
+}
+
+_review_https_proxy_tls() {
+    local outbound="$1" server port sni cert candidate verified_count=0 verified_sni="" input_sni confirm
+    local -a candidates=()
+    if ! printf '%s' "$outbound" | jq -e '.type == "http" and .tls.enabled == true' >/dev/null 2>&1; then
+        printf '%s\n' "$outbound"
+        return 0
+    fi
+    IFS=$'\t' read -r server port sni <<< "$(printf '%s' "$outbound" | jq -r '[.server,(.server_port|tostring),.tls.server_name] | @tsv')"
+    if printf '%s' "$outbound" | jq -e '.tls.insecure == true' >/dev/null 2>&1; then
+        _warn "此链接已显式设置 insecure=1；将跳过落地 HTTPS 证书身份校验。" >&2
+        printf '%s\n' "$outbound"
+        return 0
+    fi
+    if _https_proxy_strict_check "$server" "$port" "$sni"; then
+        _info "落地 HTTPS 证书已通过严格校验：$sni" >&2
+        printf '%s\n' "$outbound"
+        return 0
+    fi
+    cert=$(_https_proxy_fetch_cert "$server" "$port" "$sni") || {
+        _error "未能从落地地址取得 TLS 证书；请检查地址、端口和网络，不能用 insecure=1 代替连接检查。" >&2
+        return 1
+    }
+    while IFS= read -r candidate; do
+        candidate="${candidate#DNS:}"
+        [[ "$candidate" == *\** ]] && continue
+        _valid_hostname "$candidate" || continue
+        candidates+=("$candidate")
+    done < <(printf '%s\n' "$cert" | grep -oE 'DNS:[A-Za-z0-9._*-]+' | sort -u | head -n 8)
+    if [ "${#candidates[@]}" -gt 0 ]; then
+        _info "证书列出的域名候选：${candidates[*]}；仍需重新握手并验证，不能仅凭列表认定可用。" >&2
+        for candidate in "${candidates[@]}"; do
+            if _https_proxy_strict_check "$server" "$port" "$candidate"; then
+                verified_count=$((verified_count + 1))
+                verified_sni="$candidate"
+            fi
+        done
+    fi
+    if [ "$verified_count" -eq 1 ]; then
+        _info "已找到唯一通过严格校验的证书域名：$verified_sni" >&2
+        printf '%s\n' "$outbound" | jq --arg sni "$verified_sni" '.tls.server_name = $sni'
+        return
+    fi
+    if [ "$verified_count" -gt 1 ]; then
+        _warn "多个域名通过证书校验，无法自动确定代理所需的 SNI。" >&2
+    else
+        _warn "当前 SNI 未通过严格证书校验；证书域名候选也未通过。" >&2
+    fi
+    read -r -p "  可手动输入落地 HTTPS 的证书域名重试 (回车跳过): " input_sni || return 1
+    if [ -n "$input_sni" ]; then
+        _valid_hostname "$input_sni" || { _error "证书域名格式无效" >&2; return 1; }
+        if _https_proxy_strict_check "$server" "$port" "$input_sni"; then
+            _info "手动填写的证书域名已通过严格校验：$input_sni" >&2
+            printf '%s\n' "$outbound" | jq --arg sni "$input_sni" '.tls.server_name = $sni'
+            return
+        fi
+        sni="$input_sni"
+        cert=$(_https_proxy_fetch_cert "$server" "$port" "$sni") || {
+            _error "使用该域名无法取得 TLS 证书，请检查 SNI 与代理地址。" >&2
+            return 1
+        }
+    fi
+    _warn "关闭校验后无法确认落地代理的身份，且不能修复代理认证、CONNECT 或转发错误。" >&2
+    read -r -p "  仅对此落地节点跳过 HTTPS 证书校验？(y/N): " confirm || return 1
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        printf '%s\n' "$outbound" | jq --arg sni "$sni" '.tls.server_name = $sni | .tls.insecure = true'
+    else
+        _info "已取消导入；请核对证书域名或取得可信证书。" >&2
+        return 1
+    fi
+}
+
 _manual_socks_outbound() {
     local auth_mode="$1" server port username password
     read -r -p "  SOCKS5 服务器地址（IP 或域名）: " server
@@ -1189,7 +1291,7 @@ _import_link_config() {
     echo -e "    ${GREEN}[3]${NC} 纯 VLESS + TCP（链接）"
     echo -e "    ${GREEN}[4]${NC} Shadowsocks aes-128-gcm（链接）"
     echo -e "    ${GREEN}[5]${NC} Shadowsocks aes-256-gcm（链接）"
-    echo -e "    ${GREEN}[6]${NC} HTTPS / HTTP 代理（链接导入，支持 https:// 或 host:port）"
+    echo -e "    ${GREEN}[6]${NC} HTTPS / HTTP 代理（链接导入，支持 https:// 或 http://）"
     echo -e "    ${GREEN}[7]${NC} HTTPS / HTTP 代理（手动输入）"
     echo -e "    ${GREEN}[8]${NC} SOCKS5 无认证（手动输入）"
     echo -e "    ${GREEN}[9]${NC} SOCKS5 用户名密码认证（手动输入）"
@@ -1234,6 +1336,11 @@ _import_link_config() {
         fi
         _check_parser || { read -r -p "  按回车键返回..."; return; }
         local PARSER_BIN="$_PARSER_PATH"
+        if [ "$parser_mode" = "https-proxy" ]; then
+            echo "  HTTPS 示例：https://203.0.113.10:443?sni=proxy.example.com" >&2
+            echo "  HTTP  示例：http://203.0.113.10:8080" >&2
+            _info "IP 连接域名证书请加 ?sni=证书域名；仅输入 host:port 目前按 HTTPS 处理。"
+        fi
         read -r -p "  请输入对应类型的节点分享链接: " share_link
         [ -n "$share_link" ] || { _error "节点链接不能为空"; read -r -p "  按回车键返回..."; return; }
         _info "正在按 ${parser_mode} 严格解析链接..."
@@ -1263,6 +1370,18 @@ _import_link_config() {
         return
     fi
 
+    if [ "$validation_mode" = "https-proxy" ]; then
+        outbound_json=$(_review_https_proxy_tls "$outbound_json") || {
+            read -r -p "  按回车键返回..."
+            return 1
+        }
+        if ! _validate_imported_outbound "$validation_mode" "$outbound_json"; then
+            _error "HTTPS 证书探测结果未通过配置校验"
+            read -r -p "  按回车键返回..."
+            return 1
+        fi
+    fi
+
     outbound_json=$(printf '%s' "$outbound_json" | jq -c '.tag = "TEMP_TAG"') || {
         _error "解析结果不是有效 JSON"
         read -r -p "  按回车键返回..."
@@ -1281,7 +1400,7 @@ _import_link_config() {
 # 检查依赖 (主脚本已预装绝大部分，此处仅做快速校验)
 _check_deps() {
     # [修复] 移除 Bash 数组语法，防止在部分环境（如 Ash/Dash）下闪退
-    for cmd in jq openssl wget curl flock; do
+    for cmd in jq openssl wget curl flock timeout; do
         if ! command -v "$cmd" &>/dev/null; then
             _error "缺少关键依赖: $cmd"
             _warn "请先运行主脚本 [1) 安装环境]。"
@@ -1608,8 +1727,16 @@ _finalize_relay_setup() {
         return 1
     fi
 
-    _success "已解析落地节点: ${dest_type} -> ${dest_addr}:${dest_port}"
+    # sing-box 的 HTTPS 代理仍使用 http outbound，以 tls.enabled 区分明文和 TLS。
+    local dest_label="$dest_type"
+    if [ "$dest_type" == "http" ] && printf '%s' "$outbound_json" | jq -e '.tls.enabled == true' >/dev/null 2>&1; then
+        dest_label="https"
+    fi
+    _success "已解析落地节点: ${dest_label} -> ${dest_addr}:${dest_port}"
     if [ "$dest_type" == "http" ]; then
+        if [ "$dest_label" == "https" ] && { _valid_ipv4_literal "$dest_addr" || _valid_ipv6_literal "$dest_addr"; }; then
+            _info "若 HTTPS 代理使用域名证书，连接 IP 时需填写证书域名：链接导入可加 ?sni=证书域名，手动输入可填写 TLS 证书域名。"
+        fi
         _warn "【提示】HTTP/HTTPS 代理落地节点通常仅支持 TCP (HTTP CONNECT)，不支持 UDP 转发。"
         _info "建议中转入口优先选择 VLESS+TCP+Reality、AnyTLS 或 Shadowsocks。"
     fi
@@ -1688,7 +1815,7 @@ _finalize_relay_setup() {
         [[ -z "$entrance_sni" ]] && entrance_sni="www.amd.com"
     fi
     
-    local default_name="${dest_type}-Relay-${listen_port}"
+    local default_name="${dest_label}-Relay-${listen_port}"
     read -p "  请输入节点名称 (回车: ${default_name}): " node_name
     [[ -z "$node_name" ]] && node_name="$default_name"
     if [ -s "$RELAY_CLASH_YAML" ] && [ -x "$YQ_BINARY" ]; then
@@ -1941,7 +2068,7 @@ _finalize_relay_setup() {
     fi
 
     metadata=$(jq -n --arg link "$link" --arg created "$(date '+%Y-%m-%d %H:%M:%S')" --arg relay_type "$relay_type" \
-        --arg landing_type "$dest_type" --arg landing_addr "${dest_addr}:${dest_port}" --arg node_name "$node_name" \
+        --arg landing_type "$dest_label" --arg landing_addr "${dest_addr}:${dest_port}" --arg node_name "$node_name" \
         --argjson listen_port "$listen_port" --arg hop "${port_range:-}" \
         '{link:$link,created_at:$created,relay_type:$relay_type,landing_type:$landing_type,landing_addr:$landing_addr,node_name:$node_name,listen_port:$listen_port} | if $hop != "" then .port_hopping=$hop else . end') || true
     tmp=$(_make_same_dir_tmp "$LINKS_FILE") || true
@@ -1967,12 +2094,13 @@ _finalize_relay_setup() {
     _txn_cleanup "$txn_dir"
     _state_lock_release
     _save_nftables_rules
-    _log_operation "CREATE_RELAY" "Type: $relay_type, Port: $listen_port, Landing: ${dest_type}@${dest_addr}:${dest_port}"
+    _log_operation "CREATE_RELAY" "Type: $relay_type, Port: $listen_port, Landing: ${dest_label}@${dest_addr}:${dest_port}"
     
     echo -e "${YELLOW}═══════════════════ 配置成功 ═══════════════════${NC}"
     _success "中转配置已生效！"
     echo -e "  节点名称: ${GREEN}$node_name${NC}"
     echo -e "  中转协议: ${CYAN}$relay_type${NC}"
+    echo -e "  落地协议: ${CYAN}$dest_label${NC}"
     echo -e "  落地地址: ${CYAN}${dest_addr}:${dest_port}${NC}"
     echo -e "  本地监听: ${CYAN}$listen_port${NC}"
     echo -e "分享链接:"
@@ -3792,7 +3920,7 @@ _menu() {
         echo -e "${CYAN}"
         echo "  ╔═══════════════════════════════════════╗"
         echo "  ║       singbox-lite 进阶转发管理       ║"
-        echo "  ║                (v20)                  ║"
+        echo "  ║                (v21)                  ║"
         echo "  ╚═══════════════════════════════════════╝"
         echo -e "${NC}"
 

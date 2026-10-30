@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="28"
+export SCRIPT_VERSION="29"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -867,10 +867,11 @@ _time_prepare_ntp_config() {
 _time_prepare_ntp_config_locked() {
     [ -s "$CONFIG_FILE" ] || return 0
     local current managed="" wanted server state_file="${SINGBOX_DIR}/time-sync.json"
-    local status="unreachable" tmp old_present
+    local status="unreachable" previous_status="" tmp old_present config_changed=false
     current=$(jq -cS '.ntp // null' "$CONFIG_FILE") || return 1
     old_present=$(jq -r 'has("ntp")' "$CONFIG_FILE") || return 1
     [ ! -s "$state_file" ] || managed=$(jq -cS '.managed_ntp // null' "$state_file" 2>/dev/null)
+    [ ! -s "$state_file" ] || previous_status=$(jq -r '.last_probe_status // empty' "$state_file" 2>/dev/null)
     # 仅迁移无配置、历史默认项或与 sidecar 完全一致的脚本管理项。
     # 用户自定义服务器、间隔、detour 和显式 enabled:false 不被覆盖。
     if [ "$current" != null ] && [ "$current" != "$managed" ] && ! jq -e '
@@ -905,6 +906,7 @@ _time_prepare_ntp_config_locked() {
             rm -f -- "$tmp"
             return 1
         fi
+        config_changed=true
     fi
     if ! mv -f "$tmp" "$state_file"; then
         _atomic_modify_json "$CONFIG_FILE" 'if $present then .ntp=$ntp else del(.ntp) end' --argjson ntp "$current" --argjson present "$old_present" || _error "恢复原 NTP 配置失败"
@@ -912,7 +914,9 @@ _time_prepare_ntp_config_locked() {
         return 1
     fi
     if [ "$status" = reachable ]; then
-        _info "核心 NTP: ${TIME_PROBE_SOURCE}，每 1 分钟补偿时间；系统偏差约 ${TIME_PROBE_OFFSET} 秒，不写系统时钟。"
+        if [ "$config_changed" = true ] || [ "$previous_status" != reachable ]; then
+            _info "NTP 探测 ${TIME_PROBE_SOURCE} 可达；已配置 sing-box 每 1 分钟补偿协议时钟；系统偏差约 ${TIME_PROBE_OFFSET} 秒，未修改系统时钟。"
+        fi
     else
         _warn "三个 NTP 时间源均未通过有界探测，暂不启用脚本管理的内置 NTP，避免拖延其他节点启动。"
         _warn "下次启动/重启或 [11] 修复会重新探测；未校时不等于 SS2022 已可用。"
@@ -1896,7 +1900,6 @@ _start_argo_tunnel() {
              rm -f -- "$pid_file"
              return 1
         fi
-        _enable_argo_watchdog
         _success "Argo 固定隧道 (端口: $target_port) 启动成功!" >&2
         return 0
     else
@@ -1978,7 +1981,6 @@ _start_argo_tunnel() {
                  return 1
             fi
 
-            _enable_argo_watchdog
             _success "Argo 临时隧道建立成功: ${tunnel_domain}" >&2
             echo "$tunnel_domain"
             return 0
@@ -2596,6 +2598,9 @@ _restart_argo_tunnel_menu() {
         paths+=("$path")
     done < <(jq -r 'to_entries[] | "\(.key)|\(.value.name)|\(.value.local_port)|\(.value.protocol)|\(.value.type)|\(.value.token // "")|\(.value.uuid // "")|\(.value.password // "")|\(.value.path // "")"' "$ARGO_METADATA_FILE")
 
+    # 手动重启也要先确认守护可用，避免停掉现有隧道后才发现 cron 不工作。
+    _enable_argo_watchdog || return 1
+
     for i in "${!selected_indices[@]}"; do
         local idx="${selected_indices[$i]}"
         local tag="${tags[$idx]}"
@@ -2753,6 +2758,21 @@ _argo_keepalive() {
     exec 7>&-
 }
 
+_cron_daemon_running() {
+    local name comm
+    for name in cron crond; do
+        if command -v pgrep >/dev/null 2>&1 && pgrep -x "$name" >/dev/null 2>&1; then return 0; fi
+        if command -v pidof >/dev/null 2>&1 && pidof "$name" >/dev/null 2>&1; then return 0; fi
+    done
+    # 精简容器可能没有 pgrep/pidof，直接读取 Linux 的进程名。
+    for comm in /proc/[0-9]*/comm; do
+        [ -r "$comm" ] || continue
+        IFS= read -r name < "$comm" || continue
+        case "$name" in cron|crond) return 0 ;; esac
+    done
+    return 1
+}
+
 _ensure_argo_cron() {
     local cron_pkg="cron"
     local services=(cron crond cronie)
@@ -2805,23 +2825,17 @@ _ensure_argo_cron() {
     esac
 
     # 容器里 rc-service 可能存在，但没有真正运行 OpenRC。
-    if ! { pgrep -x crond >/dev/null 2>&1 || pidof crond >/dev/null 2>&1; }; then
+    if ! _cron_daemon_running; then
         if command -v crond &>/dev/null; then
             crond >/dev/null 2>&1 || true
         elif command -v busybox &>/dev/null; then
             busybox crond >/dev/null 2>&1 || true
         fi
     fi
-    if command -v pgrep >/dev/null 2>&1 || command -v pidof >/dev/null 2>&1; then
-        if { pgrep -x crond >/dev/null 2>&1 || pidof crond >/dev/null 2>&1; }; then
-            started=true
-        else
-            started=false
-        fi
-    fi
+    if _cron_daemon_running; then started=true; else started=false; fi
 
     if [ "$started" != true ]; then
-        _error "Cron 服务启动失败，无法启用 Argo 自动守护。"
+        _error "未检测到运行中的 cron/crond，无法启用 Argo 自动守护。请检查服务状态和容器进程权限。"
         return 1
     fi
 }

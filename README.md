@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v28`、`advanced_relay.sh v20`、`xray_manager.sh v3.1.3`。
+当前文档按以下脚本版本整理：`singbox.sh v29`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.3`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -142,8 +142,8 @@ ShadowTLS 组合没有通用的单行分享链接，脚本会给出 Mihomo 配�
 | Shadowsocks `aes-256-gcm` | `ss://` 链接 | 不接受插件或其他加密方法 |
 | Shadowsocks `2022-blake3-aes-128-gcm` | `ss://` 链接 | Base64 密钥解码后须为 16 字节；支持单密钥及服务端密钥:用户密钥 |
 | Shadowsocks `2022-blake3-aes-256-gcm` | `ss://` 链接 | Base64 密钥解码后须为 32 字节；支持单密钥及服务端密钥:用户密钥 |
-| HTTPS / HTTP 代理 | 链接导入 | 支持 `https://`、`http://` 或 `host:port`，支持 `?sni=` 及 `?insecure=` 参数 |
-| HTTPS / HTTP 代理 | 手动输入 | 输入服务器地址、端口，选择是否开启 TLS (HTTPS) 及可选认证 |
+| HTTPS / HTTP 代理 | 链接导入 | 支持 `https://`、`http://` 或 `host:port`（默认 HTTPS），支持 `?sni=` 及 `?insecure=` 参数；选择后显示输入示例 |
+| HTTPS / HTTP 代理 | 手动输入 | 显示 HTTPS/HTTP 示例，再输入服务器地址、端口、TLS (HTTPS) 与可选认证 |
 | SOCKS5 无认证 | 手动输入 | 输入服务器地址和端口 |
 | SOCKS5 用户名/密码认证 | 手动输入 | 输入服务器地址、端口、用户名和密码 |
 
@@ -152,6 +152,10 @@ Hysteria2、TUIC、VMess、Trojan、AnyTLS 等其余第三方分享链接不属�
 SS2022 可导入 SIP002 明文用户信息链接；为兼容现有分享工具，也接受非标准的 Base64 编码用户信息及旧式整串 Base64 链接。带插件的链接会被拒绝；普通分享链接无法表达落地节点是否要求 ShadowTLS 或 Multiplex/Padding，因此这些附加设置不会自动启用。中转机与第三方落地机需要保持时间准确；导入成功只表示配置通过检查，仍需确认实际连通。
 
 VLESS 导入结果都会显式写入 `network: "tcp"`。Reality 模式严格检查 SNI、公钥、Short ID、uTLS 指纹和 `flow`；WS+TLS 模式严格校验 SNI、Host、Path 与 uTLS 指纹；HTTP/HTTPS 代理作为落地节点时通过 HTTP CONNECT 转发 TCP 流量。
+
+sing-box 中 HTTPS 代理的出站类型仍为 `http`，通过 `tls.enabled: true` 启用 TLS；中转菜单按 TLS 状态显示为 `https`。使用 `https://IP:端口` 导入域名证书代理时，需在链接中加 `?sni=证书域名`，并确保域名与实际证书匹配；`http://` 则不会启用 TLS。
+
+导入 HTTPS 代理时，中转机先严格校验证书；若连接 IP 时只取得域名证书，脚本读取证书中的 DNS SAN 作为候选，逐个带 SNI 重新握手验证。唯一候选通过校验时自动填写 SNI；多个候选或校验失败时可手动填写 SNI 重试。取得 TLS 证书但仍无法严格验证时，用户可以明确选择仅对当前落地节点跳过证书校验（默认否）。若无法取得 TLS 证书，脚本会拒绝把 `insecure=1` 当成连通性修复。显式导入的 `?insecure=1` 保持原意并给出提示。证书探测不等于代理 CONNECT 可用，创建后仍需测试实际中转链路。
 
 ## 落地与中转
 
@@ -418,3 +422,9 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 ### 2026.10.29
 
 - Hysteria2 中转入口新增可选 Salamander QUIC 混淆，自动生成混淆密码，并同步写入服务端入站、分享链接和 Clash/Mihomo 配置；端口跳跃范围也同步写入客户端 YAML 的 `ports` 字段。
+
+### 2026.10.30
+
+- Argo 守护改为识别 `cron` 和 `crond` 两种进程名，避免服务已启动却被误判为失败；隧道创建只在保存节点后检查一次守护，手动重启时先确认守护可用。
+- 脚本管理的 NTP 状态仅在首次探测、可达状态变化或配置变化时提示；普通节点操作仍会进行启动前探测，但不会反复打印相同的成功信息。
+- 第三方 HTTP/HTTPS 落地节点导入显示具体链接与手动输入示例；HTTPS 在写配置前探测证书、验证可用 SNI，并仅在取得证书且用户明确确认时允许逐节点跳过校验。
