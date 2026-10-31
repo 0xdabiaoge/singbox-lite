@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v29`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.3`。
+当前文档按以下脚本版本整理：`singbox.sh v30`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.3`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -428,3 +428,7 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - Argo 守护改为识别 `cron` 和 `crond` 两种进程名，避免服务已启动却被误判为失败；隧道创建只在保存节点后检查一次守护，手动重启时先确认守护可用。
 - 脚本管理的 NTP 状态仅在首次探测、可达状态变化或配置变化时提示；普通节点操作仍会进行启动前探测，但不会反复打印相同的成功信息。
 - 第三方 HTTP/HTTPS 落地节点导入显示具体链接与手动输入示例；HTTPS 在写配置前探测证书、验证可用 SNI，并仅在取得证书且用户明确确认时允许逐节点跳过校验。
+
+### 2026.10.31
+
+- 修复 Alpine 上 BusyBox 自带 `crontab`/`crond` 导致 Argo 守护误以为开机自启已就绪的问题：实际运行 OpenRC 时按需安装可用的 cron 服务，校验其已加入 `default` 运行级别且处于运行状态；启用失败则拒绝创建没有重启自愈能力的 Argo 节点。已有 Argo 节点在更新后首次打开管理脚本时也会补齐守护；无 OpenRC PID 1 的容器仍需在容器启动流程中运行 cron。

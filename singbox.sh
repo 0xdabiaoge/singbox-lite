@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="29"
+export SCRIPT_VERSION="30"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -2776,7 +2776,7 @@ _cron_daemon_running() {
 _ensure_argo_cron() {
     local cron_pkg="cron"
     local services=(cron crond cronie)
-    local service_name started=false
+    local service_name started=false service_available=false
 
     if command -v apk &>/dev/null; then
         cron_pkg="dcron"
@@ -2786,7 +2786,14 @@ _ensure_argo_cron() {
         services=(crond cronie)
     fi
 
-    if ! command -v crontab &>/dev/null; then
+    # Alpine 自带 BusyBox crontab/crond，但通常没有 OpenRC 的 cron 服务。
+    # 仅按 crontab 命令判断会在创建节点时临时启动 crond，重启后却无人执行守护任务。
+    for service_name in "${services[@]}"; do
+        [ ! -x "/etc/init.d/$service_name" ] || service_available=true
+    done
+    if ! command -v crontab &>/dev/null \
+        || { [ "${INIT_SYSTEM:-}" = openrc ] && [ -s /run/openrc/softlevel ] \
+             && [ "$service_available" != true ]; }; then
         _info "正在按需安装 Argo 守护依赖: ${cron_pkg}..."
         if ! _pkg_install "$cron_pkg" || ! command -v crontab &>/dev/null; then
             _error "安装 Argo 守护依赖失败，未创建不受守护的隧道节点。"
@@ -2804,13 +2811,27 @@ _ensure_argo_cron() {
             done
             ;;
         openrc)
-            for service_name in "${services[@]}"; do
-                if rc-service "$service_name" start >/dev/null 2>&1; then
-                    rc-update add "$service_name" default >/dev/null 2>&1 || true
+            if [ -s /run/openrc/softlevel ]; then
+                for service_name in "${services[@]}"; do
+                    [ -x "/etc/init.d/$service_name" ] || continue
+                    if ! rc-update add "$service_name" default >/dev/null 2>&1 \
+                        || [ ! -L "/etc/runlevels/default/$service_name" ]; then
+                        _error "无法把 ${service_name} 加入 OpenRC default 运行级别；重启后 Argo 无法自启。"
+                        return 1
+                    fi
+                    if ! rc-service "$service_name" start >/dev/null 2>&1 \
+                        || ! rc-service "$service_name" status >/dev/null 2>&1; then
+                        _error "OpenRC ${service_name} 服务未运行；无法启用 Argo 自动守护。"
+                        return 1
+                    fi
                     started=true
                     break
+                done
+                if [ "$started" != true ]; then
+                    _error "没有可用的 OpenRC cron 服务；无法保证 Argo 重启后自动恢复。"
+                    return 1
                 fi
-            done
+            fi
             ;;
         *)
             if command -v service &>/dev/null; then
@@ -8800,6 +8821,11 @@ main() {
         fi
         _setup_log_cleanup
         _secure_state_permissions
+        # 已有 Argo 节点升级脚本后也要补齐开机守护，避免只在新建或手动重启时修复。
+        if [ -s "$ARGO_METADATA_FILE" ] \
+            && jq -e 'type == "object" and length > 0' "$ARGO_METADATA_FILE" >/dev/null 2>&1; then
+            _enable_argo_watchdog || _warn "已有 Argo 节点的开机守护修复失败；请检查 cron/OpenRC 状态。"
+        fi
     else
         # --- sing-box 未安装：仅显示提示，不自动安装 ---
         _warn "sing-box 核心未安装。请通过主菜单【核心管理】进行安装。"
