@@ -35,9 +35,8 @@ _warn() { echo -e "${YELLOW}[注意] $1${NC}" >&2; }
 _warning() { _warn "$1"; } # 别名兼容
 _error() { echo -e "${RED}[错误] $1${NC}" >&2; }
 
-# Podman 容器通常没有 NET_ADMIN，nftables 转发会由 advanced_relay.sh
-# 自动降级到 sing-box 用户态转发。检测到该环境时不安装不会被使用的
-# 可选包，避免 128M 容器在 apk 解包时触发 OOM。
+# 容器名称只用于调整可选依赖；端口转发能力由 advanced_relay.sh 实测。
+# 精简 Podman 容器跳过部分非必要安装，避免低内存环境解包时触发 OOM。
 _is_podman_environment() {
     [ -f /run/.containerenv ] && return 0
     grep -qaE 'libpod|podman' /proc/1/cgroup /proc/1/environ 2>/dev/null
@@ -1374,7 +1373,7 @@ _install_dependencies() {
                 missing_cached="$missing_cached $cmd"
             fi
         done
-        if ! _is_podman_environment && ! command -v nft &>/dev/null; then
+        if ! command -v nft &>/dev/null; then
             missing_cached="$missing_cached nftables"
         fi
         if [ -z "$missing_cached" ] && [ -x "$YQ_BINARY" ]; then
@@ -1391,11 +1390,9 @@ _install_dependencies() {
     # 可选依赖：部分功能需要，即使装失败也不致命
     local optional_pkgs="procps nftables socat iproute2 cron lsof"
 
-    # Podman 的网络能力由容器运行时决定，即使安装 nftables 也无法写入
-    # 主机 netfilter；在容器中跳过整组可选包，只保留脚本核心依赖。
+    # 容器类型不能代替权限探测；Podman 仍尝试提供 nft 命令，实际写入能力由子菜单探测。
     if _is_podman_environment; then
-        optional_pkgs=""
-        _info "检测到 Podman 容器：跳过 nftables 等可选依赖，使用 sing-box 用户态转发"
+        optional_pkgs="nftables"
     fi
     
     # 针对不同发行版的 cron 包名适配
@@ -1457,6 +1454,38 @@ _install_dependencies() {
 
     mkdir -p "$SINGBOX_DIR"
     printf '%s\n' "$DEP_STATE_VERSION" > "$DEP_STATE_FILE"
+}
+
+# 未装 sing-box 时主菜单只准备通用工具；nftables 是否能写规则由端口转发菜单实测。
+_install_menu_dependencies() {
+    local lock_pkg="util-linux" cron_pkg="cron" missing="" cmd
+    if command -v apk >/dev/null 2>&1; then
+        lock_pkg="util-linux-misc"
+        cron_pkg="dcron"
+    elif ! command -v apt-get >/dev/null 2>&1; then
+        cron_pkg="cronie"
+    fi
+    for cmd in bash jq curl wget openssl tar unzip flock timeout; do
+        command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
+    done
+    if [ -n "$missing" ]; then
+        _info "正在补齐菜单依赖:${missing}"
+        _pkg_install bash jq curl wget openssl tar unzip ca-certificates "$lock_pkg" || return 1
+    fi
+    for cmd in bash jq curl wget openssl tar unzip flock timeout; do
+        command -v "$cmd" >/dev/null 2>&1 || { _error "缺少菜单依赖: $cmd"; return 1; }
+    done
+    command -v nft >/dev/null 2>&1 || _pkg_install nftables >/dev/null 2>&1 || true
+    command -v ss >/dev/null 2>&1 || _pkg_install iproute2 >/dev/null 2>&1 || true
+    command -v crontab >/dev/null 2>&1 || _pkg_install "$cron_pkg" >/dev/null 2>&1 || true
+    if command -v apk >/dev/null 2>&1 && command -v crond >/dev/null 2>&1; then
+        if command -v rc-service >/dev/null 2>&1; then
+            rc-service dcron start >/dev/null 2>&1 || true
+            rc-update add dcron default >/dev/null 2>&1 || true
+        else
+            pgrep -x crond >/dev/null 2>&1 || crond >/dev/null 2>&1 || true
+        fi
+    fi
 }
 
 # 确保 nftables 可用，并检测实际 netfilter 写入能力
@@ -7808,6 +7837,7 @@ _xray_features() {
         _error "Xray 核心未安装！请先通过主菜单【核心管理】-> [16] 进行安装。"
         return 1
     fi
+    _install_yq || return 1
 
     local script_name="xray_manager.sh"
     local script_path="${SINGBOX_DIR}/${script_name}"
@@ -8027,7 +8057,7 @@ _main_menu() {
             15) _install_or_update_singbox ;;
             16) _install_or_update_xray ;;
             17) _uninstall ;; 
-            18) _require_singbox && _advanced_features ;;
+            18) _advanced_features ;;
             19) _xray_features ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
@@ -8742,7 +8772,11 @@ main() {
     chmod 700 "${SINGBOX_DIR}" 2>/dev/null || true
     
     # 1. 首次安装或依赖状态失效时才完整检查，避免每次 sb 进入菜单都触发包管理器
-    _install_dependencies
+    if [ -x "$SINGBOX_BIN" ]; then
+        _install_dependencies
+    else
+        _install_menu_dependencies || return 1
+    fi
     
     # 2. 根据核心安装状态决定初始化路径
     if [ -f "${SINGBOX_BIN}" ]; then

@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v30`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.3`。
+当前文档按以下脚本版本整理：`singbox.sh v30`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.6`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -188,6 +188,9 @@ sing-box 中 HTTPS 代理的出站类型仍为 `http`，通过 `tls.enabled: tru
 - TUIC v5
 - AnyTLS
 - Shadowsocks `aes-256-gcm`
+- VLESS + XHTTP + Reality（需先通过 Xray 管理脚本安装 Xray 核心；入口、落地出站和路由均由 Xray 处理，不要求安装 sing-box 核心。其他五种中转入口仍使用 sing-box。）
+
+XHTTP 入口导入设置了 `insecure=1` 的 HTTPS 落地时，会固定当时获取的落地证书 SHA-256 指纹；证书更新后需重新导入该中转。普通 HTTPS 落地继续验证证书和域名。Xray 出站只支持 TCP 的 HTTP/HTTPS 代理转发，无法转发 UDP。
 
 创建、删除和修改中转路由都使用事务快照；配置检查或服务重启失败时会尝试恢复原状态。
 
@@ -195,14 +198,16 @@ sing-box 中 HTTPS 代理的出站类型仍为 `http`，通过 `tls.enabled: tru
 
 入口：主菜单 `[18]` → 进阶转发菜单 `[8]`。
 
+进入 `[18]` 不要求先安装 sing-box 核心；第三方节点导入时仅选择 XHTTP + Reality 入口可以只安装 Xray，其他中转入口仍需 sing-box 核心。查看、修改、删除 Xray 直连中转也不要求 sing-box。端口转发可在没有核心时使用 nftables 引擎，端口转发元数据继续存放在原路径，不会因此生成 sing-box 主配置。
+
 ### 自动选择引擎
 
-脚本不是只根据“LXC/KVM/Podman”名称做判断，而是实际尝试创建并删除一条 nftables 测试规则：
+脚本不是只根据“LXC/KVM/Podman”名称做判断，而是在独立临时 nftables 表中探测 NAT 规则写入能力，并在探测结束后删除该表：
 
 - 探测成功：使用 nftables DNAT 内核转发。
-- 探测失败或缺少权限：使用 sing-box `direct` 用户态转发。
+- 探测失败或缺少权限：若已安装 sing-box，使用 `direct` 用户态转发；否则提示先在主菜单 `[15]` 安装核心，不写入转发规则。
 
-因此，具备权限的 LXC 和 KVM 可以使用 nftables；常见的无特权 Docker/Podman 会自动降级为 sing-box。规则创建后也可以在菜单中手动切换引擎，切换失败会恢复旧规则。
+因此，具备权限的 LXC 和 KVM 可以使用 nftables；无权限的 Docker/Podman 在装有 sing-box 时可使用用户态引擎。nftables 写入能力还需配合内核 IP 转发、宿主机端口发布和防火墙设置才能从外部访问。规则创建后也可以在菜单中手动切换引擎；切换涉及 sing-box 时仍要求已安装核心。
 
 ### 支持能力
 
@@ -225,13 +230,15 @@ sing-box 用户态 UDP 转发的性能通常低于 nftables，但适合没有 ne
 | 2 | VLESS + gRPC + Reality | 客户端需支持 gRPC Reality |
 | 3 | Trojan + XHTTP + Reality | Mihomo/Clash 不支持 XHTTP |
 | 4 | Trojan + gRPC + Reality | 客户端需支持 gRPC Reality |
-| 5 | VLESS + XHTTP + TLS | 面向 Xray 客户端；可用于 CF H2 回源 |
-| 6 | VLESS + gRPC + TLS | 使用 CF 时需开启 gRPC 并正确配置 SSL 模式 |
-| 7 | Trojan + gRPC + TLS | 使用 CF 时需开启 gRPC 并正确配置 SSL 模式 |
-| 8 | Shadowsocks | AES-128/256-GCM、ChaCha20、XChaCha20、三种 SS2022 及 SS2022 + Padding |
+| 5 | VLESS + XHTTP + Reality | H2、空 Vision flow；生成分享链接，并写入含 `support-x25519mlkem768: true` 的 Mihomo YAML |
+| 6 | VLESS + XHTTP + TLS | 面向 Xray 客户端；可用于 CF H2 回源 |
+| 7 | VLESS + gRPC + TLS | 使用 CF 时需开启 gRPC 并正确配置 SSL 模式 |
+| 8 | Trojan + gRPC + TLS | 使用 CF 时需开启 gRPC 并正确配置 SSL 模式 |
+| 9 | Shadowsocks | AES-128/256-GCM、ChaCha20、XChaCha20、三种 SS2022 及 SS2022 + Padding |
 
 Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/etc/sing-box/clash.yaml`。删除和修改节点时只处理归属于目标节点的 YAML 项，避免误删另一核心的同名或相邻配置。
 仅安装 Xray 时，Xray 管理器会先初始化这份共享 YAML；以后安装 sing-box 会复用已有的非空文件，并将新节点追加到同一配置中。
+Mihomo 的 `support-x25519mlkem768` 是客户端配置字段，不写入 Xray 服务端 JSON 或通用分享链接。Xray 管理器创建的 VLESS + XHTTP + Reality 节点会把它写入共享 YAML；其他由 Xray 管理器新建且生成 YAML 的 Reality 节点也会带上此字段。已有 YAML 条目不会自动改写，需要手动补充或重建节点。Mihomo 官方仍提示与较新 Xray 核心可能存在兼容差异；请以实际客户端连通测试为准。
 
 ## IPv6
 
@@ -432,3 +439,14 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 ### 2026.10.31
 
 - 修复 Alpine 上 BusyBox 自带 `crontab`/`crond` 导致 Argo 守护误以为开机自启已就绪的问题：实际运行 OpenRC 时按需安装可用的 cron 服务，校验其已加入 `default` 运行级别且处于运行状态；启用失败则拒绝创建没有重启自愈能力的 Argo 节点。已有 Argo 节点在更新后首次打开管理脚本时也会补齐守护；无 OpenRC PID 1 的容器仍需在容器启动流程中运行 cron。
+
+### 2026.11.03
+
+- Xray 节点管理新增 `[5] VLESS + XHTTP + Reality`：生成随机路径、Reality 密钥和分享链接，使用空 flow，并通过既有配置校验、服务重启及失败回滚流程提交。
+- Xray 管理器生成的 Mihomo Reality 节点配置补充 `support-x25519mlkem768: true`；VLESS + XHTTP + Reality 同时输出 H2 / stream-one 的 YAML 条目。该字段仅作用于 Mihomo 客户端，分享链接导入流程仍取决于客户端或订阅转换器。
+- Xray 添加节点菜单按分组顺序连续编号：Reality `[1-5]`、TLS `[6-8]`、Shadowsocks `[9]`，选项分发与文档同步调整。
+- 主菜单 `[18]` 允许在未安装 sing-box 时进入；中转节点操作仍要求核心。端口转发按实际 nftables 写入能力选择引擎，具备能力时可独立使用内核转发，受限环境缺少核心时明确提示安装后再创建用户态规则。
+
+### 2026.11.04
+
+- 进阶中转与端口转发菜单统一在结果显示后等待一次回车，避免成功或错误提示被下一轮菜单清屏；取消操作和返回上级菜单不增加等待。
