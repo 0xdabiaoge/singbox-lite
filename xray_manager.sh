@@ -1212,10 +1212,10 @@ _add_vless_xhttp_reality() {
           "xhttp-opts":{"path":$pa, "mode":"stream-one"}}') || return 1
     _xray_add_node_to_yaml "$proxy_json" || return 1
 
-    local link="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=none&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&fp=chrome&type=xhttp&mode=auto&path=$(_url_encode "$path")&sni=$(_url_encode "$sni")&sid=${REALITY_SHORT_ID}#$(_url_encode "$name")"
+    local link="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=none&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&fp=chrome&type=xhttp&mode=auto&path=$(_url_encode "$path")&sni=$(_url_encode "$sni")&sid=${REALITY_SHORT_ID}&support-x25519mlkem768=true#$(_url_encode "$name")"
     _save_xray_meta "$tag" "$name" "$link" "publicKey=$REALITY_PUBLIC_KEY" "shortId=$REALITY_SHORT_ID" || return 1
 
-    _info "已写入 Mihomo YAML：H2 / stream-one / X25519MLKEM768。分享链接不会携带 Mihomo 专用开关。"
+    _info "已写入 Mihomo YAML：H2 / stream-one / X25519MLKEM768；分享链接已附加兼容的扩展参数。"
     _success "VLESS+XHTTP+Reality 节点 [${name}] 添加成功！"
     echo -e "  ${YELLOW}分享链接:${NC} ${link}"
 }

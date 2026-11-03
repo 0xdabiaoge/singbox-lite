@@ -238,7 +238,7 @@ sing-box 用户态 UDP 转发的性能通常低于 nftables，但适合没有 ne
 
 Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/etc/sing-box/clash.yaml`。删除和修改节点时只处理归属于目标节点的 YAML 项，避免误删另一核心的同名或相邻配置。
 仅安装 Xray 时，Xray 管理器会先初始化这份共享 YAML；以后安装 sing-box 会复用已有的非空文件，并将新节点追加到同一配置中。
-Mihomo 的 `support-x25519mlkem768` 是客户端配置字段，不写入 Xray 服务端 JSON 或通用分享链接。Xray 管理器创建的 VLESS + XHTTP + Reality 节点会把它写入共享 YAML；其他由 Xray 管理器新建且生成 YAML 的 Reality 节点也会带上此字段。已有 YAML 条目不会自动改写，需要手动补充或重建节点。Mihomo 官方仍提示与较新 Xray 核心可能存在兼容差异；请以实际客户端连通测试为准。
+Mihomo 的 `support-x25519mlkem768` 是客户端配置字段，不写入 Xray 服务端 JSON。Xray 管理器和中转脚本创建的 VLESS + XHTTP + Reality 节点会在共享 YAML 的 `reality-opts` 中写入该字段，也会在分享链接中附加 `support-x25519mlkem768=true`，供支持此扩展参数的 Mihomo 或订阅转换器使用。其他由 Xray 管理器新建且生成 YAML 的 Reality 节点也会带上此字段。已有分享链接和经第三方聚合工具生成的 YAML 不会自动改写，需要手动给旧链接补参数后重新转换，或重新创建节点。不同客户端与转换器对扩展参数的处理可能不同；请以实际转换结果和连通测试为准。
 
 ## IPv6
 
@@ -443,7 +443,7 @@ Mihomo 的 `support-x25519mlkem768` 是客户端配置字段，不写入 Xray �
 ### 2026.11.03
 
 - Xray 节点管理新增 `[5] VLESS + XHTTP + Reality`：生成随机路径、Reality 密钥和分享链接，使用空 flow，并通过既有配置校验、服务重启及失败回滚流程提交。
-- Xray 管理器生成的 Mihomo Reality 节点配置补充 `support-x25519mlkem768: true`；VLESS + XHTTP + Reality 同时输出 H2 / stream-one 的 YAML 条目。该字段仅作用于 Mihomo 客户端，分享链接导入流程仍取决于客户端或订阅转换器。
+- Xray 管理器生成的 Mihomo Reality 节点配置补充 `support-x25519mlkem768: true`；VLESS + XHTTP + Reality 同时输出 H2 / stream-one 的 YAML 条目，并在分享链接中携带同名扩展参数。分享链接导入流程仍取决于客户端或订阅转换器。
 - Xray 添加节点菜单按分组顺序连续编号：Reality `[1-5]`、TLS `[6-8]`、Shadowsocks `[9]`，选项分发与文档同步调整。
 - 主菜单 `[18]` 允许在未安装 sing-box 时进入；中转节点操作仍要求核心。端口转发按实际 nftables 写入能力选择引擎，具备能力时可独立使用内核转发，受限环境缺少核心时明确提示安装后再创建用户态规则。
 

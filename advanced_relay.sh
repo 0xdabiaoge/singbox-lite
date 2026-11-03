@@ -2161,7 +2161,7 @@ _finalize_relay_setup() {
         fi
         xray_inbound=$(jq -n --arg t "$inbound_tag" --argjson p "$listen_port" --arg u "$uuid" --arg sn "$entrance_sni" --arg pk "$pk" --arg sid "$sid" --arg path "$xhttp_path" \
             '{tag:$t,listen:"::",port:$p,protocol:"vless",settings:{clients:[{id:$u,flow:""}],decryption:"none"},streamSettings:{network:"xhttp",security:"reality",realitySettings:{show:false,dest:($sn + ":443"),xver:0,serverNames:[$sn],privateKey:$pk,shortIds:[$sid]},xhttpSettings:{path:$path}}}') || return 1
-        link="vless://${uuid}@${link_ip}:${listen_port}?security=reality&encryption=none&pbk=$(_url_encode "$pbk")&fp=chrome&type=xhttp&mode=auto&path=$(_url_encode "$xhttp_path")&sni=$(_url_encode "$entrance_sni")&sid=${sid}#$(_url_encode "$node_name")"
+        link="vless://${uuid}@${link_ip}:${listen_port}?security=reality&encryption=none&pbk=$(_url_encode "$pbk")&fp=chrome&type=xhttp&mode=auto&path=$(_url_encode "$xhttp_path")&sni=$(_url_encode "$entrance_sni")&sid=${sid}&support-x25519mlkem768=true#$(_url_encode "$node_name")"
     elif [ "$relay_type" == "vless-reality" ]; then
         local uuid=$($SINGBOX_BIN generate uuid)
         keypair=$($SINGBOX_BIN generate reality-keypair)
