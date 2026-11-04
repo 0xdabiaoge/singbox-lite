@@ -107,7 +107,7 @@ sb
 | 6 | Hysteria2 | 支持 Salamander 混淆和端口跳跃 |
 | 7 | TUIC v5 | 使用 QUIC/UDP |
 | 8 | Shadowsocks | 经典 SS、SS2022、Padding、SS2022 + ShadowTLS v3 |
-| 9 | 纯 VLESS + TCP | 无 TLS/Reality，适合明确知道风险和使用场景的用户 |
+| 9 | 纯 VLESS + TCP | 无 TLS/Reality；新版 Xray 客户端拒绝公网地址，可改选 sing-box 客户端核心 |
 | 10 | SOCKS5 | 本机创建的是用户名/密码认证节点 |
 | 11 | 批量创建 | 支持多协议组合、端口规划、冲突检查和整批回滚 |
 
@@ -184,14 +184,19 @@ sing-box 中 HTTPS 代理的出站类型仍为 `http`，通过 `tls.enabled: tru
 可选中转入口：
 
 - VLESS + TCP + Reality + Vision（sing-box 或 Xray）
-- VLESS + TCP（sing-box 或 Xray；仅适合可信内网或已有加密隧道）
+- VLESS + TCP（sing-box 或 Xray；明文入口；新版 Xray 客户端会拒绝公网地址）
 - VLESS + XHTTP + Reality（Xray）
+- VLESS + WebSocket + TLS（sing-box 或 Xray；可由 Cloudflare 代理域名回源）
 - Hysteria2（可选 Salamander QUIC 混淆和端口跳跃；混淆密码会同步写入分享链接与 Clash/Mihomo 配置）
 - TUIC v5
 - AnyTLS
 - Shadowsocks `aes-128-gcm`、`aes-256-gcm`、`2022-blake3-aes-128-gcm`、`2022-blake3-aes-256-gcm`（sing-box 或 Xray）
 
-Reality + Vision、纯 VLESS + TCP 和上述四种 Shadowsocks 入口在两种核心均已安装时会询问中转核心；仅安装其中一种时自动使用已安装的核心。Xray 入口由 Xray 直接完成落地出站和路由。Hysteria2、TUIC、AnyTLS 继续使用 sing-box。Xray 的 SS2022 依赖准确的系统时间。
+Reality + Vision、纯 VLESS + TCP、VLESS + WebSocket + TLS 和上述四种 Shadowsocks 入口在两种核心均已安装时会询问中转核心；仅安装其中一种时自动使用已安装的核心。Xray 入口由 Xray 直接完成落地出站和路由。Hysteria2、TUIC、AnyTLS 继续使用 sing-box。Xray 的 SS2022 依赖准确的系统时间。
+
+WS/TLS 中转入口需填写客户端连接地址、Cloudflare 代理域名、WebSocket 路径及回源证书。客户端连接地址填写橙云域名；使用优选 IP 时，SNI 和 WS Host 仍填写橙云域名。脚本可复制现有证书与私钥，或生成自签证书；Cloudflare Full (strict) 需要匹配域名的受信任证书或 Cloudflare Origin CA 证书，自签证书只能配合 Full。复制的证书在续签后不会自动同步，需重新导入更新后的文件。监听端口由用户选择；默认生成的分享链接和 Clash 配置使用相同端口。若在 Cloudflare 设置客户端 443 → 本机其他端口的回源规则，需把客户端配置中的端口改为 443。Xray 26.10.31 已对 WebSocket 传输发出弃用提示，因此长期使用 WS/TLS 入口更建议选择 sing-box 核心。
+
+纯 VLESS + TCP 的服务端可以由 sing-box 或 Xray 运行，两者生成相同格式的分享链接。v2rayN 若选择新版 Xray 核心连接公网明文地址，会在加载客户端配置时失败；可在核心类型设置中将 VLESS 改由 sing-box 运行。该方式仍是明文传输；公网使用更建议选 Reality 等带传输加密的协议。通过加密隧道连接时，可以填写隧道内的私有地址。
 
 XHTTP 入口导入设置了 `insecure=1` 的 HTTPS 落地时，会固定当时获取的落地证书 SHA-256 指纹；证书更新后需重新导入该中转。普通 HTTPS 落地继续验证证书和域名。Xray 出站只支持 TCP 的 HTTP/HTTPS 代理转发，无法转发 UDP。
 
@@ -237,7 +242,7 @@ sing-box 用户态 UDP 转发的性能通常低于 nftables，但适合没有 ne
 | 6 | VLESS + XHTTP + TLS | 面向 Xray 客户端；可用于 CF H2 回源 |
 | 7 | VLESS + gRPC + TLS | 使用 CF 时需开启 gRPC 并正确配置 SSL 模式 |
 | 8 | Trojan + gRPC + TLS | 使用 CF 时需开启 gRPC 并正确配置 SSL 模式 |
-| 9 | VLESS + TCP | 明文传输，仅适合可信内网或已有加密隧道 |
+| 9 | VLESS + TCP | 明文传输；新版 Xray 客户端拒绝公网地址，可改选 sing-box 客户端核心 |
 | 10 | Shadowsocks | AES-128/256-GCM、ChaCha20、XChaCha20、三种 SS2022 及 SS2022 + Padding |
 
 Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/etc/sing-box/clash.yaml`。删除和修改节点时只处理归属于目标节点的 YAML 项，避免误删另一核心的同名或相邻配置。

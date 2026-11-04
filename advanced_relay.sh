@@ -2029,8 +2029,9 @@ _finalize_relay_setup() {
     echo -e "    ${GREEN}[8]${NC} Shadowsocks aes-256-gcm"
     echo -e "    ${GREEN}[9]${NC} Shadowsocks 2022-blake3-aes-128-gcm"
     echo -e "    ${GREEN}[10]${NC} Shadowsocks 2022-blake3-aes-256-gcm"
+    echo -e "    ${GREEN}[11]${NC} VLESS + WebSocket + TLS (CF 回源)"
     echo ""
-    read -p "  请输入选项 [1-10]: " relay_choice
+    read -p "  请输入选项 [1-11]: " relay_choice
     
     local relay_type="" relay_engine="" ss_method="" engine_choice=""
     local listen_network="tcp"
@@ -2045,6 +2046,7 @@ _finalize_relay_setup() {
         8) relay_type="shadowsocks"; ss_method="aes-256-gcm" ;;
         9) relay_type="shadowsocks"; ss_method="2022-blake3-aes-128-gcm" ;;
         10) relay_type="shadowsocks"; ss_method="2022-blake3-aes-256-gcm" ;;
+        11) relay_type="vless-ws-tls" ;;
         *) _error "无效选项"; return 1 ;;
     esac
     if [ -z "$relay_engine" ]; then
@@ -2062,6 +2064,9 @@ _finalize_relay_setup() {
     else
         _require_relay_core || return 1
     fi
+    if [ "$relay_type" = "vless-ws-tls" ] && [ "$relay_engine" = xray ]; then
+        _warn "Xray 26.10.31 已提示 WebSocket 传输弃用；此入口可用，但长期使用建议选择 sing-box 核心。"
+    fi
     [ "$relay_type" != "shadowsocks" ] || listen_network="tcp+udp"
     [ "$relay_type" != "vless-tcp" ] || _warn "纯 VLESS + TCP 不加密；v2rayN 使用新版 Xray 核心时会拒绝公网地址，请选 sing-box 核心或改用加密协议。"
     if [[ "$ss_method" == 2022-* && "$relay_engine" == xray ]]; then
@@ -2072,12 +2077,15 @@ _finalize_relay_setup() {
     local detected_relay_ip relay_server_ip input_relay_ip
     detected_relay_ip=$(_get_public_ip)
     while true; do
-        if [ -n "$detected_relay_ip" ]; then
+        if [ "$relay_type" = "vless-ws-tls" ]; then
+            read -r -p "  请输入客户端连接的 CF 代理域名或优选 IP（必填）: " input_relay_ip || return 1
+            [ -n "$input_relay_ip" ] || { _error "CF 入口必须填写客户端连接地址"; continue; }
+        elif [ -n "$detected_relay_ip" ]; then
             read -r -p "  请输入客户端连接中转入口的 IP 或域名 (回车默认: ${detected_relay_ip}): " input_relay_ip || return 1
         else
             read -r -p "  无法自动检测入口 IP，请输入客户端连接中转入口的 IP 或域名: " input_relay_ip || return 1
         fi
-        relay_server_ip="${input_relay_ip:-$detected_relay_ip}"
+        if [ "$relay_type" = "vless-ws-tls" ]; then relay_server_ip="$input_relay_ip"; else relay_server_ip="${input_relay_ip:-$detected_relay_ip}"; fi
         if [[ "$relay_server_ip" == \[*\] ]]; then
             relay_server_ip="${relay_server_ip:1:${#relay_server_ip}-2}"
         fi
@@ -2114,9 +2122,23 @@ _finalize_relay_setup() {
             break
         fi
     done
+
+    if [ "$relay_type" = "vless-ws-tls" ]; then
+        case "$listen_port" in
+            443|2053|2083|2087|2096|8443) ;;
+            *) _warn "${listen_port} 不是 CF 标准代理的 HTTPS 端口；如在 CF 配置 443 → ${listen_port} 回源规则，生成的分享链接和 Clash 端口需改为 443。" ;;
+        esac
+    fi
     
     local entrance_sni=""
-    if [ "$relay_type" != "shadowsocks" ] && [ "$relay_type" != "vless-tcp" ]; then
+    if [ "$relay_type" = "vless-ws-tls" ]; then
+        read -r -p "  请输入 CF 代理域名（用于 TLS SNI 和 WS Host）: " entrance_sni || return 1
+        if [[ ! "$entrance_sni" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || [[ "$entrance_sni" != *.* ]]; then
+            _error "请输入有效的 CF 代理域名"
+            return 1
+        fi
+        _info "客户端连接地址应填写该 CF 代理域名；如使用 CF 优选 IP，SNI/Host 仍须保持该域名。"
+    elif [ "$relay_type" != "shadowsocks" ] && [ "$relay_type" != "vless-tcp" ]; then
         read -p "  请输入中转机入口 SNI (回车默认 www.amd.com): " entrance_sni
         [[ -z "$entrance_sni" ]] && entrance_sni="www.amd.com"
     fi
@@ -2145,12 +2167,47 @@ _finalize_relay_setup() {
     local link=""
     local keypair=""
     local pbk=""
-    local xray_inbound="" xhttp_path=""
+    local xray_inbound="" xhttp_path="" ws_path=""
     
     # 证书处理 (仅中转入口使用)
     local cert_path="${RELAY_AUX_DIR}/${inbound_tag}.pem"
     local key_path="${RELAY_AUX_DIR}/${inbound_tag}.key"
-    if [[ "$relay_type" == "hysteria2" || "$relay_type" == "tuic" || "$relay_type" == "anytls" ]]; then
+    if [ "$relay_type" = "vless-ws-tls" ]; then
+        local cert_choice="" source_cert="" source_key="" cert_pub="" key_pub=""
+        if [ -e "$cert_path" ] || [ -e "$key_path" ]; then
+            _error "中转入口证书文件已存在，避免覆盖: $inbound_tag"
+            return 1
+        fi
+        ws_path="/$(openssl rand -hex 8)" || return 1
+        read -r -p "  请输入 WebSocket 路径 (回车随机 ${ws_path}): " custom_path || return 1
+        ws_path="${custom_path:-$ws_path}"
+        if [[ "$ws_path" != /* || "$ws_path" == *[[:space:]?#]* ]]; then
+            _error "WebSocket 路径须以 / 开头，且不能包含空白、? 或 #"
+            return 1
+        fi
+        echo "  [1] 使用已有证书与私钥（CF Full (strict) 推荐受信任证书或 Origin CA）"
+        echo "  [2] 生成自签证书（仅适用于 CF Full，不能用于 Full (strict)）"
+        read -r -p "  请选择回源证书 [1-2]: " cert_choice || return 1
+        case "$cert_choice" in
+            1)
+                read -r -p "  请输入证书文件路径（fullchain.pem 或 Origin CA 证书）: " source_cert || return 1
+                read -r -p "  请输入私钥文件路径: " source_key || return 1
+                [ -f "$source_cert" ] && [ -f "$source_key" ] || { _error "证书或私钥文件不存在"; return 1; }
+                openssl x509 -in "$source_cert" -noout -checkend 0 >/dev/null 2>&1 && openssl pkey -in "$source_key" -noout >/dev/null 2>&1 || { _error "证书已过期，或证书/私钥格式无效"; return 1; }
+                cert_pub=$(openssl x509 -in "$source_cert" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null) || return 1
+                key_pub=$(openssl pkey -in "$source_key" -pubout -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null) || return 1
+                [ -n "$cert_pub" ] && [ "$cert_pub" = "$key_pub" ] || { _error "证书与私钥不匹配"; return 1; }
+                openssl x509 -in "$source_cert" -noout -checkhost "$entrance_sni" 2>/dev/null | grep -q 'does match' || { _error "证书不匹配 CF 代理域名: $entrance_sni"; return 1; }
+                cp -- "$source_cert" "$cert_path" && cp -- "$source_key" "$key_path" || { _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"; _error "复制回源证书失败"; return 1; }
+                ;;
+            2)
+                openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout "$key_path" -out "$cert_path" -subj "/CN=${entrance_sni}" -addext "subjectAltName=DNS:${entrance_sni}" >/dev/null 2>&1 || { _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"; _error "生成自签证书失败"; return 1; }
+                _warn "自签证书仅适用于 CF Full；回源证书不会被验证，请优先使用 Full (strict)。"
+                ;;
+            *) _error "无效证书选项"; return 1 ;;
+        esac
+        chmod 600 "$cert_path" "$key_path" 2>/dev/null || true
+    elif [[ "$relay_type" == "hysteria2" || "$relay_type" == "tuic" || "$relay_type" == "anytls" ]]; then
         _info "正在生成中转入口自签名证书..."
         if ! openssl ecparam -genkey -name prime256v1 -out "$key_path" >/dev/null 2>&1 \
             || ! openssl req -new -x509 -days 3650 -key "$key_path" -out "$cert_path" -subj "/CN=${entrance_sni}" >/dev/null 2>&1; then
@@ -2167,7 +2224,19 @@ _finalize_relay_setup() {
     # 客户端连接地址已在生成配置前确认；IPv6 分享链接需要加方括号。
     local link_ip="$relay_server_ip"; [[ "$relay_server_ip" == *":"* ]] && link_ip="[$relay_server_ip]"
     
-    if [ "$relay_type" == "vless-xhttp-reality" ]; then
+    if [ "$relay_type" == "vless-ws-tls" ]; then
+        local uuid
+        if [ "$relay_engine" = xray ]; then
+            uuid=$("$RELAY_XRAY_BIN" uuid) || { _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"; return 1; }
+            xray_inbound=$(jq -n --arg t "$inbound_tag" --argjson p "$listen_port" --arg u "$uuid" --arg cert "$cert_path" --arg key "$key_path" --arg path "$ws_path" \
+                '{tag:$t,listen:"::",port:$p,protocol:"vless",settings:{clients:[{id:$u}],decryption:"none"},streamSettings:{network:"ws",security:"tls",tlsSettings:{certificates:[{certificateFile:$cert,keyFile:$key}],alpn:["http/1.1"]},wsSettings:{path:$path}}}') || { _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"; return 1; }
+        else
+            uuid=$("$SINGBOX_BIN" generate uuid) || { _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"; return 1; }
+            inbound_json=$(jq -n --arg t "$inbound_tag" --argjson p "$listen_port" --arg u "$uuid" --arg sn "$entrance_sni" --arg cert "$cert_path" --arg key "$key_path" --arg path "$ws_path" \
+                '{type:"vless",tag:$t,listen:"::",listen_port:$p,users:[{uuid:$u}],tls:{enabled:true,server_name:$sn,alpn:["http/1.1"],certificate_path:$cert,key_path:$key},transport:{type:"ws",path:$path}}') || { _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"; return 1; }
+        fi
+        link="vless://${uuid}@${link_ip}:${listen_port}?encryption=none&security=tls&sni=$(_url_encode "$entrance_sni")&type=ws&host=$(_url_encode "$entrance_sni")&path=$(_url_encode "$ws_path")#$(_url_encode "$node_name")"
+    elif [ "$relay_type" == "vless-xhttp-reality" ]; then
         local uuid raw_keys pk sid
         uuid=$("$RELAY_XRAY_BIN" uuid) || return 1
         raw_keys=$("$RELAY_XRAY_BIN" x25519) || return 1
@@ -2339,7 +2408,16 @@ _finalize_relay_setup() {
     
     # 构造 Clash 客户端节点，随后与 config/metadata 一起事务提交。
     local proxy_json=""
-    if [ "$relay_type" == "vless-xhttp-reality" ]; then
+    if [ "$relay_type" == "vless-ws-tls" ]; then
+        local uuid
+        if [ "$relay_engine" = xray ]; then
+            uuid=$(printf '%s' "$xray_inbound" | jq -r '.settings.clients[0].id')
+        else
+            uuid=$(printf '%s' "$inbound_json" | jq -r '.users[0].uuid')
+        fi
+        proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --argjson p "$listen_port" --arg u "$uuid" --arg sn "$entrance_sni" --arg path "$ws_path" \
+            '{name:$n,type:"vless",server:$s,port:$p,uuid:$u,encryption:"none",tls:true,udp:true,sni:$sn,network:"ws","ws-opts":{path:$path,headers:{Host:$sn}}}') || { _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"; return 1; }
+    elif [ "$relay_type" == "vless-xhttp-reality" ]; then
         local uuid=$(printf '%s' "$xray_inbound" | jq -r '.settings.clients[0].id')
         local sid=$(printf '%s' "$xray_inbound" | jq -r '.streamSettings.realitySettings.shortIds[0]')
         proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --arg p "$listen_port" --arg u "$uuid" --arg sn "$entrance_sni" --arg pbk "$pbk" --arg sid "$sid" --arg path "$xhttp_path" \
@@ -2406,11 +2484,14 @@ _finalize_relay_setup() {
         local xray_outbound
         xray_outbound=$(_xray_outbound_from_singbox "$outbound_json" "$outbound_tag") || {
             _error "该落地节点无法转换为 Xray 原生出站，未写入任何中转配置"
+            _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"
             return 1
         }
         _create_xray_direct_relay "$xray_inbound" "$xray_outbound" "$inbound_tag" "$outbound_tag" \
             "$listen_port" "$node_name" "$link" "$proxy_json" "$dest_label" "$dest_addr" "$dest_port" "$relay_type" "$listen_network"
-        return $?
+        local relay_result=$?
+        [ "$relay_result" -eq 0 ] || _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"
+        return "$relay_result"
     fi
 
     _info "正在事务写入中转配置..."
@@ -2723,7 +2804,7 @@ _clear_all_relays() {
 
     relay_tags=$(jq -c '[
         (.route.rules[]? | select(((.outbound? // "") | startswith("relay-out-"))) | .inbound),
-        (.inbounds[]? | select((.tag? // "") | test("^(vless-reality|hysteria2|tuic|anytls|shadowsocks)-in-[0-9]+$")) | .tag)
+        (.inbounds[]? | select((.tag? // "") | test("^(vless-reality|vless-ws-tls|hysteria2|tuic|anytls|shadowsocks)-in-[0-9]+$")) | .tag)
     ] | unique' "$CONFIG_FILE" 2>/dev/null)
     [ -n "$relay_tags" ] || relay_tags='[]'
 
@@ -2817,6 +2898,7 @@ _delete_xray_direct_relay() {
         return 1
     fi
     _txn_cleanup "$txn_dir"; _state_lock_release
+    rm -f -- "${RELAY_AUX_DIR}/${tag}.pem" "${RELAY_AUX_DIR}/${tag}.key"
     _success "已删除 Xray 中转链路 [$tag]"
 }
 
