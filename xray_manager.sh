@@ -1106,7 +1106,7 @@ _add_vless_reality_vision() {
 _add_vless_tcp() {
     [ -n "$server_ip" ] || server_ip=$(_get_public_ip)
     local node_ip="$server_ip" custom_ip port default_name custom_name name uuid tag inbound proxy_json link_ip link
-    _warn "纯 VLESS + TCP 不加密；仅适合可信内网或已有加密隧道。"
+    _warn "纯 VLESS + TCP 不加密；v2rayN 使用新版 Xray 核心时会拒绝公网地址，请选 sing-box 核心或改用加密协议。"
     read -r -p "请输入服务器IP (默认: ${server_ip}): " custom_ip || return 1
     node_ip=${custom_ip:-$server_ip}
     [[ -n "$node_ip" && "$node_ip" != *[[:space:]/?#@]* ]] || { _error "服务器地址无效"; return 1; }
@@ -1967,7 +1967,7 @@ _xray_add_node_menu() {
         echo -e "  ${YELLOW}[7]${NC} VLESS+gRPC+TLS"
         echo -e "  ${YELLOW}[8]${NC} Trojan+gRPC+TLS"
         echo -e "  ${CYAN}  ── 其他 ──${NC}"
-        echo -e "  ${YELLOW}[9]${NC} VLESS+TCP (可信内网)"
+        echo -e "  ${YELLOW}[9]${NC} VLESS+TCP (明文)"
         echo -e "  ${YELLOW}[10]${NC} Shadowsocks"
         echo -e "  ${RED}[0]${NC} 返回"
         echo "  ==============================="

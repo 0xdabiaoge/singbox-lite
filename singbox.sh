@@ -4854,6 +4854,7 @@ _add_vless_tcp() {
         '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":false,"network":"tcp"}')
     _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
     _success "VLESS (TCP) 节点 [${name}] 添加成功!"
+    _warn "此节点为明文 VLESS；v2rayN 使用新版 Xray 核心时会拒绝公网地址，可在核心类型设置中将 VLESS 改为 sing-box。"
     _show_node_link "vless-tcp" "$name" "$link_ip" "$port" "$tag" "$uuid" || return 1
 }
 

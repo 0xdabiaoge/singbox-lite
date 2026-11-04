@@ -2020,7 +2020,7 @@ _finalize_relay_setup() {
     # --- 选择中转入口协议 ---
     echo -e "\n  ${CYAN}【请选择本机的 [中转入口] 协议】${NC}"
     echo -e "    ${GREEN}[1]${NC} VLESS + TCP + Reality + Vision"
-    echo -e "    ${GREEN}[2]${NC} VLESS + TCP (可信内网)"
+    echo -e "    ${GREEN}[2]${NC} VLESS + TCP (明文)"
     echo -e "    ${GREEN}[3]${NC} VLESS + XHTTP + Reality (Xray)"
     echo -e "    ${GREEN}[4]${NC} Hysteria2 (sing-box)"
     echo -e "    ${GREEN}[5]${NC} TUICv5 (sing-box)"
@@ -2063,7 +2063,7 @@ _finalize_relay_setup() {
         _require_relay_core || return 1
     fi
     [ "$relay_type" != "shadowsocks" ] || listen_network="tcp+udp"
-    [ "$relay_type" != "vless-tcp" ] || _warn "纯 VLESS + TCP 不加密，仅适用于可信内网或已有加密隧道。"
+    [ "$relay_type" != "vless-tcp" ] || _warn "纯 VLESS + TCP 不加密；v2rayN 使用新版 Xray 核心时会拒绝公网地址，请选 sing-box 核心或改用加密协议。"
     if [[ "$ss_method" == 2022-* && "$relay_engine" == xray ]]; then
         _warn "Xray SS2022 依赖准确的系统时间；容器时钟偏差可能导致连接失败。"
     fi
