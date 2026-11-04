@@ -908,8 +908,8 @@ _view_xray_log() {
 }
 
 _uninstall_xray() {
-    if [ -s "$XRAY_CONFIG" ] && jq -e '.inbounds[]? | select((.tag // "") | startswith("vless-xhttp-reality-in-"))' "$XRAY_CONFIG" >/dev/null 2>&1; then
-        _error "Xray 核心仍承载 XHTTP 中转入口。请先在中转管理菜单删除这些入口，再卸载核心。"
+    if [ -s "$XRAY_CONFIG" ] && jq -e '.inbounds[]? | select((.tag // "") | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$"))' "$XRAY_CONFIG" >/dev/null 2>&1; then
+        _error "Xray 核心仍承载中转入口。请先在中转管理菜单删除这些入口，再卸载核心。"
         return 1
     fi
     echo ""
@@ -1100,6 +1100,32 @@ _add_vless_reality_vision() {
     _save_xray_meta "$tag" "$name" "$link" "publicKey=$REALITY_PUBLIC_KEY" "shortId=$REALITY_SHORT_ID" || return 1
     
     _success "VLESS+TCP+Reality+Vision 节点 [${name}] 添加成功！"
+    echo -e "  ${YELLOW}分享链接:${NC} ${link}"
+}
+
+_add_vless_tcp() {
+    [ -n "$server_ip" ] || server_ip=$(_get_public_ip)
+    local node_ip="$server_ip" custom_ip port default_name custom_name name uuid tag inbound proxy_json link_ip link
+    _warn "纯 VLESS + TCP 不加密；仅适合可信内网或已有加密隧道。"
+    read -r -p "请输入服务器IP (默认: ${server_ip}): " custom_ip || return 1
+    node_ip=${custom_ip:-$server_ip}
+    [[ -n "$node_ip" && "$node_ip" != *[[:space:]/?#@]* ]] || { _error "服务器地址无效"; return 1; }
+    port=$(_input_port) || return 1
+    default_name="X-VLESS-TCP-${port}"
+    read -r -p "请输入节点名称 (默认: ${default_name}): " custom_name || return 1
+    name=${custom_name:-$default_name}
+    uuid=$($XRAY_BIN uuid) || return 1
+    tag="xray-vless-tcp-${port}"
+    inbound=$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" \
+        '{tag:$tag,listen:"::",port:$port,protocol:"vless",settings:{clients:[{id:$uuid}],decryption:"none"},streamSettings:{network:"raw",security:"none"}}') || return 1
+    _xray_atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
+    proxy_json=$(jq -n --arg n "$name" --arg s "$node_ip" --argjson p "$port" --arg u "$uuid" \
+        '{name:$n,type:"vless",server:$s,port:$p,uuid:$u,encryption:"none",tls:false,network:"tcp"}') || return 1
+    _xray_add_node_to_yaml "$proxy_json" || return 1
+    link_ip="$node_ip"; [[ "$node_ip" == *:* ]] && link_ip="[$node_ip]"
+    link="vless://${uuid}@${link_ip}:${port}?encryption=none&type=tcp#$(_url_encode "$name")"
+    _save_xray_meta "$tag" "$name" "$link" || return 1
+    _success "VLESS + TCP 节点 [${name}] 添加成功！"
     echo -e "  ${YELLOW}分享链接:${NC} ${link}"
 }
 
@@ -1723,7 +1749,7 @@ _add_trojan_grpc_tls() {
 # ============================================================
 
 _view_xray_nodes() {
-    if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '[.inbounds[]? | select((.tag // "" | startswith("vless-xhttp-reality-in-")) | not)] | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
+    if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '[.inbounds[]? | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not)] | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
         _warn "当前没有 Xray 节点。"
         return
     fi
@@ -1742,7 +1768,7 @@ _view_xray_nodes() {
         echo -e "      协议: ${YELLOW}${desc}${NC}  |  端口: ${GREEN}${port}${NC}  |  标签: ${CYAN}${tag}${NC}"
         [ -n "$link" ] && echo -e "      ${YELLOW}分享链接:${NC} ${link}"
     done < <(jq -r --slurpfile meta "$XRAY_METADATA" '
-        .inbounds[] | select((.tag // "" | startswith("vless-xhttp-reality-in-")) | not) |
+        .inbounds[] | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not) |
         . as $in |
         ($meta[0][$in.tag] // {}) as $m |
         [
@@ -1761,7 +1787,7 @@ _view_xray_nodes() {
 }
 
 _delete_xray_node() {
-    if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '[.inbounds[]? | select((.tag // "" | startswith("vless-xhttp-reality-in-")) | not)] | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
+    if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '[.inbounds[]? | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not)] | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
         _warn "当前没有 Xray 节点可删除。"; return
     fi
     [ -f "$XRAY_METADATA" ] || echo '{}' > "$XRAY_METADATA"
@@ -1778,7 +1804,7 @@ _delete_xray_node() {
         local i=${#tags[@]}
         echo -e "  ${GREEN}[${i}]${NC} ${name} (端口: ${port})"
     done < <(jq -r --slurpfile meta "$XRAY_METADATA" '
-        .inbounds[] | select((.tag // "" | startswith("vless-xhttp-reality-in-")) | not) |
+        .inbounds[] | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not) |
         . as $in |
         ($meta[0][$in.tag] // {}) as $m |
         [$in.tag, ($in.port|tostring), ($m.name // $in.tag)] | @tsv
@@ -1816,10 +1842,10 @@ _delete_xray_node() {
 }
 
 _delete_all_xray_nodes() {
-    if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '[.inbounds[]? | select((.tag // "" | startswith("vless-xhttp-reality-in-")) | not)] | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
+    if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '[.inbounds[]? | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not)] | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
         _warn "当前没有 Xray 节点。"; return
     fi
-    local count=$(jq '[.inbounds[]? | select((.tag // "" | startswith("vless-xhttp-reality-in-")) | not)] | length' "$XRAY_CONFIG")
+    local count=$(jq '[.inbounds[]? | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not)] | length' "$XRAY_CONFIG")
     read -p "$(echo -e ${RED}"确定删除全部 ${count} 个节点? (y/N): "${NC})" confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { _info "已取消。"; return; }
     _xray_snapshot_state || { _error "无法创建变更快照。"; return 1; }
@@ -1827,12 +1853,12 @@ _delete_all_xray_nodes() {
     while IFS=$'\t' read -r tag port name; do
         if [ -n "$name" ] && ! _xray_remove_node_from_yaml "$name" "$port"; then cleanup_ok=0; fi
     done < <(jq -r --slurpfile meta "$XRAY_METADATA" '
-        .inbounds[] | select((.tag // "" | startswith("vless-xhttp-reality-in-")) | not) | [.tag, (.port|tostring), ($meta[0][.tag].name // .tag)] | @tsv' "$XRAY_CONFIG" 2>/dev/null)
+        .inbounds[] | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not) | [.tag, (.port|tostring), ($meta[0][.tag].name // .tag)] | @tsv' "$XRAY_CONFIG" 2>/dev/null)
     if [ "$cleanup_ok" -eq 1 ] && \
-       _xray_atomic_modify_json "$XRAY_CONFIG" '.inbounds = [(.inbounds // [])[] | select((.tag // "" | startswith("vless-xhttp-reality-in-")))]' && \
+       _xray_atomic_modify_json "$XRAY_CONFIG" '.inbounds = [(.inbounds // [])[] | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")))]' && \
        _xray_atomic_modify_json "$XRAY_METADATA" '{} ' && \
        _manage_xray_service restart; then
-        for tag in $(jq -r '.inbounds[] | select((.tag // "" | startswith("vless-xhttp-reality-in-")) | not) | .tag' "$snapshot/config.json" 2>/dev/null); do
+        for tag in $(jq -r '.inbounds[] | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not) | .tag' "$snapshot/config.json" 2>/dev/null); do
             rm -f -- "${XRAY_DIR}/${tag}.pem" "${XRAY_DIR}/${tag}.key"
         done
         _xray_drop_snapshot "$snapshot"
@@ -1847,7 +1873,7 @@ _delete_all_xray_nodes() {
 }
 
 _modify_xray_port() {
-    if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '[.inbounds[]? | select((.tag // "" | startswith("vless-xhttp-reality-in-")) | not)] | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
+    if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '[.inbounds[]? | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not)] | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
         _warn "当前没有 Xray 节点。"; return
     fi
     [ -f "$XRAY_METADATA" ] || echo '{}' > "$XRAY_METADATA"
@@ -1864,7 +1890,7 @@ _modify_xray_port() {
         local i=${#tags[@]}
         echo -e "  ${GREEN}[${i}]${NC} ${name} (端口: ${port})"
     done < <(jq -r --slurpfile meta "$XRAY_METADATA" '
-        .inbounds[] | select((.tag // "" | startswith("vless-xhttp-reality-in-")) | not) |
+        .inbounds[] | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not) |
         . as $in |
         ($meta[0][$in.tag] // {}) as $m |
         [$in.tag, ($in.port|tostring), ($m.name // $in.tag)] | @tsv
@@ -1941,10 +1967,11 @@ _xray_add_node_menu() {
         echo -e "  ${YELLOW}[7]${NC} VLESS+gRPC+TLS"
         echo -e "  ${YELLOW}[8]${NC} Trojan+gRPC+TLS"
         echo -e "  ${CYAN}  ── 其他 ──${NC}"
-        echo -e "  ${YELLOW}[9]${NC} Shadowsocks"
+        echo -e "  ${YELLOW}[9]${NC} VLESS+TCP (可信内网)"
+        echo -e "  ${YELLOW}[10]${NC} Shadowsocks"
         echo -e "  ${RED}[0]${NC} 返回"
         echo "  ==============================="
-        read -p "请选择 [0-9]: " choice
+        read -p "请选择 [0-10]: " choice
         if [ "$choice" != "0" ] && [ ! -f "$XRAY_BIN" ]; then
             _error "Xray 尚未安装！请先安装 Xray 核心。"
             read -p "按回车键返回..."; continue
@@ -1958,7 +1985,8 @@ _xray_add_node_menu() {
             6) _with_singboxlite_lock _run_xray_transaction _add_vless_h2_tls ;;
             7) _with_singboxlite_lock _run_xray_transaction _add_xray_vless_grpc_tls ;;
             8) _with_singboxlite_lock _run_xray_transaction _add_trojan_grpc_tls ;;
-            9) _with_singboxlite_lock _run_xray_transaction _add_shadowsocks_xray ;;
+            9) _with_singboxlite_lock _run_xray_transaction _add_vless_tcp ;;
+            10) _with_singboxlite_lock _run_xray_transaction _add_shadowsocks_xray ;;
             0) return ;;
             *) _error "无效输入" ;;
         esac
@@ -2014,7 +2042,7 @@ _xray_menu() {
                 _xray_is_pid_file_running_cmd "$XRAY_PID_FILE" "$XRAY_BIN" && xray_status="${GREEN}运行中${NC} (v${xray_ver})" || xray_status="${YELLOW}已停止${NC} (v${xray_ver})"
             fi
         fi
-        local node_count=$(jq '[.inbounds[]? | select((.tag // "" | startswith("vless-xhttp-reality-in-")) | not)] | length' "$XRAY_CONFIG" 2>/dev/null || echo "0")
+        local node_count=$(jq '[.inbounds[]? | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not)] | length' "$XRAY_CONFIG" 2>/dev/null || echo "0")
         echo -e "  状态: ${xray_status}  节点: ${GREEN}${node_count}${NC} 个"
         echo ""
         echo -e "  ${CYAN}【服务控制】${NC}"

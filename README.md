@@ -21,7 +21,7 @@
 - 节点创建、查看、删除、端口修改、批量创建和分享链接输出。
 - VLESS、Trojan、Hysteria2、TUIC、AnyTLS、Shadowsocks、SOCKS5 等协议管理。
 - VLESS-WS / Trojan-WS 的 Argo 临时隧道和固定隧道。
-- 支持本机节点 Token 与第三方落地节点两种接入流程，并可选择五种中转入口协议。
+- 支持本机节点 Token 与第三方落地节点两种接入流程，并可选择多种中转入口协议。
 - nftables 内核转发与 sing-box 用户态转发双引擎，按实际权限自动选择。
 - IPv4/IPv6 地址、域名目标、TCP、UDP、TCP+UDP 端口转发。
 - 共享状态锁、原子写入、事务快照和失败回滚，降低跨脚本并发修改造成的配置损坏风险。
@@ -183,12 +183,15 @@ sing-box 中 HTTPS 代理的出站类型仍为 `http`，通过 `tls.enabled: tru
 
 可选中转入口：
 
-- VLESS + TCP + Reality + Vision
+- VLESS + TCP + Reality + Vision（sing-box 或 Xray）
+- VLESS + TCP（sing-box 或 Xray；仅适合可信内网或已有加密隧道）
+- VLESS + XHTTP + Reality（Xray）
 - Hysteria2（可选 Salamander QUIC 混淆和端口跳跃；混淆密码会同步写入分享链接与 Clash/Mihomo 配置）
 - TUIC v5
 - AnyTLS
-- Shadowsocks `aes-256-gcm`
-- VLESS + XHTTP + Reality（需先通过 Xray 管理脚本安装 Xray 核心；入口、落地出站和路由均由 Xray 处理，不要求安装 sing-box 核心。其他五种中转入口仍使用 sing-box。）
+- Shadowsocks `aes-128-gcm`、`aes-256-gcm`、`2022-blake3-aes-128-gcm`、`2022-blake3-aes-256-gcm`（sing-box 或 Xray）
+
+Reality + Vision、纯 VLESS + TCP 和上述四种 Shadowsocks 入口在两种核心均已安装时会询问中转核心；仅安装其中一种时自动使用已安装的核心。Xray 入口由 Xray 直接完成落地出站和路由。Hysteria2、TUIC、AnyTLS 继续使用 sing-box。Xray 的 SS2022 依赖准确的系统时间。
 
 XHTTP 入口导入设置了 `insecure=1` 的 HTTPS 落地时，会固定当时获取的落地证书 SHA-256 指纹；证书更新后需重新导入该中转。普通 HTTPS 落地继续验证证书和域名。Xray 出站只支持 TCP 的 HTTP/HTTPS 代理转发，无法转发 UDP。
 
@@ -198,7 +201,7 @@ XHTTP 入口导入设置了 `insecure=1` 的 HTTPS 落地时，会固定当时�
 
 入口：主菜单 `[18]` → 进阶转发菜单 `[8]`。
 
-进入 `[18]` 不要求先安装 sing-box 核心；第三方节点导入时仅选择 XHTTP + Reality 入口可以只安装 Xray，其他中转入口仍需 sing-box 核心。查看、修改、删除 Xray 直连中转也不要求 sing-box。端口转发可在没有核心时使用 nftables 引擎，端口转发元数据继续存放在原路径，不会因此生成 sing-box 主配置。
+进入 `[18]` 不要求先安装 sing-box 核心；第三方节点导入时可选择已安装的中转核心。查看、修改、删除 Xray 直连中转也不要求 sing-box。端口转发可在没有核心时使用 nftables 引擎，端口转发元数据继续存放在原路径，不会因此生成 sing-box 主配置。
 
 ### 自动选择引擎
 
@@ -234,7 +237,8 @@ sing-box 用户态 UDP 转发的性能通常低于 nftables，但适合没有 ne
 | 6 | VLESS + XHTTP + TLS | 面向 Xray 客户端；可用于 CF H2 回源 |
 | 7 | VLESS + gRPC + TLS | 使用 CF 时需开启 gRPC 并正确配置 SSL 模式 |
 | 8 | Trojan + gRPC + TLS | 使用 CF 时需开启 gRPC 并正确配置 SSL 模式 |
-| 9 | Shadowsocks | AES-128/256-GCM、ChaCha20、XChaCha20、三种 SS2022 及 SS2022 + Padding |
+| 9 | VLESS + TCP | 明文传输，仅适合可信内网或已有加密隧道 |
+| 10 | Shadowsocks | AES-128/256-GCM、ChaCha20、XChaCha20、三种 SS2022 及 SS2022 + Padding |
 
 Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/etc/sing-box/clash.yaml`。删除和修改节点时只处理归属于目标节点的 YAML 项，避免误删另一核心的同名或相邻配置。
 仅安装 Xray 时，Xray 管理器会先初始化这份共享 YAML；以后安装 sing-box 会复用已有的非空文件，并将新节点追加到同一配置中。

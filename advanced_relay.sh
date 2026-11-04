@@ -333,10 +333,10 @@ _json_config_port_conflict() {
     [ -s "$file" ] || return 1
     jq -e --argjson port "$port" --arg proto "$proto" --arg exclude "$exclude_tag" '
         def uses_tcp:
-            if (.network? == "udp" or .type == "hysteria2" or .type == "tuic") then false else true end;
+            if (.network? == "udp" or .type == "hysteria2" or .type == "tuic" or .protocol == "hysteria") then false else true end;
         def uses_udp:
             if .network? == "tcp" then false
-            elif (.type == "hysteria2" or .type == "tuic" or .type == "shadowsocks" or .type == "socks" or .type == "direct") then true
+            elif (.type == "hysteria2" or .type == "tuic" or .type == "shadowsocks" or .type == "socks" or .type == "direct" or .protocol == "shadowsocks" or .protocol == "socks" or .protocol == "hysteria") then true
             else false end;
         any(.inbounds[]?;
             (.tag // "") != $exclude
@@ -666,7 +666,7 @@ _txn_cleanup() {
 
 _relay_xray_ready() {
     if [ ! -x "$RELAY_XRAY_BIN" ] || [ ! -s "$RELAY_XRAY_CONFIG" ] || ! jq empty "$RELAY_XRAY_CONFIG" >/dev/null 2>&1; then
-        _error "XHTTP + Reality 中转入口需要先通过 Xray 管理脚本安装 Xray 核心并初始化配置。"
+        _error "Xray 中转入口需要先通过 Xray 管理脚本安装核心并初始化配置。"
         return 1
     fi
     case "$INIT_SYSTEM" in
@@ -1922,7 +1922,7 @@ _cleanup_pending_relay_assets() {
 _create_xray_direct_relay() {
     local xray_inbound="$1" xray_outbound="$2" inbound_tag="$3" outbound_tag="$4"
     local listen_port="$5" node_name="$6" link="$7" proxy_json="$8"
-    local dest_label="$9" dest_addr="${10}" dest_port="${11}"
+    local dest_label="$9" dest_addr="${10}" dest_port="${11}" relay_type="${12}" listen_network="${13}"
     local links_file="${RELAY_AUX_DIR}/relay_links.json" txn_dir metadata tmp failed=false
     _state_lock_acquire || return 1
     txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
@@ -1933,7 +1933,7 @@ _create_xray_direct_relay() {
         _error "无法创建 Xray 中转状态快照"
         return 1
     fi
-    if _network_port_conflict "$listen_port" tcp \
+    if _network_port_conflict "$listen_port" "$listen_network" \
         || jq -e --arg tag "$inbound_tag" --arg out "$outbound_tag" \
             'any(.inbounds[]?; .tag == $tag) or any(.outbounds[]?; .tag == $out)' "$RELAY_XRAY_CONFIG" >/dev/null 2>&1 \
         || jq -e --arg tag "$inbound_tag" 'has($tag)' "$links_file" >/dev/null 2>&1; then
@@ -1949,8 +1949,8 @@ _create_xray_direct_relay() {
     fi
     metadata=$(jq -n --arg link "$link" --arg created "$(date '+%Y-%m-%d %H:%M:%S')" \
         --arg name "$node_name" --arg landing_type "$dest_label" --arg landing_addr "${dest_addr}:${dest_port}" \
-        --arg tag "$outbound_tag" --argjson port "$listen_port" '
-        {link:$link,created_at:$created,engine:"xray",relay_type:"vless-xhttp-reality",
+        --arg tag "$outbound_tag" --arg relay_type "$relay_type" --argjson port "$listen_port" '
+        {link:$link,created_at:$created,engine:"xray",relay_type:$relay_type,
          xray_outbound_tag:$tag,landing_type:$landing_type,landing_addr:$landing_addr,node_name:$name,listen_port:$port}') || failed=true
     if [ "$failed" = false ]; then
         _relay_xray_add_direct "$xray_inbound" "$xray_outbound" "$inbound_tag" || failed=true
@@ -1975,7 +1975,7 @@ _create_xray_direct_relay() {
     fi
     _txn_cleanup "$txn_dir"; _state_lock_release
     _log_operation "CREATE_XRAY_RELAY" "Port: $listen_port, Landing: ${dest_label}@${dest_addr}:${dest_port}"
-    _success "XHTTP + Reality 中转已由 Xray 单核心生效"
+    _success "${relay_type} 中转已由 Xray 生效"
     echo -e "  节点名称: ${GREEN}${node_name}${NC}"
     echo -e "  落地地址: ${CYAN}${dest_addr}:${dest_port}${NC}"
     echo -e "  本机监听: ${CYAN}${listen_port}${NC}"
@@ -2020,29 +2020,52 @@ _finalize_relay_setup() {
     # --- 选择中转入口协议 ---
     echo -e "\n  ${CYAN}【请选择本机的 [中转入口] 协议】${NC}"
     echo -e "    ${GREEN}[1]${NC} VLESS + TCP + Reality + Vision"
-    echo -e "    ${GREEN}[2]${NC} Hysteria2"
-    echo -e "    ${GREEN}[3]${NC} TUICv5"
-    echo -e "    ${GREEN}[4]${NC} AnyTLS"
-    echo -e "    ${GREEN}[5]${NC} Shadowsocks aes-256-gcm"
-    echo -e "    ${GREEN}[6]${NC} VLESS + XHTTP + Reality (需已安装 Xray 核心)"
+    echo -e "    ${GREEN}[2]${NC} VLESS + TCP (可信内网)"
+    echo -e "    ${GREEN}[3]${NC} VLESS + XHTTP + Reality (Xray)"
+    echo -e "    ${GREEN}[4]${NC} Hysteria2 (sing-box)"
+    echo -e "    ${GREEN}[5]${NC} TUICv5 (sing-box)"
+    echo -e "    ${GREEN}[6]${NC} AnyTLS (sing-box)"
+    echo -e "    ${GREEN}[7]${NC} Shadowsocks aes-128-gcm"
+    echo -e "    ${GREEN}[8]${NC} Shadowsocks aes-256-gcm"
+    echo -e "    ${GREEN}[9]${NC} Shadowsocks 2022-blake3-aes-128-gcm"
+    echo -e "    ${GREEN}[10]${NC} Shadowsocks 2022-blake3-aes-256-gcm"
     echo ""
-    read -p "  请输入选项 [1-6]: " relay_choice
+    read -p "  请输入选项 [1-10]: " relay_choice
     
-    local relay_type=""
+    local relay_type="" relay_engine="" ss_method="" engine_choice=""
     local listen_network="tcp"
     case "$relay_choice" in
         1) relay_type="vless-reality" ;;
-        2) relay_type="hysteria2"; listen_network="udp" ;;
-        3) relay_type="tuic"; listen_network="udp" ;;
-        4) relay_type="anytls" ;;
-        5) relay_type="shadowsocks" ;;
-        6) relay_type="vless-xhttp-reality" ;;
+        2) relay_type="vless-tcp" ;;
+        3) relay_type="vless-xhttp-reality"; relay_engine="xray" ;;
+        4) relay_type="hysteria2"; relay_engine="sing-box"; listen_network="udp" ;;
+        5) relay_type="tuic"; relay_engine="sing-box"; listen_network="udp" ;;
+        6) relay_type="anytls"; relay_engine="sing-box" ;;
+        7) relay_type="shadowsocks"; ss_method="aes-128-gcm" ;;
+        8) relay_type="shadowsocks"; ss_method="aes-256-gcm" ;;
+        9) relay_type="shadowsocks"; ss_method="2022-blake3-aes-128-gcm" ;;
+        10) relay_type="shadowsocks"; ss_method="2022-blake3-aes-256-gcm" ;;
         *) _error "无效选项"; return 1 ;;
     esac
-    if [ "$relay_type" = "vless-xhttp-reality" ]; then
+    if [ -z "$relay_engine" ]; then
+        if [ -x "$SINGBOX_BIN" ] && [ -x "$RELAY_XRAY_BIN" ] && [ -s "$RELAY_XRAY_CONFIG" ]; then
+            echo "  [1] sing-box  [2] Xray"
+            read -r -p "  请选择中转核心 [1-2]: " engine_choice || return 1
+            case "$engine_choice" in 1) relay_engine="sing-box" ;; 2) relay_engine="xray" ;; *) _error "无效核心选项"; return 1 ;; esac
+        elif [ -x "$SINGBOX_BIN" ]; then relay_engine="sing-box"
+        elif [ -x "$RELAY_XRAY_BIN" ] && [ -s "$RELAY_XRAY_CONFIG" ]; then relay_engine="xray"
+        else _error "请先安装 sing-box 或 Xray 核心"; return 1
+        fi
+    fi
+    if [ "$relay_engine" = "xray" ]; then
         _relay_xray_ready && _init_xray_relay_state || return 1
     else
         _require_relay_core || return 1
+    fi
+    [ "$relay_type" != "shadowsocks" ] || listen_network="tcp+udp"
+    [ "$relay_type" != "vless-tcp" ] || _warn "纯 VLESS + TCP 不加密，仅适用于可信内网或已有加密隧道。"
+    if [[ "$ss_method" == 2022-* && "$relay_engine" == xray ]]; then
+        _warn "Xray SS2022 依赖准确的系统时间；容器时钟偏差可能导致连接失败。"
     fi
     
     # 分享链接和 Clash 使用客户端连接中转入口的地址，不能假定出口 IP 就是入口 IP。
@@ -2093,7 +2116,7 @@ _finalize_relay_setup() {
     done
     
     local entrance_sni=""
-    if [ "$relay_type" != "shadowsocks" ]; then
+    if [ "$relay_type" != "shadowsocks" ] && [ "$relay_type" != "vless-tcp" ]; then
         read -p "  请输入中转机入口 SNI (回车默认 www.amd.com): " entrance_sni
         [[ -z "$entrance_sni" ]] && entrance_sni="www.amd.com"
     fi
@@ -2162,6 +2185,29 @@ _finalize_relay_setup() {
         xray_inbound=$(jq -n --arg t "$inbound_tag" --argjson p "$listen_port" --arg u "$uuid" --arg sn "$entrance_sni" --arg pk "$pk" --arg sid "$sid" --arg path "$xhttp_path" \
             '{tag:$t,listen:"::",port:$p,protocol:"vless",settings:{clients:[{id:$u,flow:""}],decryption:"none"},streamSettings:{network:"xhttp",security:"reality",realitySettings:{show:false,dest:($sn + ":443"),xver:0,serverNames:[$sn],privateKey:$pk,shortIds:[$sid]},xhttpSettings:{path:$path}}}') || return 1
         link="vless://${uuid}@${link_ip}:${listen_port}?security=reality&encryption=none&pbk=$(_url_encode "$pbk")&fp=chrome&type=xhttp&mode=auto&path=$(_url_encode "$xhttp_path")&sni=$(_url_encode "$entrance_sni")&sid=${sid}&support-x25519mlkem768=true#$(_url_encode "$node_name")"
+    elif [ "$relay_type" = "vless-tcp" ] && [ "$relay_engine" = xray ]; then
+        local uuid
+        uuid=$("$RELAY_XRAY_BIN" uuid) || return 1
+        xray_inbound=$(jq -n --arg t "$inbound_tag" --argjson p "$listen_port" --arg u "$uuid" \
+            '{tag:$t,listen:"::",port:$p,protocol:"vless",settings:{clients:[{id:$u}],decryption:"none"},streamSettings:{network:"raw",security:"none"}}') || return 1
+        link="vless://${uuid}@${link_ip}:${listen_port}?encryption=none&type=tcp#$(_url_encode "$node_name")"
+    elif [ "$relay_type" = "vless-tcp" ]; then
+        local uuid
+        uuid=$("$SINGBOX_BIN" generate uuid) || return 1
+        inbound_json=$(jq -n --arg t "$inbound_tag" --argjson p "$listen_port" --arg u "$uuid" \
+            '{type:"vless",tag:$t,listen:"::",listen_port:$p,users:[{uuid:$u}]}') || return 1
+        link="vless://${uuid}@${link_ip}:${listen_port}?encryption=none&type=tcp#$(_url_encode "$node_name")"
+    elif [ "$relay_type" = "vless-reality" ] && [ "$relay_engine" = xray ]; then
+        local uuid raw_keys pk sid flow="xtls-rprx-vision"
+        uuid=$("$RELAY_XRAY_BIN" uuid) || return 1
+        raw_keys=$("$RELAY_XRAY_BIN" x25519) || return 1
+        pk=$(printf '%s\n' "$raw_keys" | awk 'NR==1 {print $NF}')
+        pbk=$(printf '%s\n' "$raw_keys" | awk 'NR==2 {print $NF}')
+        sid=$(openssl rand -hex 8) || return 1
+        [ -n "$pk" ] && [ -n "$pbk" ] || { _error "Reality 密钥生成失败"; return 1; }
+        xray_inbound=$(jq -n --arg t "$inbound_tag" --argjson p "$listen_port" --arg u "$uuid" --arg sn "$entrance_sni" --arg pk "$pk" --arg sid "$sid" \
+            '{tag:$t,listen:"::",port:$p,protocol:"vless",settings:{clients:[{id:$u,flow:"xtls-rprx-vision"}],decryption:"none"},streamSettings:{network:"raw",security:"reality",realitySettings:{show:false,dest:($sn + ":443"),xver:0,serverNames:[$sn],privateKey:$pk,shortIds:[$sid]}}}') || return 1
+        link="vless://${uuid}@${link_ip}:${listen_port}?encryption=none&flow=${flow}&security=reality&sni=$(_url_encode "$entrance_sni")&fp=chrome&pbk=$(_url_encode "$pbk")&sid=${sid}&type=tcp&support-x25519mlkem768=true#$(_url_encode "$node_name")"
     elif [ "$relay_type" == "vless-reality" ]; then
         local uuid=$($SINGBOX_BIN generate uuid)
         keypair=$($SINGBOX_BIN generate reality-keypair)
@@ -2272,10 +2318,20 @@ _finalize_relay_setup() {
         link="anytls://${password}@${link_ip}:${listen_port}?security=tls&sni=${entrance_sni}&insecure=1&type=tcp${pin_param}#$(_url_encode "${node_name}")"
         
     elif [ "$relay_type" == "shadowsocks" ]; then
-        local method="aes-256-gcm"
-        local password=$($SINGBOX_BIN generate rand --hex 16)
-        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg m "$method" --arg pw "$password" \
-            '{"type":"shadowsocks","tag":$t,"listen":"::","listen_port":($p|tonumber),"method":$m,"password":$pw}')
+        local method="$ss_method" password="" key_bytes=16
+        case "$method" in
+            aes-128-gcm|aes-256-gcm) password=$(openssl rand -hex 16) || return 1 ;;
+            2022-blake3-aes-128-gcm) password=$(openssl rand -base64 16) || return 1 ;;
+            2022-blake3-aes-256-gcm) password=$(openssl rand -base64 32) || return 1 ;;
+            *) _error "不支持的 Shadowsocks 加密方式"; return 1 ;;
+        esac
+        if [ "$relay_engine" = xray ]; then
+            xray_inbound=$(jq -n --arg t "$inbound_tag" --argjson p "$listen_port" --arg m "$method" --arg pw "$password" \
+                '{tag:$t,listen:"::",port:$p,protocol:"shadowsocks",settings:{method:$m,password:$pw,network:"tcp,udp"}}') || return 1
+        else
+            inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg m "$method" --arg pw "$password" \
+                '{"type":"shadowsocks","tag":$t,"listen":"::","listen_port":($p|tonumber),"method":$m,"password":$pw}') || return 1
+        fi
             
         local userinfo=$(printf '%s' "${method}:${password}" | base64 | tr -d '\n\r ' | tr '+/' '-_' | tr -d '=')
         link="ss://${userinfo}@${link_ip}:${listen_port}#$(_url_encode "${node_name}")"
@@ -2288,6 +2344,21 @@ _finalize_relay_setup() {
         local sid=$(printf '%s' "$xray_inbound" | jq -r '.streamSettings.realitySettings.shortIds[0]')
         proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --arg p "$listen_port" --arg u "$uuid" --arg sn "$entrance_sni" --arg pbk "$pbk" --arg sid "$sid" --arg path "$xhttp_path" \
             '{name:$n,type:"vless",server:$s,port:($p|tonumber),uuid:$u,encryption:"none",tls:true,servername:$sn,alpn:["h2"],network:"xhttp","client-fingerprint":"chrome","reality-opts":{"public-key":$pbk,"short-id":$sid,"support-x25519mlkem768":true},"xhttp-opts":{path:$path,mode:"stream-one"}}') || return 1
+    elif [ "$relay_type" = "vless-tcp" ]; then
+        local uuid
+        if [ "$relay_engine" = xray ]; then
+            uuid=$(printf '%s' "$xray_inbound" | jq -r '.settings.clients[0].id')
+        else
+            uuid=$(printf '%s' "$inbound_json" | jq -r '.users[0].uuid')
+        fi
+        proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --argjson p "$listen_port" --arg u "$uuid" \
+            '{name:$n,type:"vless",server:$s,port:$p,uuid:$u,encryption:"none",tls:false,network:"tcp"}') || return 1
+    elif [ "$relay_type" = "vless-reality" ] && [ "$relay_engine" = xray ]; then
+        local uuid sid
+        uuid=$(printf '%s' "$xray_inbound" | jq -r '.settings.clients[0].id')
+        sid=$(printf '%s' "$xray_inbound" | jq -r '.streamSettings.realitySettings.shortIds[0]')
+        proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --argjson p "$listen_port" --arg u "$uuid" --arg sn "$entrance_sni" --arg pbk "$pbk" --arg sid "$sid" \
+            '{name:$n,type:"vless",server:$s,port:$p,uuid:$u,encryption:"none",flow:"xtls-rprx-vision",tls:true,servername:$sn,network:"tcp","client-fingerprint":"chrome","reality-opts":{"public-key":$pbk,"short-id":$sid,"support-x25519mlkem768":true}}') || return 1
     elif [ "$relay_type" == "vless-reality" ]; then
         local uuid=$(echo "$inbound_json" | jq -r '.users[0].uuid')
         local sn=$(echo "$inbound_json" | jq -r '.tls.server_name')
@@ -2314,8 +2385,14 @@ _finalize_relay_setup() {
         proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --arg p "$listen_port" --arg pw "$password" --arg sn "$sn" \
             '{name:$n,type:"anytls",server:$s,port:($p|tonumber),password:$pw,"client-fingerprint":"chrome",udp:true,sni:$sn,alpn:["h2","http/1.1"],"skip-cert-verify":true}')
     elif [ "$relay_type" == "shadowsocks" ]; then
-        local password=$(echo "$inbound_json" | jq -r '.password')
-        local method=$(echo "$inbound_json" | jq -r '.method')
+        local password method
+        if [ "$relay_engine" = xray ]; then
+            password=$(printf '%s' "$xray_inbound" | jq -r '.settings.password')
+            method=$(printf '%s' "$xray_inbound" | jq -r '.settings.method')
+        else
+            password=$(printf '%s' "$inbound_json" | jq -r '.password')
+            method=$(printf '%s' "$inbound_json" | jq -r '.method')
+        fi
         proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --arg p "$listen_port" --arg m "$method" --arg pw "$password" \
             '{name:$n,type:"ss",server:$s,port:($p|tonumber),cipher:$m,password:$pw,udp:true}')
     fi
@@ -2325,14 +2402,14 @@ _finalize_relay_setup() {
         return 1
     fi
 
-    if [ "$relay_type" = "vless-xhttp-reality" ]; then
+    if [ "$relay_engine" = xray ]; then
         local xray_outbound
         xray_outbound=$(_xray_outbound_from_singbox "$outbound_json" "$outbound_tag") || {
             _error "该落地节点无法转换为 Xray 原生出站，未写入任何中转配置"
             return 1
         }
         _create_xray_direct_relay "$xray_inbound" "$xray_outbound" "$inbound_tag" "$outbound_tag" \
-            "$listen_port" "$node_name" "$link" "$proxy_json" "$dest_label" "$dest_addr" "$dest_port"
+            "$listen_port" "$node_name" "$link" "$proxy_json" "$dest_label" "$dest_addr" "$dest_port" "$relay_type" "$listen_network"
         return $?
     fi
 
@@ -2529,7 +2606,7 @@ _view_relays() {
     local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
     local rules xray_rows
     rules=$(jq -c '.route.rules[]? | select(.inbound != null and .outbound != null and (.outbound | startswith("relay-out-")))' "$CONFIG_FILE" 2>/dev/null)
-    xray_rows=$(jq -c 'to_entries[]? | select(.value.engine == "xray" and .value.relay_type == "vless-xhttp-reality")' "$LINKS_FILE" 2>/dev/null)
+    xray_rows=$(jq -c 'to_entries[]? | select(.value.engine == "xray" and .value.xray_outbound_tag != null)' "$LINKS_FILE" 2>/dev/null)
     if [ -z "$rules" ] && [ -z "$xray_rows" ]; then
         echo -e "\n    ${YELLOW}暂无活跃中转链路${NC}"
         echo ""
@@ -2584,7 +2661,7 @@ _view_relays() {
         link=$(printf '%s' "$row" | jq -r '.value.link // empty')
         echo -e "  ${GREEN}[$i]${NC} ${YELLOW}${name}${NC}"
         echo -e "      入口索引: ${CYAN}${tag}${NC}"
-        echo -e "      中转方式: VLESS + XHTTP + Reality (Xray 单核心)"
+        echo -e "      中转方式: $(printf '%s' "$row" | jq -r '.value.relay_type') (Xray)"
         echo -e "      公网端口: ${port} (Xray)"
         echo -e "      落地目标: ${landing}"
         [ -z "$link" ] || echo -e "      分享链接: ${CYAN}${link}${NC}"
@@ -2602,7 +2679,7 @@ _clear_all_relays() {
     local CONFIG_FILE="$RELAY_CONFIG_FILE"
     local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
     local txn_dir cleanup_rows relay_tags failed="false" xray_tags="" direct_tags="" legacy_present=false xray_present=false
-    direct_tags=$(jq -r 'to_entries[]? | select(.value.engine == "xray" and .value.relay_type == "vless-xhttp-reality") | .key' "$LINKS_FILE" 2>/dev/null || true)
+    direct_tags=$(jq -r 'to_entries[]? | select(.value.engine == "xray" and .value.xray_outbound_tag != null) | .key' "$LINKS_FILE" 2>/dev/null || true)
     xray_tags=$(jq -r 'to_entries[]? | select(.value.relay_type == "vless-xhttp-reality" and .value.engine != "xray") | .key' "$LINKS_FILE" 2>/dev/null || true)
     [ -z "$xray_tags$direct_tags" ] || { xray_present=true; _relay_xray_ready || return 1; }
     if jq -e '.route.rules[]? | select((.outbound? // "") | startswith("relay-out-"))' "$CONFIG_FILE" >/dev/null 2>&1; then
@@ -2624,22 +2701,20 @@ _clear_all_relays() {
 
     local relay_config_json='{}'
     [ ! -s "$CONFIG_FILE" ] || relay_config_json=$(cat "$CONFIG_FILE")
-    cleanup_rows=$(jq -nr --argjson links "$(cat "$LINKS_FILE")" --argjson config "$relay_config_json" '
+    cleanup_rows=$(jq -nc --argjson links "$(cat "$LINKS_FILE")" --argjson config "$relay_config_json" '
         $links | to_entries[]
         | .key as $tag
-        | [
-            $tag,
-            (.value.node_name // "__SINGBOXLITE_EMPTY__"),
-            (.value.port_hopping // "__SINGBOXLITE_EMPTY__"),
-            ((.value.listen_port // ([ $config.inbounds[]? | select(.tag == $tag) | .listen_port ][0] // "")) | tostring)
-          ]
-        | @tsv
+        | {tag:$tag, node_name:(.value.node_name // ""), hop:(.value.port_hopping // ""),
+           port:((.value.listen_port // ([ $config.inbounds[]? | select(.tag == $tag) | .listen_port ][0] // "")) | tostring)}
     ' 2>/dev/null) || { _error "中转元数据读取失败，已取消清空"; _txn_cleanup "$txn_dir"; _state_lock_release; return 1; }
 
-    while IFS=$'\t' read -r tag node_name hop port; do
+    while IFS= read -r row; do
+        local tag node_name hop port
+        tag=$(printf '%s' "$row" | jq -r '.tag')
+        node_name=$(printf '%s' "$row" | jq -r '.node_name')
+        hop=$(printf '%s' "$row" | jq -r '.hop')
+        port=$(printf '%s' "$row" | jq -r '.port')
         [ -z "$tag" ] && continue
-        [ "$node_name" = "__SINGBOXLITE_EMPTY__" ] && node_name=""
-        [ "$hop" = "__SINGBOXLITE_EMPTY__" ] && hop=""
         if [ -n "$node_name" ] && ! _remove_node_from_relay_yaml "$node_name" "$port"; then
             failed="true"
             break
@@ -2689,10 +2764,13 @@ _clear_all_relays() {
     fi
 
     # 服务已接受新配置后，再精确删除中转自己的证书与 HY2 跳跃规则。
-    while IFS=$'\t' read -r tag node_name hop port; do
+    while IFS= read -r row; do
+        local tag node_name hop port
+        tag=$(printf '%s' "$row" | jq -r '.tag')
+        node_name=$(printf '%s' "$row" | jq -r '.node_name')
+        hop=$(printf '%s' "$row" | jq -r '.hop')
+        port=$(printf '%s' "$row" | jq -r '.port')
         [ -z "$tag" ] && continue
-        [ "$node_name" = "__SINGBOXLITE_EMPTY__" ] && node_name=""
-        [ "$hop" = "__SINGBOXLITE_EMPTY__" ] && hop=""
         rm -f -- "${RELAY_AUX_DIR}/${tag}.pem" "${RELAY_AUX_DIR}/${tag}.key"
         if [[ "$hop" =~ ^([0-9]+)-([0-9]+)$ ]]; then
             _nft_apply_redirect_rule delete "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$port" "singboxlite-relay-hop-${tag}"
@@ -2749,7 +2827,7 @@ _delete_relay() {
     local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
     local rules xray_rows
     rules=$(jq -c '.route.rules[]? | select(.inbound != null and .outbound != null and (.outbound | startswith("relay-out-")))' "$CONFIG_FILE" 2>/dev/null)
-    xray_rows=$(jq -c 'to_entries[]? | select(.value.engine == "xray" and .value.relay_type == "vless-xhttp-reality")' "$LINKS_FILE" 2>/dev/null)
+    xray_rows=$(jq -c 'to_entries[]? | select(.value.engine == "xray" and .value.xray_outbound_tag != null)' "$LINKS_FILE" 2>/dev/null)
     if [ -z "$rules" ] && [ -z "$xray_rows" ]; then
         echo -e "    ${YELLOW}暂无活跃中转链路${NC}"
         _menu_pause
@@ -2902,14 +2980,15 @@ _delete_relay() {
 # --- 5. 修改中转路由端口 (功能恢复) ---
 _modify_xray_direct_port() {
     local tag="$1" new_port="$2" links_file="${RELAY_AUX_DIR}/relay_links.json"
-    local old_port name old_link new_link txn_dir tmp payload failed=false
+    local old_port name old_link new_link txn_dir tmp payload failed=false network=tcp
     _relay_xray_ready && _init_xray_relay_state || return 1
     old_port=$(jq -r --arg tag "$tag" '.[$tag].listen_port // empty' "$links_file")
     name=$(jq -r --arg tag "$tag" '.[$tag].node_name // empty' "$links_file")
     old_link=$(jq -r --arg tag "$tag" '.[$tag].link // empty' "$links_file")
+    [ "$(jq -r --arg tag "$tag" '.[$tag].relay_type // empty' "$links_file")" != shadowsocks ] || network=tcp+udp
     _valid_port "$old_port" && _valid_port "$new_port" && [ -n "$name" ] || return 1
     [ "$old_port" != "$new_port" ] || { _info "端口未变化"; return 0; }
-    _network_port_conflict "$new_port" tcp "$tag" && { _error "TCP 端口 $new_port 已占用"; return 1; }
+    _network_port_conflict "$new_port" "$network" "$tag" && { _error "端口 $new_port 已占用"; return 1; }
     new_link=$(printf '%s' "$old_link" | sed -E "s/(:${old_port})([?&#\/]|$)/:${new_port}\2/g")
     _state_lock_acquire || return 1
     txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
@@ -2918,7 +2997,7 @@ _modify_xray_direct_port() {
         || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML"; then
         _txn_cleanup "$txn_dir"; _state_lock_release; return 1
     fi
-    if _network_port_conflict "$new_port" tcp "$tag" \
+    if _network_port_conflict "$new_port" "$network" "$tag" \
         || ! jq -e --arg tag "$tag" 'any(.inbounds[]?; .tag == $tag)' "$RELAY_XRAY_CONFIG" >/dev/null 2>&1; then
         _error "提交前入口端口冲突或 Xray 入口已丢失"
         failed=true
@@ -2962,7 +3041,7 @@ _modify_relay_port() {
     local CONFIG_FILE="$RELAY_CONFIG_FILE"
     local rules=$(jq -c '.route.rules[]? | select(.inbound != null and .outbound != null and ((.outbound | type) == "string") and (.outbound | startswith("relay-out-")))' "$CONFIG_FILE" 2>/dev/null)
     local xray_rows
-    xray_rows=$(jq -c 'to_entries[]? | select(.value.engine == "xray" and .value.relay_type == "vless-xhttp-reality")' "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null)
+    xray_rows=$(jq -c 'to_entries[]? | select(.value.engine == "xray" and .value.xray_outbound_tag != null)' "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null)
     
     if [ -z "$rules" ] && [ -z "$xray_rows" ]; then
         _warn "没有可修改的中转路由。"
@@ -4569,8 +4648,21 @@ _menu() {
             _is_pid_file_running_cmd "$SINGBOX_PID_FILE" "$SINGBOX_BIN" && service_status="${GREEN}● 运行中${NC}"
         fi
 
+        local xray_status="${YELLOW}○ 未安装${NC}"
+        if [ -x "$RELAY_XRAY_BIN" ]; then
+            xray_status="${RED}○ 已停止${NC}"
+            if [ "$INIT_SYSTEM" = systemd ]; then
+                systemctl is-active --quiet xray && xray_status="${GREEN}● 运行中${NC}"
+            elif [ "$INIT_SYSTEM" = openrc ]; then
+                rc-service xray status 2>/dev/null | grep -q started && xray_status="${GREEN}● 运行中${NC}"
+            else
+                _is_pid_file_running_cmd "$RELAY_XRAY_PID_FILE" "$RELAY_XRAY_BIN" && xray_status="${GREEN}● 运行中${NC}"
+            fi
+        fi
+
         echo -e "  系统版本: ${CYAN}${os_info}${NC}"
         echo -e "  中转服务: ${service_status} (${service_name})"
+        echo -e "  Xray 服务: ${xray_status} (xray)"
         echo ""
         echo -e "  ${CYAN}【基础配置】${NC}"
         echo -e "    ${GREEN}[1]${NC} 落地机：生成全协议 Token"
