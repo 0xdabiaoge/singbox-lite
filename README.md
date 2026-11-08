@@ -142,7 +142,7 @@ ShadowTLS 组合没有通用的单行分享链接，脚本会给出 Mihomo 配�
 | Shadowsocks `aes-256-gcm` | `ss://` 链接 | 不接受插件或其他加密方法 |
 | Shadowsocks `2022-blake3-aes-128-gcm` | `ss://` 链接 | Base64 密钥解码后须为 16 字节；支持单密钥及服务端密钥:用户密钥 |
 | Shadowsocks `2022-blake3-aes-256-gcm` | `ss://` 链接 | Base64 密钥解码后须为 32 字节；支持单密钥及服务端密钥:用户密钥 |
-| HTTPS / HTTP 代理 | 链接导入 | 支持 `https://`、`http://` 或 `host:port`（默认 HTTPS），支持 `?sni=` 及 `?insecure=` 参数；选择后显示输入示例 |
+| HTTPS / HTTP 代理 | 链接导入 | 支持 `https://`、`http://`、`host:port`（默认 HTTPS）及 `host:port:user:password`（明文 HTTP）；HTTPS 认证代理使用 `https://user:password@host:port`，支持 `?sni=` 及 `?insecure=` 参数；选择后显示输入示例 |
 | HTTPS / HTTP 代理 | 手动输入 | 显示 HTTPS/HTTP 示例，再输入服务器地址、端口、TLS (HTTPS) 与可选认证 |
 | SOCKS5 无认证 | 手动输入 | 输入服务器地址和端口 |
 | SOCKS5 用户名/密码认证 | 手动输入 | 输入服务器地址、端口、用户名和密码 |
@@ -194,7 +194,7 @@ sing-box 中 HTTPS 代理的出站类型仍为 `http`，通过 `tls.enabled: tru
 
 Reality + Vision、纯 VLESS + TCP、VLESS + WebSocket + TLS 和上述四种 Shadowsocks 入口在两种核心均已安装时会询问中转核心；仅安装其中一种时自动使用已安装的核心。Xray 入口由 Xray 直接完成落地出站和路由。Hysteria2、TUIC、AnyTLS 继续使用 sing-box。Xray 的 SS2022 依赖准确的系统时间。
 
-WS/TLS 中转入口需填写客户端连接地址、Cloudflare 代理域名、WebSocket 路径及回源证书。客户端连接地址填写橙云域名；使用优选 IP 时，SNI 和 WS Host 仍填写橙云域名。脚本可复制现有证书与私钥，或生成自签证书；Cloudflare Full (strict) 需要匹配域名的受信任证书或 Cloudflare Origin CA 证书，自签证书只能配合 Full。复制的证书在续签后不会自动同步，需重新导入更新后的文件。监听端口由用户选择；默认生成的分享链接和 Clash 配置使用相同端口。若在 Cloudflare 设置客户端 443 → 本机其他端口的回源规则，需把客户端配置中的端口改为 443。Xray 26.10.31 已对 WebSocket 传输发出弃用提示，因此长期使用 WS/TLS 入口更建议选择 sing-box 核心。
+WS/TLS 中转入口需填写客户端连接地址、Cloudflare 对外 HTTPS 端口、本机监听端口、Cloudflare 代理域名、WebSocket 路径及回源证书。客户端连接地址填写橙云域名；使用优选 IP 时，SNI 和 WS Host 仍填写橙云域名。可将同一域名的 `/ws0`、`/ws1` 等路径通过 Cloudflare Origin Rules 分别回源至本机不同端口；脚本生成的分享链接与 Clash 配置使用 Cloudflare 对外端口，本机入站监听各自的回源端口。脚本可复制现有证书与私钥，或生成自签证书；Cloudflare Full (strict) 需要匹配域名的受信任证书或 Cloudflare Origin CA 证书，自签证书只能配合 Full。复制的证书在续签后不会自动同步，需重新导入更新后的文件。Xray 26.10.31 已对 WebSocket 传输发出弃用提示，因此长期使用 WS/TLS 入口更建议选择 sing-box 核心。
 
 纯 VLESS + TCP 的服务端可以由 sing-box 或 Xray 运行，两者生成相同格式的分享链接。v2rayN 若选择新版 Xray 核心连接公网明文地址，会在加载客户端配置时失败；可在核心类型设置中将 VLESS 改由 sing-box 运行。该方式仍是明文传输；公网使用更建议选 Reality 等带传输加密的协议。通过加密隧道连接时，可以填写隧道内的私有地址。
 

@@ -531,6 +531,7 @@ _parse_ss_uri() {
 
 _parse_http_uri() {
     local link body authority userinfo endpoint raw_user raw_pass username password
+    local colon_user="" colon_pass=""
     local use_tls=true default_port=443 output
     link="$1"
 
@@ -548,6 +549,18 @@ _parse_http_uri() {
         body="$link"
     fi
 
+    # 常见的 HTTP 代理清单格式：host:port:user:password。该格式没有
+    # TLS 标记，按明文 HTTP 处理；HTTPS 代理必须显式使用 https://。
+    # 避免把四段式的认证信息误当成 host:port，也不根据端口号猜测协议。
+    if [[ "$link" != *://* && "$link" != *@* && "$link" != *\?* && "$link" != *\#* ]] \
+        && [[ "$link" =~ ^([^:/]+):([0-9]+):([^:]+):(.+)$ ]]; then
+        body="${BASH_REMATCH[1]}:${BASH_REMATCH[2]}"
+        colon_user="${BASH_REMATCH[3]}"
+        colon_pass="${BASH_REMATCH[4]}"
+        use_tls=false
+        default_port=80
+    fi
+
     body="${body%%#*}"
     local query="" authority="$body"
     if [[ "$body" == *\?* ]]; then
@@ -556,8 +569,8 @@ _parse_http_uri() {
     fi
     [[ -n "$authority" ]] || _fatal "HTTP 代理地址为空"
 
-    username=""
-    password=""
+    username="$colon_user"
+    password="$colon_pass"
     if [[ "$authority" == *@* ]]; then
         userinfo="${authority%@*}"
         endpoint="${authority##*@}"

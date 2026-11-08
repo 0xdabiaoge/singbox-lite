@@ -1190,11 +1190,11 @@ _validate_imported_outbound() {
             and (.tls.enabled == true)
             and (.tls.server_name | type == "string" and length > 0)
             and (.tls.insecure | type == "boolean")
-            and ((.username? == null and .password? == null) or (.username | type == "string" and length > 0 and (.password | type == "string")))
+            and ((.username? == null and .password? == null) or ((.username | type) == "string" and (.username | length) > 0 and (.password | type) == "string"))
         elif $mode == "http-proxy" then
             (only_keys(["type","tag","server","server_port"]) or only_keys(["type","tag","server","server_port","username","password"]))
             and .type == "http"
-            and ((.username? == null and .password? == null) or (.username | type == "string" and length > 0 and (.password | type == "string")))
+            and ((.username? == null and .password? == null) or ((.username | type) == "string" and (.username | length) > 0 and (.password | type) == "string"))
         elif $mode == "ss-aes-128-gcm" then
             only_keys(["type","tag","server","server_port","method","password"])
             and .type == "shadowsocks"
@@ -1498,7 +1498,7 @@ _import_link_config() {
     echo -e "    ${GREEN}[3]${NC} 纯 VLESS + TCP（链接）"
     echo -e "    ${GREEN}[4]${NC} Shadowsocks aes-128-gcm（链接）"
     echo -e "    ${GREEN}[5]${NC} Shadowsocks aes-256-gcm（链接）"
-    echo -e "    ${GREEN}[6]${NC} HTTPS / HTTP 代理（链接导入，支持 https:// 或 http://）"
+    echo -e "    ${GREEN}[6]${NC} HTTPS / HTTP 代理（链接导入，支持 URL 或 host:port:user:password）"
     echo -e "    ${GREEN}[7]${NC} HTTPS / HTTP 代理（手动输入）"
     echo -e "    ${GREEN}[8]${NC} SOCKS5 无认证（手动输入）"
     echo -e "    ${GREEN}[9]${NC} SOCKS5 用户名密码认证（手动输入）"
@@ -1546,7 +1546,10 @@ _import_link_config() {
         if [ "$parser_mode" = "https-proxy" ]; then
             echo "  HTTPS 示例：https://203.0.113.10:443?sni=proxy.example.com" >&2
             echo "  HTTP  示例：http://203.0.113.10:8080" >&2
-            _info "IP 连接域名证书请加 ?sni=证书域名；仅输入 host:port 目前按 HTTPS 处理。"
+            echo "  认证 HTTP 示例：proxy.example.com:8080:user:password" >&2
+            echo "  认证 HTTPS 示例：https://user:password@proxy.example.com:443" >&2
+            _info "四段式 host:port:user:password 按明文 HTTP 处理；host:port 按 HTTPS 处理。IP 连接域名证书请加 ?sni=证书域名。"
+            _warn "明文 HTTP 代理的用户名和密码会在中转机到落地代理的链路上明文传输。"
         fi
         read -r -p "  请输入对应类型的节点分享链接: " share_link
         [ -n "$share_link" ] || { _error "节点链接不能为空"; _menu_pause; return; }
@@ -1922,7 +1925,7 @@ _cleanup_pending_relay_assets() {
 _create_xray_direct_relay() {
     local xray_inbound="$1" xray_outbound="$2" inbound_tag="$3" outbound_tag="$4"
     local listen_port="$5" node_name="$6" link="$7" proxy_json="$8"
-    local dest_label="$9" dest_addr="${10}" dest_port="${11}" relay_type="${12}" listen_network="${13}"
+    local dest_label="$9" dest_addr="${10}" dest_port="${11}" relay_type="${12}" listen_network="${13}" client_port="${14}"
     local links_file="${RELAY_AUX_DIR}/relay_links.json" txn_dir metadata tmp failed=false
     _state_lock_acquire || return 1
     txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
@@ -1949,9 +1952,9 @@ _create_xray_direct_relay() {
     fi
     metadata=$(jq -n --arg link "$link" --arg created "$(date '+%Y-%m-%d %H:%M:%S')" \
         --arg name "$node_name" --arg landing_type "$dest_label" --arg landing_addr "${dest_addr}:${dest_port}" \
-        --arg tag "$outbound_tag" --arg relay_type "$relay_type" --argjson port "$listen_port" '
+        --arg tag "$outbound_tag" --arg relay_type "$relay_type" --argjson port "$listen_port" --argjson client_port "$client_port" '
         {link:$link,created_at:$created,engine:"xray",relay_type:$relay_type,
-         xray_outbound_tag:$tag,landing_type:$landing_type,landing_addr:$landing_addr,node_name:$name,listen_port:$port}') || failed=true
+         xray_outbound_tag:$tag,landing_type:$landing_type,landing_addr:$landing_addr,node_name:$name,listen_port:$port,client_port:$client_port}') || failed=true
     if [ "$failed" = false ]; then
         _relay_xray_add_direct "$xray_inbound" "$xray_outbound" "$inbound_tag" || failed=true
     fi
@@ -1979,6 +1982,7 @@ _create_xray_direct_relay() {
     echo -e "  节点名称: ${GREEN}${node_name}${NC}"
     echo -e "  落地地址: ${CYAN}${dest_addr}:${dest_port}${NC}"
     echo -e "  本机监听: ${CYAN}${listen_port}${NC}"
+    [ "$client_port" = "$listen_port" ] || echo -e "  客户端端口: ${CYAN}${client_port}${NC}"
     echo -e "分享链接:\n${CYAN}${link}${NC}"
     _menu_pause
 }
@@ -2123,11 +2127,15 @@ _finalize_relay_setup() {
         fi
     done
 
+    local relay_client_port="$listen_port"
     if [ "$relay_type" = "vless-ws-tls" ]; then
-        case "$listen_port" in
+        read -r -p "  请输入客户端连接 CF 的 HTTPS 端口 (回车默认 443): " relay_client_port || return 1
+        relay_client_port="${relay_client_port:-443}"
+        case "$relay_client_port" in
             443|2053|2083|2087|2096|8443) ;;
-            *) _warn "${listen_port} 不是 CF 标准代理的 HTTPS 端口；如在 CF 配置 443 → ${listen_port} 回源规则，生成的分享链接和 Clash 端口需改为 443。" ;;
+            *) _error "CF 标准代理不支持 HTTPS 端口 ${relay_client_port}；请选择 443、2053、2083、2087、2096 或 8443。"; return 1 ;;
         esac
+        _info "客户端连接 ${relay_client_port}，CF 按路径回源至本机监听端口 ${listen_port}。"
     fi
     
     local entrance_sni=""
@@ -2179,7 +2187,7 @@ _finalize_relay_setup() {
             return 1
         fi
         ws_path="/$(openssl rand -hex 8)" || return 1
-        read -r -p "  请输入 WebSocket 路径 (回车随机 ${ws_path}): " custom_path || return 1
+        read -r -p "  请输入 WebSocket 路径 (例如 /ws0，回车随机 ${ws_path}): " custom_path || return 1
         ws_path="${custom_path:-$ws_path}"
         if [[ "$ws_path" != /* || "$ws_path" == *[[:space:]?#]* ]]; then
             _error "WebSocket 路径须以 / 开头，且不能包含空白、? 或 #"
@@ -2235,7 +2243,7 @@ _finalize_relay_setup() {
             inbound_json=$(jq -n --arg t "$inbound_tag" --argjson p "$listen_port" --arg u "$uuid" --arg sn "$entrance_sni" --arg cert "$cert_path" --arg key "$key_path" --arg path "$ws_path" \
                 '{type:"vless",tag:$t,listen:"::",listen_port:$p,users:[{uuid:$u}],tls:{enabled:true,server_name:$sn,alpn:["http/1.1"],certificate_path:$cert,key_path:$key},transport:{type:"ws",path:$path}}') || { _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"; return 1; }
         fi
-        link="vless://${uuid}@${link_ip}:${listen_port}?encryption=none&security=tls&sni=$(_url_encode "$entrance_sni")&type=ws&host=$(_url_encode "$entrance_sni")&path=$(_url_encode "$ws_path")#$(_url_encode "$node_name")"
+        link="vless://${uuid}@${link_ip}:${relay_client_port}?encryption=none&security=tls&sni=$(_url_encode "$entrance_sni")&type=ws&host=$(_url_encode "$entrance_sni")&path=$(_url_encode "$ws_path")#$(_url_encode "$node_name")"
     elif [ "$relay_type" == "vless-xhttp-reality" ]; then
         local uuid raw_keys pk sid
         uuid=$("$RELAY_XRAY_BIN" uuid) || return 1
@@ -2415,7 +2423,7 @@ _finalize_relay_setup() {
         else
             uuid=$(printf '%s' "$inbound_json" | jq -r '.users[0].uuid')
         fi
-        proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --argjson p "$listen_port" --arg u "$uuid" --arg sn "$entrance_sni" --arg path "$ws_path" \
+        proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --argjson p "$relay_client_port" --arg u "$uuid" --arg sn "$entrance_sni" --arg path "$ws_path" \
             '{name:$n,type:"vless",server:$s,port:$p,uuid:$u,encryption:"none",tls:true,udp:true,sni:$sn,network:"ws","ws-opts":{path:$path,headers:{Host:$sn}}}') || { _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"; return 1; }
     elif [ "$relay_type" == "vless-xhttp-reality" ]; then
         local uuid=$(printf '%s' "$xray_inbound" | jq -r '.settings.clients[0].id')
@@ -2488,7 +2496,7 @@ _finalize_relay_setup() {
             return 1
         }
         _create_xray_direct_relay "$xray_inbound" "$xray_outbound" "$inbound_tag" "$outbound_tag" \
-            "$listen_port" "$node_name" "$link" "$proxy_json" "$dest_label" "$dest_addr" "$dest_port" "$relay_type" "$listen_network"
+            "$listen_port" "$node_name" "$link" "$proxy_json" "$dest_label" "$dest_addr" "$dest_port" "$relay_type" "$listen_network" "$relay_client_port"
         local relay_result=$?
         [ "$relay_result" -eq 0 ] || _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "" "$cert_path" "$key_path"
         return "$relay_result"
@@ -2553,8 +2561,8 @@ _finalize_relay_setup() {
 
     metadata=$(jq -n --arg link "$link" --arg created "$(date '+%Y-%m-%d %H:%M:%S')" --arg relay_type "$relay_type" \
         --arg landing_type "$dest_label" --arg landing_addr "${dest_addr}:${dest_port}" --arg node_name "$node_name" \
-        --argjson listen_port "$listen_port" --arg hop "${port_range:-}" --arg bridge_port "$bridge_port" \
-        '{link:$link,created_at:$created,relay_type:$relay_type,landing_type:$landing_type,landing_addr:$landing_addr,node_name:$node_name,listen_port:$listen_port} | if $hop != "" then .port_hopping=$hop else . end | if $bridge_port != "" then .bridge_port=($bridge_port|tonumber) else . end') || true
+        --argjson listen_port "$listen_port" --argjson client_port "$relay_client_port" --arg hop "${port_range:-}" --arg bridge_port "$bridge_port" \
+        '{link:$link,created_at:$created,relay_type:$relay_type,landing_type:$landing_type,landing_addr:$landing_addr,node_name:$node_name,listen_port:$listen_port,client_port:$client_port} | if $hop != "" then .port_hopping=$hop else . end | if $bridge_port != "" then .bridge_port=($bridge_port|tonumber) else . end') || true
     tmp=$(_make_same_dir_tmp "$LINKS_FILE") || true
     if [ -z "$metadata" ] || [ -z "$tmp" ] || ! jq --arg tag "$inbound_tag" --argjson meta "$metadata" '.[$tag] = $meta' "$LINKS_FILE" > "$tmp" \
         || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$LINKS_FILE" || ! _add_node_to_relay_yaml "$proxy_json" \
@@ -2591,6 +2599,7 @@ _finalize_relay_setup() {
     echo -e "  落地协议: ${CYAN}$dest_label${NC}"
     echo -e "  落地地址: ${CYAN}${dest_addr}:${dest_port}${NC}"
     echo -e "  本地监听: ${CYAN}$listen_port${NC}"
+    [ "$relay_client_port" = "$listen_port" ] || echo -e "  客户端端口: ${CYAN}$relay_client_port${NC}"
     echo -e "分享链接:"
     echo -e "${CYAN}$link${NC}"
     echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
@@ -2722,6 +2731,10 @@ _view_relays() {
         echo -e "  ${GREEN}[$i]${NC} ${YELLOW}${node_name}${NC}"
         echo -e "      入口索引: ${CYAN}${in_tag}${NC}"
         echo -e "      中转方式: ${relay_type}"
+        if [ "$relay_type" = "vless-ws-tls" ]; then
+            echo -e "      CF 连接端口: $(printf '%s' "$metadata" | jq -r '.client_port // .listen_port // "未知"')"
+            echo -e "      本机回源端口: $(printf '%s' "$metadata" | jq -r '.listen_port // "未知"')"
+        fi
         if [ "$relay_type" = "vless-xhttp-reality" ]; then
             echo -e "      公网端口: $(printf '%s' "$metadata" | jq -r '.listen_port // "未知"') (Xray)"
             echo -e "      本机桥接: 127.0.0.1:$(printf '%s' "$metadata" | jq -r '.bridge_port // "未知"') (sing-box)"
@@ -2734,16 +2747,18 @@ _view_relays() {
 
     while IFS= read -r row; do
         [ -n "$row" ] || continue
-        local tag name landing port link
+        local tag name landing port client_port link
         tag=$(printf '%s' "$row" | jq -r '.key')
         name=$(printf '%s' "$row" | jq -r '.value.node_name // .key')
         landing=$(printf '%s' "$row" | jq -r '.value.landing_addr // "未知"')
         port=$(printf '%s' "$row" | jq -r '.value.listen_port // "未知"')
+        client_port=$(printf '%s' "$row" | jq -r '.value.client_port // .value.listen_port // "未知"')
         link=$(printf '%s' "$row" | jq -r '.value.link // empty')
         echo -e "  ${GREEN}[$i]${NC} ${YELLOW}${name}${NC}"
         echo -e "      入口索引: ${CYAN}${tag}${NC}"
         echo -e "      中转方式: $(printf '%s' "$row" | jq -r '.value.relay_type') (Xray)"
-        echo -e "      公网端口: ${port} (Xray)"
+        echo -e "      本机监听: ${port} (Xray)"
+        [ "$client_port" = "$port" ] || echo -e "      CF 连接端口: ${client_port}"
         echo -e "      落地目标: ${landing}"
         [ -z "$link" ] || echo -e "      分享链接: ${CYAN}${link}${NC}"
         echo "  -------------------------------------------------"
@@ -2786,17 +2801,19 @@ _clear_all_relays() {
         $links | to_entries[]
         | .key as $tag
         | {tag:$tag, node_name:(.value.node_name // ""), hop:(.value.port_hopping // ""),
-           port:((.value.listen_port // ([ $config.inbounds[]? | select(.tag == $tag) | .listen_port ][0] // "")) | tostring)}
+           port:((.value.listen_port // ([ $config.inbounds[]? | select(.tag == $tag) | .listen_port ][0] // "")) | tostring),
+           yaml_port:((.value.client_port // .value.listen_port // ([ $config.inbounds[]? | select(.tag == $tag) | .listen_port ][0] // "")) | tostring)}
     ' 2>/dev/null) || { _error "中转元数据读取失败，已取消清空"; _txn_cleanup "$txn_dir"; _state_lock_release; return 1; }
 
     while IFS= read -r row; do
-        local tag node_name hop port
+        local tag node_name hop port yaml_port
         tag=$(printf '%s' "$row" | jq -r '.tag')
         node_name=$(printf '%s' "$row" | jq -r '.node_name')
         hop=$(printf '%s' "$row" | jq -r '.hop')
         port=$(printf '%s' "$row" | jq -r '.port')
+        yaml_port=$(printf '%s' "$row" | jq -r '.yaml_port')
         [ -z "$tag" ] && continue
-        if [ -n "$node_name" ] && ! _remove_node_from_relay_yaml "$node_name" "$port"; then
+        if [ -n "$node_name" ] && ! _remove_node_from_relay_yaml "$node_name" "$yaml_port"; then
             failed="true"
             break
         fi
@@ -2868,12 +2885,13 @@ _clear_all_relays() {
 }
 
 _delete_xray_direct_relay() {
-    local tag="$1" links_file="${RELAY_AUX_DIR}/relay_links.json" name port outbound_tag txn_dir failed=false
+    local tag="$1" links_file="${RELAY_AUX_DIR}/relay_links.json" name port client_port outbound_tag txn_dir failed=false
     _relay_xray_ready && _init_xray_relay_state || return 1
     name=$(jq -r --arg tag "$tag" '.[$tag].node_name // empty' "$links_file")
     port=$(jq -r --arg tag "$tag" '.[$tag].listen_port // empty' "$links_file")
+    client_port=$(jq -r --arg tag "$tag" '.[$tag].client_port // .[$tag].listen_port // empty' "$links_file")
     outbound_tag=$(jq -r --arg tag "$tag" '.[$tag].xray_outbound_tag // empty' "$links_file")
-    if ! _valid_port "$port" || [ -z "$name" ] || [ -z "$outbound_tag" ]; then
+    if ! _valid_port "$port" || ! _valid_port "$client_port" || [ -z "$name" ] || [ -z "$outbound_tag" ]; then
         _error "Xray 中转元数据不完整，已取消删除"
         return 1
     fi
@@ -2884,7 +2902,7 @@ _delete_xray_direct_relay() {
         || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML"; then
         _txn_cleanup "$txn_dir"; _state_lock_release; return 1
     fi
-    _remove_node_from_relay_yaml "$name" "$port" || failed=true
+    _remove_node_from_relay_yaml "$name" "$client_port" || failed=true
     [ "$failed" = true ] || _relay_xray_remove_direct "$tag" "$outbound_tag" || failed=true
     [ "$failed" = true ] || _atomic_modify_json "$links_file" "del(.\"$tag\")" || failed=true
     [ "$failed" = true ] || _relay_xray_restart_checked || failed=true
@@ -3003,11 +3021,13 @@ _delete_relay() {
         return 1
     fi
 
-    local node_name_yaml="" port_hopping=""
+    local node_name_yaml="" port_hopping="" relay_client_port=""
     if [ -f "$LINKS_FILE" ]; then
         node_name_yaml=$(jq -r --arg t "$in_tag" '.[$t].node_name // empty' "$LINKS_FILE")
         port_hopping=$(jq -r --arg t "$in_tag" '.[$t].port_hopping // empty' "$LINKS_FILE")
+        relay_client_port=$(jq -r --arg t "$in_tag" '.[$t].client_port // empty' "$LINKS_FILE")
     fi
+    relay_client_port="${relay_client_port:-$relay_port}"
 
     _info "正在事务删除中转链路: $in_tag -> $out_tag ..."
     local txn_dir failed="false"
@@ -3026,7 +3046,7 @@ _delete_relay() {
     _atomic_modify_json "$CONFIG_FILE" \
         ".inbounds = [(.inbounds // [])[] | select(.tag != \"$in_tag\")] | .outbounds = [(.outbounds // [])[] | select(.tag != \"$out_tag\")] | .route.rules = [(.route.rules // [])[] | select(.inbound != \"$in_tag\" and .outbound != \"$out_tag\")]" || failed="true"
     if [ "$failed" != "true" ] && [ -n "$node_name_yaml" ]; then
-        _remove_node_from_relay_yaml "$node_name_yaml" "$relay_port" || failed="true"
+        _remove_node_from_relay_yaml "$node_name_yaml" "$relay_client_port" || failed="true"
     fi
     if [ "$failed" != "true" ] && [ -f "$LINKS_FILE" ]; then
         _atomic_modify_json "$LINKS_FILE" "del(.\"$in_tag\")" || failed="true"
@@ -3062,16 +3082,20 @@ _delete_relay() {
 # --- 5. 修改中转路由端口 (功能恢复) ---
 _modify_xray_direct_port() {
     local tag="$1" new_port="$2" links_file="${RELAY_AUX_DIR}/relay_links.json"
-    local old_port name old_link new_link txn_dir tmp payload failed=false network=tcp
+    local old_port old_client_port new_client_port name old_link new_link txn_dir tmp payload failed=false network=tcp
     _relay_xray_ready && _init_xray_relay_state || return 1
     old_port=$(jq -r --arg tag "$tag" '.[$tag].listen_port // empty' "$links_file")
+    old_client_port=$(jq -r --arg tag "$tag" '.[$tag].client_port // .[$tag].listen_port // empty' "$links_file")
     name=$(jq -r --arg tag "$tag" '.[$tag].node_name // empty' "$links_file")
     old_link=$(jq -r --arg tag "$tag" '.[$tag].link // empty' "$links_file")
     [ "$(jq -r --arg tag "$tag" '.[$tag].relay_type // empty' "$links_file")" != shadowsocks ] || network=tcp+udp
-    _valid_port "$old_port" && _valid_port "$new_port" && [ -n "$name" ] || return 1
+    _valid_port "$old_port" && _valid_port "$old_client_port" && _valid_port "$new_port" && [ -n "$name" ] || return 1
     [ "$old_port" != "$new_port" ] || { _info "端口未变化"; return 0; }
     _network_port_conflict "$new_port" "$network" "$tag" && { _error "端口 $new_port 已占用"; return 1; }
-    new_link=$(printf '%s' "$old_link" | sed -E "s/(:${old_port})([?&#\/]|$)/:${new_port}\2/g")
+    new_client_port="$old_client_port"
+    [ "$old_client_port" != "$old_port" ] || new_client_port="$new_port"
+    new_link="$old_link"
+    [ "$old_client_port" = "$new_client_port" ] || new_link=$(printf '%s' "$old_link" | sed -E "s/(:${old_client_port})([?&#\/]|$)/:${new_client_port}\2/g")
     _state_lock_acquire || return 1
     txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
     if ! _txn_snapshot_file "$txn_dir" xray "$RELAY_XRAY_CONFIG" \
@@ -3092,13 +3116,13 @@ _modify_xray_direct_port() {
     if [ "$failed" = false ]; then
         tmp=$(_make_same_dir_tmp "$links_file") || failed=true
         if [ "$failed" = false ]; then
-            jq --arg tag "$tag" --arg link "$new_link" --argjson port "$new_port" \
-                '.[$tag].listen_port=$port | .[$tag].link=$link' "$links_file" > "$tmp" \
+            jq --arg tag "$tag" --arg link "$new_link" --argjson port "$new_port" --argjson client_port "$new_client_port" \
+                '.[$tag].listen_port=$port | .[$tag].client_port=$client_port | .[$tag].link=$link' "$links_file" > "$tmp" \
                 && chmod 600 "$tmp" && mv -f "$tmp" "$links_file" || failed=true
         fi
     fi
     if [ "$failed" = false ]; then
-        export OLD_RELAY_NAME="$name" OLD_RELAY_PORT="$old_port" NEW_RELAY_PORT="$new_port"
+        export OLD_RELAY_NAME="$name" OLD_RELAY_PORT="$old_client_port" NEW_RELAY_PORT="$new_client_port"
         _atomic_modify_yaml "$RELAY_CLASH_YAML" \
             '(.proxies[] | select(.name == strenv(OLD_RELAY_NAME) and .port == (env(OLD_RELAY_PORT) | tonumber)) | .port) = (env(NEW_RELAY_PORT) | tonumber)' || failed=true
     fi
@@ -3115,6 +3139,7 @@ _modify_xray_direct_port() {
     fi
     _txn_cleanup "$txn_dir"; _state_lock_release
     _success "Xray 中转入口端口已改为 $new_port"
+    [[ "$tag" != vless-ws-tls-in-* ]] || _warn "请同步将 CF Origin Rule 的该路径回源端口改为 ${new_port}；客户端连接端口仍为 ${new_client_port}。"
 }
 
 _modify_relay_port() {
@@ -3217,14 +3242,19 @@ _modify_relay_port() {
     done
     
     _info "正在修改端口..."
-    local old_node_name="" current_link="" new_link="" hop_info=""
+    local old_node_name="" current_link="" new_link="" hop_info="" old_client_port="$old_port" new_client_port=""
     if [ -f "$LINKS_FILE" ]; then
         old_node_name=$(jq -r --arg tag "$in_tag" '.[$tag].node_name // empty' "$LINKS_FILE")
         current_link=$(jq -r --arg tag "$in_tag" '.[$tag].link // empty' "$LINKS_FILE")
         hop_info=$(jq -r --arg tag "$in_tag" '.[$tag].port_hopping // empty' "$LINKS_FILE")
+        old_client_port=$(jq -r --arg tag "$in_tag" '.[$tag].client_port // .[$tag].listen_port // empty' "$LINKS_FILE")
     fi
-    if [ -n "$current_link" ]; then
-        new_link=$(printf '%s' "$current_link" | sed -E "s/(:${old_port})([?&#\/]|$)/:${new_port}\2/g")
+    old_client_port="${old_client_port:-$old_port}"
+    new_client_port="$old_client_port"
+    [ "$old_client_port" != "$old_port" ] || new_client_port="$new_port"
+    new_link="$current_link"
+    if [ -n "$current_link" ] && [ "$old_client_port" != "$new_client_port" ]; then
+        new_link=$(printf '%s' "$current_link" | sed -E "s/(:${old_client_port})([?&#\/]|$)/:${new_client_port}\2/g")
     fi
 
     local txn_dir tmp failed="false"
@@ -3256,8 +3286,8 @@ _modify_relay_port() {
     if [ "$failed" != "true" ] && [ -f "$LINKS_FILE" ]; then
         tmp=$(_make_same_dir_tmp "$LINKS_FILE") || failed="true"
         if [ "$failed" != "true" ]; then
-            if ! jq --arg tag "$in_tag" --arg link "$new_link" --argjson port "$new_port" \
-                '.[$tag].listen_port = $port | if $link != "" then .[$tag].link = $link else . end' \
+            if ! jq --arg tag "$in_tag" --arg link "$new_link" --argjson port "$new_port" --argjson client_port "$new_client_port" \
+                '.[$tag].listen_port = $port | .[$tag].client_port = $client_port | if $link != "" then .[$tag].link = $link else . end' \
                 "$LINKS_FILE" > "$tmp" || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$LINKS_FILE"; then
                 rm -f -- "$tmp"
                 failed="true"
@@ -3266,8 +3296,8 @@ _modify_relay_port() {
     fi
     if [ "$failed" != "true" ] && [ -n "$old_node_name" ]; then
         export OLD_RELAY_NAME="$old_node_name"
-        export OLD_RELAY_PORT="$old_port"
-        export NEW_RELAY_PORT="$new_port"
+        export OLD_RELAY_PORT="$old_client_port"
+        export NEW_RELAY_PORT="$new_client_port"
         _atomic_modify_yaml "$RELAY_CLASH_YAML" \
             '(.proxies[] | select(.name == strenv(OLD_RELAY_NAME) and .port == (env(OLD_RELAY_PORT) | tonumber)) | .port) = (env(NEW_RELAY_PORT) | tonumber)' || failed="true"
     fi
@@ -3309,6 +3339,7 @@ _modify_relay_port() {
     _state_lock_release
     _log_operation "MODIFY_RELAY_PORT" "Tag: $in_tag, Old Port: $old_port, New Port: $new_port"
     _success "中转端口已修改并通过组合配置校验"
+    [[ "$in_tag" != vless-ws-tls-in-* ]] || _warn "请同步将 CF Origin Rule 的该路径回源端口改为 ${new_port}；客户端连接端口仍为 ${new_client_port}。"
     _menu_pause
 }
 
