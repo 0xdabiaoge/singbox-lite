@@ -62,7 +62,9 @@ sb
 `[15]` 进入后可选择：
 
 1. 安装/更新 sing-box 最新稳定版。
-2. 安装固定版 `1.13.21`。安装成功后会写入持久版本锁，后续不能再通过脚本升级核心，只能重新安装同一固定版本。
+2. 安装固定版 `1.14.4`。安装成功后会写入持久版本锁，后续通过此菜单只能安装脚本指定的固定版。
+
+已锁定 `1.13.21` 的机器，更新脚本后可通过 `[15] → [2]` 安装 `1.14.4`。核心通过配置校验并启动成功后，版本锁才会更新为 `1.14.4`。
 
 固定版锁定状态会显示在主菜单的 sing-box 版本旁。固定版和最新版都会校验官方发布标签、资产名称、SHA-256 摘要、二进制实际版本以及现有 `config.json + relay.json` 组合配置；任一步失败都不会提交新核心。
 
@@ -110,6 +112,9 @@ sb
 | 9 | 纯 VLESS + TCP | 无 TLS/Reality；新版 Xray 客户端拒绝公网地址，可改选 sing-box 客户端核心 |
 | 10 | SOCKS5 | 本机创建的是用户名/密码认证节点 |
 | 11 | 批量创建 | 支持多协议组合、端口规划、冲突检查和整批回滚 |
+| 12 | Snell v6 | 直连，需 sing-box 1.14.0 或以上稳定版，使用 TCP 监听并支持 UDP 转发 |
+
+Snell v6 新建节点采用 `mode: default`，自动生成独立 PSK。通过主菜单查看节点可获取 sing-box／v2rayN 自定义 JSON 和 Surge 配置行，Clash Verge Rev 可使用共享 `clash.yaml`（Mihomo 1.19.34 或以上）。JSON 的本地代理默认监听 `127.0.0.1:10808`，如端口已被占用，可修改导出的本地监听端口。重置 PSK 后需重新导入客户端配置。
 
 sing-box Shadowsocks 可选项：
 
@@ -267,7 +272,7 @@ Mihomo 的 `support-x25519mlkem768` 是客户端配置字段，不写入 Xray �
 | `/usr/local/etc/sing-box/relay.json` | 中转和用户态端口转发配置 |
 | `/usr/local/etc/sing-box/clash.yaml` | sing-box/Xray 共享客户端配置 |
 | `/usr/local/etc/sing-box/metadata.json` | 主节点元数据和分享链接 |
-| `/usr/local/etc/sing-box/core-version.lock` | 固定版 `1.13.21` 的持久升级锁 |
+| `/usr/local/etc/sing-box/core-version.lock` | sing-box 固定版的持久版本锁，记录最近一次成功安装的固定版本 |
 | `/usr/local/etc/sing-box/relay.d/` | 中转、端口转发和辅助状态 |
 | `/usr/local/etc/xray/config.json` | Xray 服务端配置 |
 | `/var/log/sing-box.log` | sing-box 日志 |
