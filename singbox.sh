@@ -7420,11 +7420,11 @@ _update_script_locked() {
         return 1
     fi
 
-    local cache_bust downloaded_version script_name script_path script_url stage backup i j
+    local cache_bust downloaded_version fixed_version script_name script_path script_url stage backup i j
     local names=("singbox.sh" "advanced_relay.sh" "parser.sh" "xray_manager.sh")
     local targets=("$SELF_SCRIPT_PATH")
     local urls=()
-    local stages=() backups=() had_original=()
+    local stages=() backups=() had_original=() changed=() changed_names=()
     cache_bust=$(date +%s)
     urls+=("${SCRIPT_UPDATE_URL}?v=${cache_bust}")
 
@@ -7465,8 +7465,16 @@ _update_script_locked() {
         return 1
     fi
 
-    # 所有组件都验证成功后再建立回滚副本。任何一个替换失败都会恢复整组文件。
     for i in "${!targets[@]}"; do
+        if [ -x "${targets[$i]}" ] && cmp -s -- "${stages[$i]}" "${targets[$i]}"; then
+            continue
+        fi
+        changed+=("$i")
+        changed_names+=("${names[$i]}")
+    done
+
+    # 所有组件都验证成功后再备份待替换文件。任何一个替换失败都会恢复本次改动。
+    for i in "${changed[@]}"; do
         script_path=${targets[$i]}
         if [ -e "$script_path" ] || [ -L "$script_path" ]; then
             backup=$(mktemp "$(dirname "$script_path")/.${names[$i]}.rollback.XXXXXX") || {
@@ -7477,16 +7485,15 @@ _update_script_locked() {
                 rm -f -- "$backup" "${stages[@]}" "${backups[@]}"
                 return 1
             fi
-            backups+=("$backup")
-            had_original+=(1)
+            backups[$i]="$backup"
+            had_original[$i]=1
         else
-            backups+=("")
-            had_original+=(0)
+            had_original[$i]=0
         fi
     done
 
     local commit_failed=0
-    for i in "${!targets[@]}"; do
+    for i in "${changed[@]}"; do
         if ! chmod 755 "${stages[$i]}" || ! mv -f -- "${stages[$i]}" "${targets[$i]}"; then
             commit_failed=1
             break
@@ -7494,7 +7501,7 @@ _update_script_locked() {
     done
     if [ "$commit_failed" -ne 0 ]; then
         _error "脚本组提交失败，正在恢复更新前的全部组件。"
-        for j in "${!targets[@]}"; do
+        for j in "${changed[@]}"; do
             if [ "${had_original[$j]}" -eq 1 ] && [ -n "${backups[$j]}" ]; then
                 mv -f -- "${backups[$j]}" "${targets[$j]}" 2>/dev/null || true
             else
@@ -7506,11 +7513,19 @@ _update_script_locked() {
     fi
 
     rm -f -- "${stages[@]}" "${backups[@]}"
-    _success "脚本组件已作为一个事务完成更新：v${SCRIPT_VERSION} -> v${downloaded_version}"
+    if [ "${#changed[@]}" -eq 0 ]; then
+        _info "四个脚本组件内容均无变化（v${downloaded_version}）。"
+    else
+        _success "脚本组件已作为一个事务完成更新：v${SCRIPT_VERSION} -> v${downloaded_version}"
+        _info "已替换组件：${changed_names[*]}"
+    fi
+    fixed_version=$(sed -nE 's/^(export[[:space:]]+)?SINGBOX_FIXED_VERSION="([0-9]+\.[0-9]+\.[0-9]+)"[[:space:]]*$/v\2/p' "$SELF_SCRIPT_PATH" | tail -n 1)
+    _info "主脚本：${SELF_SCRIPT_PATH}"
+    _info "固定核心目标：${fixed_version:-未识别到明确版本}"
 
     # yq 是独立工具，不参与脚本文件事务；失败时明确提示，不伪报全部成功。
     if ! _install_yq; then
-        _warning "脚本已更新，但 yq 检查/更新失败，请检查网络后重试。"
+        _warning "yq 检查/更新失败，请检查网络后重试。"
     fi
 
     _info "请重新运行脚本以应用所有变更："
