@@ -557,8 +557,7 @@ _init_server_ip() {
 _manage_service() {
     local action="$1"
 
-    # NTP 查询失败不等于核心必然退出，但首次查询仍有等待成本。
-    # 先有界探测，再迁移脚本管理的默认配置；容器也可使用进程内时间补偿。
+    # 复用已保存的 NTP 设置，首次初始化时才探测并写入脚本管理项。
     if [[ "$action" == "restart" || "$action" == "start" ]]; then
         _time_prepare_ntp_config || return 1
         _ensure_relay_config || return 1
@@ -860,17 +859,22 @@ _time_has_ss2022() {
 }
 
 _time_prepare_ntp_config() {
-    _with_state_lock _time_prepare_ntp_config_locked
+    _with_state_lock _time_prepare_ntp_config_locked "$@"
 }
 
 _time_prepare_ntp_config_locked() {
     [ -s "$CONFIG_FILE" ] || return 0
     local current managed="" wanted server state_file="${SINGBOX_DIR}/time-sync.json"
-    local status="unreachable" previous_status="" tmp old_present config_changed=false
+    local status="unreachable" previous_status="" tmp old_present
     current=$(jq -cS '.ntp // null' "$CONFIG_FILE") || return 1
-    old_present=$(jq -r 'has("ntp")' "$CONFIG_FILE") || return 1
     [ ! -s "$state_file" ] || managed=$(jq -cS '.managed_ntp // null' "$state_file" 2>/dev/null)
     [ ! -s "$state_file" ] || previous_status=$(jq -r '.last_probe_status // empty' "$state_file" 2>/dev/null)
+    # 首次结果可为已选源或全部不可达。普通操作复用两种结果，修复菜单可强制重选。
+    if [[ "${1:-}" != --force && "$current" != null && "$current" == "$managed" ]] \
+        && [[ "$previous_status" == reachable || "$previous_status" == unreachable ]]; then
+        return 0
+    fi
+
     # 仅迁移无配置、历史默认项或与 sidecar 完全一致的脚本管理项。
     # 用户自定义服务器、间隔、detour 和显式 enabled:false 不被覆盖。
     if [ "$current" != null ] && [ "$current" != "$managed" ] && ! jq -e '
@@ -886,6 +890,7 @@ _time_prepare_ntp_config_locked() {
         return 0
     fi
 
+    old_present=$(jq -r 'has("ntp")' "$CONFIG_FILE") || return 1
     wanted='{"enabled":false}'
     for server in time.apple.com time.cloudflare.com time.google.com; do
         if _time_probe_ntp "$server" 123; then
@@ -905,7 +910,6 @@ _time_prepare_ntp_config_locked() {
             rm -f -- "$tmp"
             return 1
         fi
-        config_changed=true
     fi
     if ! mv -f "$tmp" "$state_file"; then
         _atomic_modify_json "$CONFIG_FILE" 'if $present then .ntp=$ntp else del(.ntp) end' --argjson ntp "$current" --argjson present "$old_present" || _error "恢复原 NTP 配置失败"
@@ -913,12 +917,10 @@ _time_prepare_ntp_config_locked() {
         return 1
     fi
     if [ "$status" = reachable ]; then
-        if [ "$config_changed" = true ] || [ "$previous_status" != reachable ]; then
-            _info "NTP 探测 ${TIME_PROBE_SOURCE} 可达；已配置 sing-box 每 1 分钟补偿协议时钟；系统偏差约 ${TIME_PROBE_OFFSET} 秒，未修改系统时钟。"
-        fi
+        _info "NTP 探测 ${TIME_PROBE_SOURCE} 可达；已配置 sing-box 每 1 分钟补偿协议时钟；系统偏差约 ${TIME_PROBE_OFFSET} 秒，未修改系统时钟。"
     else
         _warn "三个 NTP 时间源均未通过有界探测，暂不启用脚本管理的内置 NTP，避免拖延其他节点启动。"
-        _warn "下次启动/重启或 [11] 修复会重新探测；未校时不等于 SS2022 已可用。"
+        _warn "时间源可达后，请通过主菜单 [11] → [2] 重新探测并修复；SS2022 仍依赖系统时间。"
         _time_has_ss2022 && _warn "检测到 SS2022：系统偏差超过 30 秒时将被拒绝；请使用可达时间源或联系宿主机管理员。"
     fi
     return 0
@@ -1014,6 +1016,7 @@ _time_menu() {
             [ -x "$SINGBOX_BIN" ] && [ -s "$CONFIG_FILE" ] || { _error "请先安装 sing-box 核心及配置"; return 1; }
             read -r -p "会短暂重启 sing-box；保留自定义/显式关闭的 NTP 配置，继续？(y/N): " confirm
             [[ "$confirm" = y || "$confirm" = Y ]] || return 0
+            _time_prepare_ntp_config --force || return 1
             _manage_service restart || return 1
             _time_diagnostics
             ;;
@@ -8896,7 +8899,7 @@ main() {
             config_updated=true
         fi
 
-        # 新旧配置均按能力探测选择核心 NTP，不按 Podman/LXC 名称禁用。
+        # 兼容旧版默认配置：缺少初始化记录时补做一次 NTP 探测。
         local ntp_before ntp_after
         ntp_before=$(jq -cS '.ntp // null' "$CONFIG_FILE")
         _time_prepare_ntp_config || { _error "时间补偿配置准备失败"; return 1; }
