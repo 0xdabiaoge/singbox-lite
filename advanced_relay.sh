@@ -13,7 +13,6 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_BIN="/usr/local/bin/sing-box"
 RELAY_XRAY_BIN="/usr/local/bin/xray"
 RELAY_XRAY_CONFIG="/usr/local/etc/xray/config.json"
-RELAY_XRAY_PID_FILE="/run/xray/xray.pid"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
 
 # [整合方案] 检测父进程导出的工具函数
@@ -77,6 +76,8 @@ RELAY_CONFIG_FILE="${RELAY_AUX_DIR}/relay.json"
 STATE_LOCK_FILE="${SINGBOX_DIR}/.singboxlite.lock"
 RUN_DIR="/run/singboxlite"
 SINGBOX_PID_FILE="${RUN_DIR}/sing-box.pid"
+RELAY_XRAY_PID_FILE="${RUN_DIR}/xray.pid"
+XRAY_LEGACY_PID_FILE="/run/xray/xray.pid"
 STATE_LOCK_FD=""
 STATE_LOCK_OWNED="false"
 
@@ -383,7 +384,7 @@ _network_port_conflict() {
 _is_pid_running_cmd() {
     local pid="$1"
     local pattern="$2"
-    [ -n "$pid" ] || return 1
+    [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] || return 1
     kill -0 "$pid" 2>/dev/null || return 1
     if [ -r "/proc/${pid}/cmdline" ]; then
         tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -Fq "$pattern"
@@ -678,6 +679,37 @@ _relay_xray_ready() {
     "$RELAY_XRAY_BIN" run -test -config "$RELAY_XRAY_CONFIG" >/dev/null 2>&1 || { _error "现有 Xray 配置校验失败"; return 1; }
 }
 
+# direct 服务由三个可独立运行的脚本管理。旧中转进程在下次停止时一并回收。
+_direct_xray_pid() {
+    local action="$1" current_file="$2" binary="$3" config="$4"
+    local file pid stopped_pid="" attempt
+    for file in "$current_file" "$XRAY_LEGACY_PID_FILE"; do
+        [ -f "$file" ] && [ ! -L "$file" ] || continue
+        IFS= read -r pid < "$file" || continue
+        [[ "$pid" =~ ^[1-9][0-9]*$ && "$pid" != 1 ]] || continue
+        if [ "$pid" != "$stopped_pid" ]; then
+            # 旧路径也可能由另一套 Xray 使用，必须同时匹配程序、命令和配置文件。
+            cmp -s "/proc/$pid/cmdline" <(printf '%s\0' "$binary" run -c "$config") || continue
+            if [ "$action" = status ]; then
+                printf '%s\n' "$pid"
+                return 0
+            fi
+            kill "$pid" 2>/dev/null || { [ ! -d "/proc/$pid" ] || return 1; }
+            for ((attempt=0; attempt<50; attempt++)); do
+                cmp -s "/proc/$pid/cmdline" <(printf '%s\0' "$binary" run -c "$config") || break
+                sleep 0.1
+            done
+            if ((attempt == 50)); then
+                _error "等待 Xray 进程 $pid 停止超时，已保留 PID 文件 $file"
+                return 1
+            fi
+            stopped_pid="$pid"
+        fi
+        rm -f -- "$file" || return 1
+    done
+    [ "$action" = stop ]
+}
+
 _relay_xray_service() {
     local action="$1" pid
     case "$INIT_SYSTEM" in
@@ -697,20 +729,16 @@ _relay_xray_service() {
         direct)
             case "$action" in
                 restart)
-                    if [ -s "$RELAY_XRAY_PID_FILE" ]; then
-                        pid=$(cat "$RELAY_XRAY_PID_FILE" 2>/dev/null)
-                        _is_pid_running_cmd "$pid" "$RELAY_XRAY_BIN" && kill "$pid" 2>/dev/null || true
-                    fi
-                    rm -f -- "$RELAY_XRAY_PID_FILE"
-                    sleep 1
-                    mkdir -p /run/xray || return 1
-                    chmod 700 /run/xray 2>/dev/null || true
+                    _prepare_run_dir || return 1
+                    _direct_xray_pid stop "$RELAY_XRAY_PID_FILE" "$RELAY_XRAY_BIN" "$RELAY_XRAY_CONFIG" || return 1
+                    rm -f -- "$RELAY_XRAY_PID_FILE" || return 1
                     if [ "$STATE_LOCK_OWNED" = "true" ] && [[ "$STATE_LOCK_FD" =~ ^[0-9]+$ ]]; then
                         nohup "$RELAY_XRAY_BIN" run -c "$RELAY_XRAY_CONFIG" >> /var/log/xray.log 2>&1 8>&- 9>&- 219>&- {STATE_LOCK_FD}>&- &
                     else
                         nohup "$RELAY_XRAY_BIN" run -c "$RELAY_XRAY_CONFIG" >> /var/log/xray.log 2>&1 8>&- 9>&- 219>&- &
                     fi
-                    printf '%s\n' "$!" > "$RELAY_XRAY_PID_FILE"
+                    pid=$!
+                    printf '%s\n' "$pid" > "$RELAY_XRAY_PID_FILE" || { kill "$pid" 2>/dev/null; return 1; }
                     sleep 1
                     _is_pid_file_running_cmd "$RELAY_XRAY_PID_FILE" "$RELAY_XRAY_BIN"
                     ;;
@@ -1755,7 +1783,7 @@ _landing_config() {
                 if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
                     sni=$(${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .servername // .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
                 fi
-                [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.amd.com" # 极简保底
+                [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.analog.com" # 极简保底
 
                 local utls_json='{"enabled":true,"fingerprint":"chrome"}'
                 
@@ -1815,7 +1843,7 @@ _landing_config() {
                 if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
                     sni=$(${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni // .servername" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
                 fi
-                [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.amd.com"
+                [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.analog.com"
                 outbound_json=$(echo "$outbound_json" | jq --arg sni "$sni" '.tls = {enabled:true, server_name:$sni, insecure:true}')
             fi
             
@@ -1843,7 +1871,7 @@ _landing_config() {
             if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
                 sni=$(${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
             fi
-            [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.amd.com"
+            [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.analog.com"
 
             outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg pw "$password" --arg sni "$sni" \
                 '{"type":"hysteria2","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"password":$pw,"tls":{"enabled":true,"server_name":$sni,"insecure":true,"alpn":["h3"]}}')
@@ -1863,7 +1891,7 @@ _landing_config() {
             if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
                 sni=$(${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
             fi
-            [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.amd.com"
+            [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.analog.com"
 
             outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sni "$sni" --arg cc "$cc" \
                 '{"type":"tuic","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"uuid":$u,"password":$pw,"congestion_control":$cc,"tls":{"enabled":true,"server_name":$sni,"insecure":true,"alpn":["h3"]}}')
@@ -1876,7 +1904,7 @@ _landing_config() {
             if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
                 sni=$(${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
             fi
-            [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.amd.com"
+            [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.analog.com"
             outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg pw "$password" --arg sni "$sni" \
                 '{"type":"anytls","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"password":$pw,"tls":{"enabled":true,"server_name":$sni,"insecure":true}}')
             ;;
@@ -2147,8 +2175,8 @@ _finalize_relay_setup() {
         fi
         _info "客户端连接地址应填写该 CF 代理域名；如使用 CF 优选 IP，SNI/Host 仍须保持该域名。"
     elif [ "$relay_type" != "shadowsocks" ] && [ "$relay_type" != "vless-tcp" ]; then
-        read -p "  请输入中转机入口 SNI (回车默认 www.amd.com): " entrance_sni
-        [[ -z "$entrance_sni" ]] && entrance_sni="www.amd.com"
+        read -p "  请输入中转机入口 SNI (回车默认 www.analog.com): " entrance_sni
+        [[ -z "$entrance_sni" ]] && entrance_sni="www.analog.com"
     fi
     
     local default_name="${dest_label}-Relay-${listen_port}"
@@ -4769,7 +4797,7 @@ _menu() {
             elif [ "$INIT_SYSTEM" = openrc ]; then
                 rc-service xray status 2>/dev/null | grep -q started && xray_status="${GREEN}● 运行中${NC}"
             else
-                _is_pid_file_running_cmd "$RELAY_XRAY_PID_FILE" "$RELAY_XRAY_BIN" && xray_status="${GREEN}● 运行中${NC}"
+                _direct_xray_pid status "$RELAY_XRAY_PID_FILE" "$RELAY_XRAY_BIN" "$RELAY_XRAY_CONFIG" >/dev/null && xray_status="${GREEN}● 运行中${NC}"
             fi
         fi
 

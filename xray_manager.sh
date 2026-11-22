@@ -14,6 +14,7 @@ XRAY_CONFIG="${XRAY_DIR}/config.json"
 XRAY_METADATA="${XRAY_DIR}/metadata.json"
 XRAY_RUN_DIR="/run/singboxlite"
 XRAY_PID_FILE="${XRAY_RUN_DIR}/xray.pid"
+XRAY_LEGACY_PID_FILE="/run/xray/xray.pid"
 
 # 共享路径 (继承自 singbox.sh 或使用默认值)
 SINGBOX_DIR="${SINGBOX_DIR:-/usr/local/etc/sing-box}"
@@ -21,6 +22,13 @@ CLASH_YAML_FILE="${CLASH_YAML_FILE:-${SINGBOX_DIR}/clash.yaml}"
 YQ_BINARY="${YQ_BINARY:-/usr/local/bin/yq}"
 SINGBOXLITE_LOCK_FILE="${SINGBOX_DIR}/.singboxlite.lock"
 XRAY_STATE_LOCK_OWNED=0
+
+# 中转和普通 Xray 节点共用 config.json。旧 XHTTP 桥接入口也使用中转标签。
+XRAY_INBOUND_FILTERS='
+    def is_relay_tag: test("^(vless-reality|vless-tcp|vless-xhttp-reality|vless-ws-tls|shadowsocks)-in-[0-9]+$");
+    def is_relay_inbound: (.tag // "") | is_relay_tag;
+    def node_inbounds: .inbounds[]? | select(is_relay_inbound | not);
+'
 
 # --- 颜色定义 ---
 RED='\033[0;31m'
@@ -458,7 +466,7 @@ _xray_check_port_occupied() {
 _xray_is_pid_running_cmd() {
     local pid="$1"
     local pattern="$2"
-    [ -n "$pid" ] || return 1
+    [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] || return 1
     kill -0 "$pid" 2>/dev/null || return 1
     if [ -r "/proc/${pid}/cmdline" ]; then
         tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -Fq "$pattern"
@@ -474,6 +482,37 @@ _xray_is_pid_file_running_cmd() {
     [ -s "$pid_file" ] || return 1
     pid=$(cat "$pid_file" 2>/dev/null)
     _xray_is_pid_running_cmd "$pid" "$pattern"
+}
+
+# direct 服务由三个可独立运行的脚本管理。旧中转进程在下次停止时一并回收。
+_direct_xray_pid() {
+    local action="$1" current_file="$2" binary="$3" config="$4"
+    local file pid stopped_pid="" attempt
+    for file in "$current_file" "$XRAY_LEGACY_PID_FILE"; do
+        [ -f "$file" ] && [ ! -L "$file" ] || continue
+        IFS= read -r pid < "$file" || continue
+        [[ "$pid" =~ ^[1-9][0-9]*$ && "$pid" != 1 ]] || continue
+        if [ "$pid" != "$stopped_pid" ]; then
+            # 旧路径也可能由另一套 Xray 使用，必须同时匹配程序、命令和配置文件。
+            cmp -s "/proc/$pid/cmdline" <(printf '%s\0' "$binary" run -c "$config") || continue
+            if [ "$action" = status ]; then
+                printf '%s\n' "$pid"
+                return 0
+            fi
+            kill "$pid" 2>/dev/null || { [ ! -d "/proc/$pid" ] || return 1; }
+            for ((attempt=0; attempt<50; attempt++)); do
+                cmp -s "/proc/$pid/cmdline" <(printf '%s\0' "$binary" run -c "$config") || break
+                sleep 0.1
+            done
+            if ((attempt == 50)); then
+                _error "等待 Xray 进程 $pid 停止超时，已保留 PID 文件 $file"
+                return 1
+            fi
+            stopped_pid="$pid"
+        fi
+        rm -f -- "$file" || return 1
+    done
+    [ "$action" = stop ]
 }
 
 _check_xray_port_conflict() {
@@ -741,38 +780,32 @@ _manage_xray_service() {
         local log_file="/var/log/xray.log"
         case "$action" in
             start)
-                if _xray_is_pid_file_running_cmd "$pid_file" "$XRAY_BIN"; then
+                if _direct_xray_pid status "$pid_file" "$XRAY_BIN" "$XRAY_CONFIG" >/dev/null; then
                     :
                 else
-                    rm -f "$pid_file"
+                    rm -f -- "$pid_file" || return 1
                     nohup env GOMEMLIMIT="$(_xray_get_mem_limit)MiB" \
                         "$XRAY_BIN" run -c "$XRAY_CONFIG" >> "$log_file" 2>&1 8>&- 9>&- 219>&- &
-                    echo $! > "$pid_file"
+                    local started_pid=$!
+                    printf '%s\n' "$started_pid" > "$pid_file" || { kill "$started_pid" 2>/dev/null; return 1; }
                     sleep 1
                     _xray_is_pid_file_running_cmd "$pid_file" "$XRAY_BIN" || rc=1
                 fi
                 ;;
             stop)
-                if [ -s "$pid_file" ]; then
-                    local pid
-                    pid=$(cat "$pid_file" 2>/dev/null)
-                    if _xray_is_pid_running_cmd "$pid" "$XRAY_BIN"; then
-                        kill "$pid" 2>/dev/null
-                    fi
-                fi
-                rm -f "$pid_file"
+                _direct_xray_pid stop "$pid_file" "$XRAY_BIN" "$XRAY_CONFIG" || return 1
+                rm -f -- "$pid_file" || return 1
                 ;;
             restart)
-                _manage_xray_service stop
-                sleep 1
+                _manage_xray_service stop || return 1
                 _manage_xray_service start || rc=$?
                 ;;
             status)
-                if _xray_is_pid_file_running_cmd "$pid_file" "$XRAY_BIN"; then
-                    _success "Xray direct 后台模式运行中 (PID: $(cat "$pid_file"))"
+                local running_pid
+                if running_pid=$(_direct_xray_pid status "$pid_file" "$XRAY_BIN" "$XRAY_CONFIG"); then
+                    _success "Xray direct 后台模式运行中 (PID: ${running_pid})"
                     return 0
                 fi
-                rm -f "$pid_file"
                 _warn "Xray direct 后台模式未运行。"
                 return 1
                 ;;
@@ -833,8 +866,8 @@ EOF
 
 _check_and_fix_xray_listen() {
     [ -f "$XRAY_CONFIG" ] || return 1
-    if jq -e '.inbounds[]? | select(.listen == "0.0.0.0")' "$XRAY_CONFIG" >/dev/null 2>&1; then
-        if _xray_atomic_modify_json "$XRAY_CONFIG" '(.inbounds[]? | select(.listen == "0.0.0.0") | .listen) = "::"'; then
+    if jq -e "${XRAY_INBOUND_FILTERS}"'any(node_inbounds; .listen == "0.0.0.0")' "$XRAY_CONFIG" >/dev/null 2>&1; then
+        if _xray_atomic_modify_json "$XRAY_CONFIG" "${XRAY_INBOUND_FILTERS}"'(node_inbounds | select(.listen == "0.0.0.0") | .listen) = "::"'; then
             _success "已将既有 Xray 入站监听从 0.0.0.0 升级为 ::，支持 IPv4/IPv6 双栈。"
             return 0
         fi
@@ -908,9 +941,13 @@ _view_xray_log() {
 }
 
 _uninstall_xray() {
-    if [ -s "$XRAY_CONFIG" ] && jq -e '.inbounds[]? | select((.tag // "") | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$"))' "$XRAY_CONFIG" >/dev/null 2>&1; then
-        _error "Xray 核心仍承载中转入口。请先在中转管理菜单删除这些入口，再卸载核心。"
-        return 1
+    if [ -s "$XRAY_CONFIG" ]; then
+        local has_relays
+        has_relays=$(jq "${XRAY_INBOUND_FILTERS}"'any(.inbounds[]?; is_relay_inbound)' "$XRAY_CONFIG") || return 1
+        if [ "$has_relays" = true ]; then
+            _error "Xray 核心仍承载中转入口。请先在中转管理菜单删除这些入口，再卸载核心。"
+            return 1
+        fi
     fi
     echo ""
     _warn "即将卸载 Xray 核心及其所有配置！"
@@ -921,7 +958,7 @@ _uninstall_xray() {
     fi
     
     # 停止服务
-    _manage_xray_service "stop"
+    _manage_xray_service "stop" || return 1
     
     # 从 clash.yaml 中清理节点
     if [ -f "$XRAY_METADATA" ] && [ -f "$CLASH_YAML_FILE" ]; then
@@ -1052,9 +1089,9 @@ _add_vless_reality_vision() {
     node_ip=${custom_ip:-$server_ip}
     
     local port=$(_input_port)
-    local sni="www.amd.com"
-    read -p "请输入伪装域名 SNI (默认: www.amd.com): " custom_sni
-    sni=${custom_sni:-www.amd.com}
+    local sni="www.analog.com"
+    read -p "请输入伪装域名 SNI (默认: www.analog.com): " custom_sni
+    sni=${custom_sni:-www.analog.com}
     
     local default_name="X-VLESS-TCP-REALITY-VISION-${port}"
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
@@ -1141,9 +1178,9 @@ _add_vless_grpc_reality() {
     node_ip=${custom_ip:-$server_ip}
     
     local port=$(_input_port)
-    local sni="www.amd.com"
-    read -p "请输入伪装域名 SNI (默认: www.amd.com): " custom_sni
-    sni=${custom_sni:-www.amd.com}
+    local sni="www.analog.com"
+    read -p "请输入伪装域名 SNI (默认: www.analog.com): " custom_sni
+    sni=${custom_sni:-www.analog.com}
     
     local service_name="grpc"
     read -p "请输入 gRPC serviceName (默认: grpc): " custom_svc
@@ -1196,8 +1233,8 @@ _add_vless_xhttp_reality() {
     node_ip=${custom_ip:-$server_ip}
 
     local port=$(_input_port)
-    local sni="www.amd.com" custom_sni
-    read -p "请输入伪装域名 SNI (默认: www.amd.com): " custom_sni
+    local sni="www.analog.com" custom_sni
+    read -p "请输入伪装域名 SNI (默认: www.analog.com): " custom_sni
     sni=${custom_sni:-$sni}
 
     local path="/$(openssl rand -hex 6)" custom_path
@@ -1258,9 +1295,9 @@ _add_trojan_xhttp_reality() {
     node_ip=${custom_ip:-$server_ip}
     
     local port=$(_input_port)
-    local sni="www.amd.com"
-    read -p "请输入伪装域名 SNI (默认: www.amd.com): " custom_sni
-    sni=${custom_sni:-www.amd.com}
+    local sni="www.analog.com"
+    read -p "请输入伪装域名 SNI (默认: www.analog.com): " custom_sni
+    sni=${custom_sni:-www.analog.com}
     
     local path="/$(openssl rand -hex 6)"
     read -p "请输入 XHTTP 路径 (默认: ${path}): " custom_path
@@ -1309,9 +1346,9 @@ _add_trojan_grpc_reality() {
     node_ip=${custom_ip:-$server_ip}
     
     local port=$(_input_port)
-    local sni="www.amd.com"
-    read -p "请输入伪装域名 SNI (默认: www.amd.com): " custom_sni
-    sni=${custom_sni:-www.amd.com}
+    local sni="www.analog.com"
+    read -p "请输入伪装域名 SNI (默认: www.analog.com): " custom_sni
+    sni=${custom_sni:-www.analog.com}
     
     local service_name="trojan-grpc"
     read -p "请输入 gRPC serviceName (默认: trojan-grpc): " custom_svc
@@ -1503,9 +1540,9 @@ _add_vless_h2_tls() {
     node_ip=${custom_ip:-$server_ip}
     
     local port=$(_input_port)
-    local sni="www.amd.com"
-    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.amd.com): " custom_sni
-    sni=${custom_sni:-www.amd.com}
+    local sni="www.analog.com"
+    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.analog.com): " custom_sni
+    sni=${custom_sni:-www.analog.com}
     
     local path="/$(openssl rand -hex 6)"
     read -p "请输入 H2 路径 (默认: ${path}): " custom_path
@@ -1589,9 +1626,9 @@ _add_xray_vless_grpc_tls() {
     node_ip=${custom_ip:-$server_ip}
     
     local port=$(_input_port)
-    local sni="www.amd.com"
-    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.amd.com): " custom_sni
-    sni=${custom_sni:-www.amd.com}
+    local sni="www.analog.com"
+    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.analog.com): " custom_sni
+    sni=${custom_sni:-www.analog.com}
     
     local service_name="grpc-$(openssl rand -hex 4)"
     read -p "请输入 gRPC serviceName (默认: ${service_name}): " custom_svc
@@ -1673,9 +1710,9 @@ _add_trojan_grpc_tls() {
     node_ip=${custom_ip:-$server_ip}
     
     local port=$(_input_port)
-    local sni="www.amd.com"
-    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.amd.com): " custom_sni
-    sni=${custom_sni:-www.amd.com}
+    local sni="www.analog.com"
+    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.analog.com): " custom_sni
+    sni=${custom_sni:-www.analog.com}
     
     local service_name="grpc-$(openssl rand -hex 4)"
     read -p "请输入 gRPC serviceName (默认: ${service_name}): " custom_svc
@@ -1748,8 +1785,12 @@ _add_trojan_grpc_tls() {
 #                     节点管理
 # ============================================================
 
+_xray_node_count() {
+    jq "${XRAY_INBOUND_FILTERS}"'[node_inbounds] | length' "$XRAY_CONFIG"
+}
+
 _view_xray_nodes() {
-    if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '[.inbounds[]? | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not)] | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
+    if [[ $(_xray_node_count 2>/dev/null) -eq 0 ]]; then
         _warn "当前没有 Xray 节点。"
         return
     fi
@@ -1767,9 +1808,8 @@ _view_xray_nodes() {
         echo -e "  ${GREEN}[${count}]${NC} ${CYAN}${name}${NC}"
         echo -e "      协议: ${YELLOW}${desc}${NC}  |  端口: ${GREEN}${port}${NC}  |  标签: ${CYAN}${tag}${NC}"
         [ -n "$link" ] && echo -e "      ${YELLOW}分享链接:${NC} ${link}"
-    done < <(jq -r --slurpfile meta "$XRAY_METADATA" '
-        .inbounds[] | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not) |
-        . as $in |
+    done < <(jq -r --slurpfile meta "$XRAY_METADATA" "${XRAY_INBOUND_FILTERS}"'
+        node_inbounds as $in |
         ($meta[0][$in.tag] // {}) as $m |
         [
             $in.tag,
@@ -1787,7 +1827,7 @@ _view_xray_nodes() {
 }
 
 _delete_xray_node() {
-    if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '[.inbounds[]? | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not)] | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
+    if [[ $(_xray_node_count 2>/dev/null) -eq 0 ]]; then
         _warn "当前没有 Xray 节点可删除。"; return
     fi
     [ -f "$XRAY_METADATA" ] || echo '{}' > "$XRAY_METADATA"
@@ -1803,9 +1843,8 @@ _delete_xray_node() {
         names+=("$name")
         local i=${#tags[@]}
         echo -e "  ${GREEN}[${i}]${NC} ${name} (端口: ${port})"
-    done < <(jq -r --slurpfile meta "$XRAY_METADATA" '
-        .inbounds[] | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not) |
-        . as $in |
+    done < <(jq -r --slurpfile meta "$XRAY_METADATA" "${XRAY_INBOUND_FILTERS}"'
+        node_inbounds as $in |
         ($meta[0][$in.tag] // {}) as $m |
         [$in.tag, ($in.port|tostring), ($m.name // $in.tag)] | @tsv
     ' "$XRAY_CONFIG" 2>/dev/null)
@@ -1842,23 +1881,24 @@ _delete_xray_node() {
 }
 
 _delete_all_xray_nodes() {
-    if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '[.inbounds[]? | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not)] | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
+    local count
+    count=$(_xray_node_count 2>/dev/null) || return 1
+    if [ "$count" -eq 0 ]; then
         _warn "当前没有 Xray 节点。"; return
     fi
-    local count=$(jq '[.inbounds[]? | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not)] | length' "$XRAY_CONFIG")
     read -p "$(echo -e ${RED}"确定删除全部 ${count} 个节点? (y/N): "${NC})" confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { _info "已取消。"; return; }
     _xray_snapshot_state || { _error "无法创建变更快照。"; return 1; }
     local snapshot="$XRAY_TX_DIR" cleanup_ok=1 tag name port
     while IFS=$'\t' read -r tag port name; do
         if [ -n "$name" ] && ! _xray_remove_node_from_yaml "$name" "$port"; then cleanup_ok=0; fi
-    done < <(jq -r --slurpfile meta "$XRAY_METADATA" '
-        .inbounds[] | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not) | [.tag, (.port|tostring), ($meta[0][.tag].name // .tag)] | @tsv' "$XRAY_CONFIG" 2>/dev/null)
+    done < <(jq -r --slurpfile meta "$XRAY_METADATA" "${XRAY_INBOUND_FILTERS}"'
+        node_inbounds | [.tag, (.port|tostring), ($meta[0][.tag].name // .tag)] | @tsv' "$XRAY_CONFIG" 2>/dev/null)
     if [ "$cleanup_ok" -eq 1 ] && \
-       _xray_atomic_modify_json "$XRAY_CONFIG" '.inbounds = [(.inbounds // [])[] | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")))]' && \
-       _xray_atomic_modify_json "$XRAY_METADATA" '{} ' && \
+        _xray_atomic_modify_json "$XRAY_CONFIG" "${XRAY_INBOUND_FILTERS}"'.inbounds = [.inbounds[]? | select(is_relay_inbound)]' && \
+        _xray_atomic_modify_json "$XRAY_METADATA" "${XRAY_INBOUND_FILTERS}"'with_entries(select(.key | is_relay_tag))' && \
        _manage_xray_service restart; then
-        for tag in $(jq -r '.inbounds[] | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not) | .tag' "$snapshot/config.json" 2>/dev/null); do
+        for tag in $(jq -r "${XRAY_INBOUND_FILTERS}"'node_inbounds | .tag' "$snapshot/config.json" 2>/dev/null); do
             rm -f -- "${XRAY_DIR}/${tag}.pem" "${XRAY_DIR}/${tag}.key"
         done
         _xray_drop_snapshot "$snapshot"
@@ -1873,7 +1913,7 @@ _delete_all_xray_nodes() {
 }
 
 _modify_xray_port() {
-    if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '[.inbounds[]? | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not)] | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
+    if [[ $(_xray_node_count 2>/dev/null) -eq 0 ]]; then
         _warn "当前没有 Xray 节点。"; return
     fi
     [ -f "$XRAY_METADATA" ] || echo '{}' > "$XRAY_METADATA"
@@ -1889,9 +1929,8 @@ _modify_xray_port() {
         names+=("$name")
         local i=${#tags[@]}
         echo -e "  ${GREEN}[${i}]${NC} ${name} (端口: ${port})"
-    done < <(jq -r --slurpfile meta "$XRAY_METADATA" '
-        .inbounds[] | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not) |
-        . as $in |
+    done < <(jq -r --slurpfile meta "$XRAY_METADATA" "${XRAY_INBOUND_FILTERS}"'
+        node_inbounds as $in |
         ($meta[0][$in.tag] // {}) as $m |
         [$in.tag, ($in.port|tostring), ($m.name // $in.tag)] | @tsv
     ' "$XRAY_CONFIG" 2>/dev/null)
@@ -2039,10 +2078,10 @@ _xray_menu() {
             elif [ "$INIT_SYSTEM" == "openrc" ]; then
                 rc-service xray status >/dev/null 2>&1 && xray_status="${GREEN}运行中${NC} (v${xray_ver})" || xray_status="${YELLOW}已停止${NC} (v${xray_ver})"
             else
-                _xray_is_pid_file_running_cmd "$XRAY_PID_FILE" "$XRAY_BIN" && xray_status="${GREEN}运行中${NC} (v${xray_ver})" || xray_status="${YELLOW}已停止${NC} (v${xray_ver})"
+                _direct_xray_pid status "$XRAY_PID_FILE" "$XRAY_BIN" "$XRAY_CONFIG" >/dev/null && xray_status="${GREEN}运行中${NC} (v${xray_ver})" || xray_status="${YELLOW}已停止${NC} (v${xray_ver})"
             fi
         fi
-        local node_count=$(jq '[.inbounds[]? | select((.tag // "" | test("^(vless-xhttp-reality|vless-reality|vless-tcp|shadowsocks)-in-[0-9]+$")) | not)] | length' "$XRAY_CONFIG" 2>/dev/null || echo "0")
+        local node_count=$(_xray_node_count 2>/dev/null || echo "0")
         echo -e "  状态: ${xray_status}  节点: ${GREEN}${node_count}${NC} 个"
         echo ""
         echo -e "  ${CYAN}【服务控制】${NC}"
@@ -2063,9 +2102,9 @@ _xray_menu() {
         echo "  =============================="
         read -p "请选择 [0-99]: " choice
         case $choice in
-            1) _manage_xray_service "start"; read -p "按回车键继续..." ;;
-            2) _manage_xray_service "stop"; read -p "按回车键继续..." ;;
-            3) _manage_xray_service "restart"; read -p "按回车键继续..." ;;
+            1) _with_singboxlite_lock _manage_xray_service "start"; read -p "按回车键继续..." ;;
+            2) _with_singboxlite_lock _manage_xray_service "stop"; read -p "按回车键继续..." ;;
+            3) _with_singboxlite_lock _manage_xray_service "restart"; read -p "按回车键继续..." ;;
             4) _manage_xray_service "status"; read -p "按回车键继续..." ;;
             5) _view_xray_log ;;
             6) _xray_add_node_menu ;;

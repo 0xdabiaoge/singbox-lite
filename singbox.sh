@@ -7,7 +7,7 @@ umask 077
 
 # 基础路径定义
 export SCRIPT_VERSION="30"
-export DEFAULT_SNI="www.amd.com"
+export DEFAULT_SNI="www.analog.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
@@ -240,6 +240,37 @@ _is_pid_file_running_cmd() {
     [ -s "$pid_file" ] || return 1
     pid=$(cat "$pid_file" 2>/dev/null)
     _is_pid_running_cmd "$pid" "$pattern"
+}
+
+# direct 服务由三个可独立运行的脚本管理。旧中转进程在下次停止时一并回收。
+_direct_xray_pid() {
+    local action="$1" current_file="$2" binary="$3" config="$4"
+    local file pid stopped_pid="" attempt
+    for file in "$current_file" "$XRAY_LEGACY_PID_FILE"; do
+        [ -f "$file" ] && [ ! -L "$file" ] || continue
+        IFS= read -r pid < "$file" || continue
+        [[ "$pid" =~ ^[1-9][0-9]*$ && "$pid" != 1 ]] || continue
+        if [ "$pid" != "$stopped_pid" ]; then
+            # 旧路径也可能由另一套 Xray 使用，必须同时匹配程序、命令和配置文件。
+            cmp -s "/proc/$pid/cmdline" <(printf '%s\0' "$binary" run -c "$config") || continue
+            if [ "$action" = status ]; then
+                printf '%s\n' "$pid"
+                return 0
+            fi
+            kill "$pid" 2>/dev/null || { [ ! -d "/proc/$pid" ] || return 1; }
+            for ((attempt=0; attempt<50; attempt++)); do
+                cmp -s "/proc/$pid/cmdline" <(printf '%s\0' "$binary" run -c "$config") || break
+                sleep 0.1
+            done
+            if ((attempt == 50)); then
+                _error "等待 Xray 进程 $pid 停止超时，已保留 PID 文件 $file"
+                return 1
+            fi
+            stopped_pid="$pid"
+        fi
+        rm -f -- "$file" || return 1
+    done
+    [ "$action" = stop ]
 }
 
 _prepare_singbox_runtime_pid() {
@@ -1346,6 +1377,7 @@ export PID_FILE="${RUNTIME_DIR}/sing-box.pid"
 export CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
 export XRAY_RUNTIME_DIR="${RUNTIME_DIR}"
 export XRAY_PID_FILE="${XRAY_RUNTIME_DIR}/xray.pid"
+XRAY_LEGACY_PID_FILE="/run/xray/xray.pid"
 export DEP_STATE_FILE="${SINGBOX_DIR}/dependencies.ok"
 export DEP_STATE_VERSION="20260831-lowmem-1"
 _detect_init_system
@@ -3327,6 +3359,10 @@ _uninstall() {
     read -p "$(echo -e ${YELLOW}"确定要执行卸载吗? (y/N): "${NC})" confirm_main
     [[ "$confirm_main" != "y" && "$confirm_main" != "Y" ]] && _info "卸载已取消。" && return
 
+    if [ "$INIT_SYSTEM" = direct ]; then
+        _with_state_lock _direct_xray_pid stop "$XRAY_PID_FILE" /usr/local/bin/xray /usr/local/etc/xray/config.json || return 1
+    fi
+
     # 1. Argo 必须在删除元数据前停止，否则会失去受控 PID 到端口的映射，
     # 留下仍在运行的 cloudflared 进程。
     _disable_argo_watchdog 2>/dev/null || true
@@ -4659,12 +4695,12 @@ _add_anytls() {
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
-    local server_name="www.amd.com"
+    local server_name="www.analog.com"
     local mode_choice="1"
 
     if [ "$BATCH_MODE" = "true" ]; then
         port="$BATCH_PORT"
-        server_name="${BATCH_SNI:-www.amd.com}"
+        server_name="${BATCH_SNI:-www.analog.com}"
         mode_choice="${BATCH_ANYTLS_MODE:-1}"
     else
         _info "--- 添加 AnyTLS / Any-Reality 节点 ---"
@@ -4696,8 +4732,8 @@ _add_anytls() {
             fi
             break
         done
-        read -p "请输入伪装域名/SNI (默认: www.amd.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.amd.com"}
+        read -p "请输入伪装域名/SNI (默认: www.analog.com): " camouflage_domain
+        server_name=${camouflage_domain:-"www.analog.com"}
     fi
 
     local password=""
@@ -4763,7 +4799,7 @@ _add_vless_reality() {
     [ -z "$server_ip" ] && server_ip=$(_get_ip)
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
-    local server_name="www.amd.com"
+    local server_name="www.analog.com"
     local port=""
     local name=""
 
@@ -4778,8 +4814,8 @@ _add_vless_reality() {
     else
         read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
         node_ip=${custom_ip:-$server_ip}
-        read -p "请输入伪装域名 (默认: www.amd.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.amd.com"}
+        read -p "请输入伪装域名 (默认: www.analog.com): " camouflage_domain
+        server_name=${camouflage_domain:-"www.analog.com"}
         while true; do
             read -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
@@ -4866,7 +4902,7 @@ _add_hysteria2() {
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
-    local server_name="www.amd.com"
+    local server_name="www.analog.com"
     local obfs_password=""
     local port_hopping=""
     local use_multiport="false"
@@ -4917,8 +4953,8 @@ _add_hysteria2() {
             _check_port_conflict "$port" "udp" && continue
             break
         done
-        read -p "请输入伪装域名 (默认: www.amd.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.amd.com"}
+        read -p "请输入伪装域名 (默认: www.analog.com): " camouflage_domain
+        server_name=${camouflage_domain:-"www.analog.com"}
     fi
 
     local tag="hy2-in-${port}"
@@ -5068,11 +5104,11 @@ _add_tuic() {
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
-    local server_name="www.amd.com"
+    local server_name="www.analog.com"
 
     if [ "$BATCH_MODE" = "true" ]; then
         port="$BATCH_PORT"
-        server_name="${BATCH_SNI:-www.amd.com}"
+        server_name="${BATCH_SNI:-www.analog.com}"
     else
         read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
         node_ip=${custom_ip:-$server_ip}
@@ -5082,8 +5118,8 @@ _add_tuic() {
             _check_port_conflict "$port" "udp" && continue
             break
         done
-        read -p "请输入伪装域名 (默认: www.amd.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.amd.com"}
+        read -p "请输入伪装域名 (默认: www.analog.com): " camouflage_domain
+        server_name=${camouflage_domain:-"www.analog.com"}
     fi
 
     local tag="tuic-in-${port}"
@@ -5227,11 +5263,11 @@ _add_shadowsocks_menu() {
     fi
     
     local shadowtls_password=""
-    local shadowtls_sni="www.amd.com"
+    local shadowtls_sni="www.analog.com"
     if [ "$use_shadowtls" == "true" ]; then
         shadowtls_password=$(${SINGBOX_BIN} generate rand --hex 16)
-        read -p "请输入 ShadowTLS 伪装白名单域名 (默认: www.amd.com): " custom_sni
-        shadowtls_sni=${custom_sni:-www.amd.com}
+        read -p "请输入 ShadowTLS 伪装白名单域名 (默认: www.analog.com): " custom_sni
+        shadowtls_sni=${custom_sni:-www.analog.com}
     fi
 
     local tag="${name_prefix}-in-${port}"
@@ -5529,8 +5565,8 @@ _view_nodes() {
             "vless")
                 # [资源优化] 合并 VLESS 关键字段读取，避免循环内多次 jq
                 local _vless_fields
-                # [加固] 智能回溯 SNI: 优先 .tls.server_name, 备选 .tls.reality.handshake.server, 保底 www.amd.com
-            _vless_fields=$(echo "$node" | jq -r '[.users[0].uuid, (.users[0].flow // ""), (.tls.reality.enabled // false | tostring), (.transport.type // ""), (.tls.enabled // false | tostring), (.tls.server_name // .tls.reality.handshake.server // "www.amd.com"), (.tls.certificate_path // ""), (.transport.path // ""), (.transport.service_name // "")] | @tsv')
+                # [加固] 智能回溯 SNI: 优先 .tls.server_name, 备选 .tls.reality.handshake.server, 保底 www.analog.com
+            _vless_fields=$(echo "$node" | jq -r '[.users[0].uuid, (.users[0].flow // ""), (.tls.reality.enabled // false | tostring), (.transport.type // ""), (.tls.enabled // false | tostring), (.tls.server_name // .tls.reality.handshake.server // "www.analog.com"), (.tls.certificate_path // ""), (.transport.path // ""), (.transport.service_name // "")] | @tsv')
             IFS=$'\t' read -r uuid flow is_reality transport_type tls_enabled tls_sn cert_path ws_path grpc_service_name <<< "$_vless_fields"
                 
                 # [加固] 确保 Reality 模式下的流量控制字段非空 (v2rayN 要求)
@@ -5625,7 +5661,7 @@ _view_nodes() {
                 # [资源优化] 合并2次jq为1次
                 local pw sn
                 # [加固] 允许 server_name 回溯
-                IFS=$'\t' read -r pw sn <<< "$(echo "$node" | jq -r '[.users[0].password, (.tls.server_name // "www.amd.com")] | @tsv')"
+                IFS=$'\t' read -r pw sn <<< "$(echo "$node" | jq -r '[.users[0].password, (.tls.server_name // "www.analog.com")] | @tsv')"
                 local skip_verify=$(_get_proxy_field "$proxy_name_to_find" ".skip-cert-verify")
                 local insecure_param=""
                 if [ "$skip_verify" == "true" ]; then
@@ -7683,7 +7719,18 @@ _install_or_update_xray() {
     else
         _info "Xray 核心未安装，正在执行首次安装..."
     fi
-    _do_update_xray
+    _with_state_lock _do_update_xray
+}
+
+_start_direct_xray() {
+    local binary="$1" config="$2" pid
+    mkdir -p "$XRAY_RUNTIME_DIR" && chmod 700 "$XRAY_RUNTIME_DIR" || return 1
+    rm -f -- "$XRAY_PID_FILE" || return 1
+    nohup "$binary" run -c "$config" >> /var/log/xray.log 2>&1 8>&- 9>&- 219>&- &
+    pid=$!
+    printf '%s\n' "$pid" > "$XRAY_PID_FILE" || { kill "$pid" 2>/dev/null; return 1; }
+    sleep 1
+    _is_pid_file_running_cmd "$XRAY_PID_FILE" "$binary" || { rm -f -- "$XRAY_PID_FILE"; return 1; }
 }
 
 # 执行 Xray 核心的安装/更新 (内联实现，避免依赖 xray_manager.sh 的 source)
@@ -7778,43 +7825,28 @@ _do_update_xray() {
     [ -f "${tmp_dir}/geosite.dat" ] && mv -f "${tmp_dir}/geosite.dat" "$xray_dir/"
 
     _create_xray_service_from_main
-    local service_ok="true"
+    local service_ok="true" direct_stopped=false
     if [ "$INIT_SYSTEM" == "systemd" ]; then
         if [ "$is_first_install" = true ] || systemctl is-active xray >/dev/null 2>&1; then systemctl reset-failed xray >/dev/null 2>&1 || true; systemctl restart xray 8>&- 9>&- 219>&- || service_ok="false"; fi
     elif [ "$INIT_SYSTEM" == "openrc" ]; then
         if [ "$is_first_install" = true ] || rc-service xray status >/dev/null 2>&1; then rc-service xray restart 8>&- 9>&- 219>&- || service_ok="false"; fi
     elif [ "$INIT_SYSTEM" == "direct" ]; then
-        mkdir -p "$XRAY_RUNTIME_DIR" && chmod 700 "$XRAY_RUNTIME_DIR" || service_ok="false"
-        if [ "$service_ok" = "true" ]; then
-            if [ -s "$XRAY_PID_FILE" ]; then
-                local xray_pid
-                xray_pid=$(cat "$XRAY_PID_FILE" 2>/dev/null)
-                _is_pid_running_cmd "$xray_pid" "$xray_bin" && kill "$xray_pid" 2>/dev/null
-            fi
-            rm -f "$XRAY_PID_FILE"
-            nohup "$xray_bin" run -c "${xray_dir}/config.json" >> /var/log/xray.log 2>&1 8>&- 9>&- 219>&- &
-            echo $! > "$XRAY_PID_FILE"
-            chmod 600 "$XRAY_PID_FILE" 2>/dev/null || true
-            sleep 1
-            _is_pid_file_running_cmd "$XRAY_PID_FILE" "$xray_bin" || service_ok="false"
+        if _direct_xray_pid stop "$XRAY_PID_FILE" "$xray_bin" "${xray_dir}/config.json"; then
+            direct_stopped=true
+            _start_direct_xray "$xray_bin" "${xray_dir}/config.json" || service_ok=false
+        else
+            service_ok=false
         fi
     fi
 
     if [ "$service_ok" != "true" ]; then
         _error "Xray 新核心启动失败，正在恢复旧核心。"
         if [ "$had_old" = "true" ] && [ -s "$backup_xray" ]; then mv -f "$backup_xray" "$xray_bin"; else rm -f "$xray_bin"; fi
-        rm -f "$XRAY_PID_FILE"
         if [ "$had_old" = "true" ] && [ "$INIT_SYSTEM" = "systemd" ]; then systemctl restart xray >/dev/null 2>&1 || true; fi
         if [ "$had_old" = "true" ] && [ "$INIT_SYSTEM" = "openrc" ]; then rc-service xray restart >/dev/null 2>&1 || true; fi
-        if [ "$had_old" = "true" ] && [ "$INIT_SYSTEM" = "direct" ]; then
-            mkdir -p "$XRAY_RUNTIME_DIR" && chmod 700 "$XRAY_RUNTIME_DIR" 2>/dev/null || true
-            nohup "$xray_bin" run -c "${xray_dir}/config.json" >> /var/log/xray.log 2>&1 8>&- 9>&- 219>&- &
-            echo $! > "$XRAY_PID_FILE"
-            chmod 600 "$XRAY_PID_FILE" 2>/dev/null || true
-            sleep 1
-            if ! _is_pid_file_running_cmd "$XRAY_PID_FILE" "$xray_bin"; then
+        if [ "$had_old" = true ] && [ "$direct_stopped" = true ]; then
+            if ! _start_direct_xray "$xray_bin" "${xray_dir}/config.json"; then
                 _error "旧 Xray 核心已恢复，但 direct 模式重新启动失败，请检查 /var/log/xray.log。"
-                rm -f "$XRAY_PID_FILE"
             fi
         fi
         rm -rf "$tmp_dir"
@@ -8078,7 +8110,7 @@ _main_menu() {
                     xray_status="${YELLOW}○ 已停止${NC}"
                 fi
             elif [ "$INIT_SYSTEM" == "direct" ]; then
-                if _is_pid_file_running_cmd "$XRAY_PID_FILE" /usr/local/bin/xray; then
+                if _direct_xray_pid status "$XRAY_PID_FILE" /usr/local/bin/xray /usr/local/etc/xray/config.json >/dev/null; then
                     xray_status="${GREEN}● 运行中${NC}"
                 else
                     xray_status="${YELLOW}○ 已停止${NC}"

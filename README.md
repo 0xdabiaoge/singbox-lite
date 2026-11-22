@@ -275,8 +275,10 @@ Mihomo 的 `support-x25519mlkem768` 是客户端配置字段，不写入 Xray �
 | `/usr/local/etc/sing-box/clash.yaml` | sing-box/Xray 共享客户端配置 |
 | `/usr/local/etc/sing-box/metadata.json` | 主节点元数据和分享链接 |
 | `/usr/local/etc/sing-box/core-version.lock` | sing-box 固定版的持久版本锁，记录最近一次成功安装的固定版本 |
-| `/usr/local/etc/sing-box/relay.d/` | 中转、端口转发和辅助状态 |
+| `/usr/local/etc/sing-box/relay_links.json` | 中转链路元数据和分享链接 |
+| `/usr/local/etc/sing-box/relay_pf.json` | 端口转发规则、转发引擎和域名解析记录 |
 | `/usr/local/etc/xray/config.json` | Xray 服务端配置 |
+| `/run/singboxlite/xray.pid` | direct 模式下由主脚本、Xray 管理器和中转脚本共用的 Xray PID 文件 |
 | `/var/log/sing-box.log` | sing-box 日志 |
 | `/var/log/singbox_argo.log` | Argo 日志 |
 
