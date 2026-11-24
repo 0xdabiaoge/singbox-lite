@@ -752,16 +752,6 @@ _relay_xray_restart_checked() {
     "$RELAY_XRAY_BIN" run -test -config "$RELAY_XRAY_CONFIG" >/dev/null 2>&1 && _relay_xray_service restart
 }
 
-_relay_xray_add() {
-    local inbound="$1" bridge_port="$2" tag="$3" bridge_password="$4" payload
-    payload=$(jq --argjson inbound "$inbound" --argjson port "$bridge_port" --arg tag "$tag" --arg password "$bridge_password" '
-        .inbounds = (.inbounds // []) + [$inbound]
-        | .outbounds = (.outbounds // []) + [{tag:($tag + "-bridge-out"),protocol:"socks",settings:{address:"127.0.0.1",port:$port,user:"relay",pass:$password}}]
-        | .routing = (.routing // {})
-        | .routing.rules = [{type:"field",inboundTag:[$tag],outboundTag:($tag + "-bridge-out")}] + (.routing.rules // [])' "$RELAY_XRAY_CONFIG") || return 1
-    _atomic_write_json "$RELAY_XRAY_CONFIG" "$payload"
-}
-
 _relay_xray_add_direct() {
     local inbound="$1" outbound="$2" tag="$3" payload
     payload=$(jq --argjson inbound "$inbound" --argjson outbound "$outbound" --arg tag "$tag" '
@@ -2538,8 +2528,7 @@ _finalize_relay_setup() {
     txn_dir=$(_txn_begin) || { _state_lock_release; _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "${port_range:-}" "$cert_path" "$key_path"; return 1; }
     if ! _txn_snapshot_file "$txn_dir" relay "$CONFIG_FILE" \
         || ! _txn_snapshot_file "$txn_dir" links "$LINKS_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML" \
-        || ! { [ "$relay_type" != "vless-xhttp-reality" ] || _txn_snapshot_file "$txn_dir" xray "$RELAY_XRAY_CONFIG"; }; then
+        || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML"; then
         _error "无法创建中转状态快照"
         _txn_cleanup "$txn_dir"
         _state_lock_release
@@ -2554,12 +2543,6 @@ _finalize_relay_setup() {
         _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "${port_range:-}" "$cert_path" "$key_path"
         return 1
     fi
-    if [ "$relay_type" = "vless-xhttp-reality" ] && _network_port_conflict "$bridge_port" tcp; then
-        _error "提交前桥接端口 ${bridge_port} 已被占用"
-        _txn_cleanup "$txn_dir"
-        _state_lock_release
-        return 1
-    fi
     export PROXY_NAME="$node_name"
     if "$YQ_BINARY" eval -e '.proxies[] | select(.name == strenv(PROXY_NAME))' "$RELAY_CLASH_YAML" >/dev/null 2>&1; then
         _error "提交前发现 Clash 节点名称已存在: $node_name"
@@ -2569,8 +2552,7 @@ _finalize_relay_setup() {
         return 1
     fi
 
-    if jq -e --arg tag "$inbound_tag" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1 \
-        || { [ "$relay_type" = "vless-xhttp-reality" ] && jq -e --arg tag "$inbound_tag" '.inbounds[]? | select(.tag == $tag)' "$RELAY_XRAY_CONFIG" >/dev/null 2>&1; }; then
+    if jq -e --arg tag "$inbound_tag" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1; then
         _error "中转入口 tag 已存在: $inbound_tag"
         _txn_cleanup "$txn_dir"
         _state_lock_release
@@ -2589,21 +2571,17 @@ _finalize_relay_setup() {
 
     metadata=$(jq -n --arg link "$link" --arg created "$(date '+%Y-%m-%d %H:%M:%S')" --arg relay_type "$relay_type" \
         --arg landing_type "$dest_label" --arg landing_addr "${dest_addr}:${dest_port}" --arg node_name "$node_name" \
-        --argjson listen_port "$listen_port" --argjson client_port "$relay_client_port" --arg hop "${port_range:-}" --arg bridge_port "$bridge_port" \
-        '{link:$link,created_at:$created,relay_type:$relay_type,landing_type:$landing_type,landing_addr:$landing_addr,node_name:$node_name,listen_port:$listen_port,client_port:$client_port} | if $hop != "" then .port_hopping=$hop else . end | if $bridge_port != "" then .bridge_port=($bridge_port|tonumber) else . end') || true
+        --argjson listen_port "$listen_port" --argjson client_port "$relay_client_port" --arg hop "${port_range:-}" \
+        '{link:$link,created_at:$created,relay_type:$relay_type,landing_type:$landing_type,landing_addr:$landing_addr,node_name:$node_name,listen_port:$listen_port,client_port:$client_port} | if $hop != "" then .port_hopping=$hop else . end') || true
     tmp=$(_make_same_dir_tmp "$LINKS_FILE") || true
     if [ -z "$metadata" ] || [ -z "$tmp" ] || ! jq --arg tag "$inbound_tag" --argjson meta "$metadata" '.[$tag] = $meta' "$LINKS_FILE" > "$tmp" \
         || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$LINKS_FILE" || ! _add_node_to_relay_yaml "$proxy_json" \
-        || ! { [ "$relay_type" != "vless-xhttp-reality" ] || _relay_xray_add "$xray_inbound" "$bridge_port" "$inbound_tag" "$bridge_password"; } \
-        || ! _restart_checked \
-        || ! { [ "$relay_type" != "vless-xhttp-reality" ] || _relay_xray_restart_checked; }; then
+        || ! _restart_checked; then
         [ -n "$tmp" ] && rm -f -- "$tmp"
         _txn_restore_file "$txn_dir" relay "$CONFIG_FILE"
         _txn_restore_file "$txn_dir" links "$LINKS_FILE"
         _txn_restore_file "$txn_dir" clash "$RELAY_CLASH_YAML"
-        [ "$relay_type" = "vless-xhttp-reality" ] && _txn_restore_file "$txn_dir" xray "$RELAY_XRAY_CONFIG"
         _manage_service restart >/dev/null 2>&1 || true
-        [ "$relay_type" = "vless-xhttp-reality" ] && _relay_xray_service restart >/dev/null 2>&1 || true
         _txn_cleanup "$txn_dir"
         _state_lock_release
         _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "${port_range:-}" "$cert_path" "$key_path"
